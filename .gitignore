@@ -1,0 +1,12 @@
+*.o
+*.pyc
+__pycache__/
+.pytest_cache/
+test_protocol
+test_protocol_asan
+*.dSYM/
+build/
+.DS_Store
+logs/*.jsonl
+logs/*.out
+.vscode/
