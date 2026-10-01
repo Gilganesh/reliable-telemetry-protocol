@@ -186,8 +186,32 @@ typedef struct {
     uint64_t last_rx_ms;
 } TcpClient;
 TcpClient g_tcp_clients[MAX_TCP_CLIENTS];
-int g_uart_fd = -1;
-FrameReader g_uart_reader;
+// Кілька послідовних портів одночасно: шлюз сам знаходить USB-TTL перехідники
+// (/dev/ttyUSB*, /dev/ttyACM*), шле на кожен пробні пінги і запам'ятовує як
+// "наш" той порт, звідки прийшов валідний кадр протоколу.
+#define MAX_UART_PORTS 4
+#define UART_PROBE_WARN_MS 15000 // стільки порт мовчить -- повідомляємо, що там, схоже, не наша плата
+typedef struct {
+    int fd;                // -1 = слот вільний
+    char path[256];        // справжній шлях (після realpath) -- для дедуплікації
+    FrameReader reader;
+    uint64_t last_rx_ms;   // коли востаннє прийшли байти (для скидання сміття між кадрами)
+    uint64_t opened_ms;
+    bool responded;        // з порту вже приходив валідний кадр
+    bool warned_silent;
+} UartPort;
+UartPort g_uart_ports[MAX_UART_PORTS];
+
+static void uart_init(void) {
+    for (int i = 0; i < MAX_UART_PORTS; i++) g_uart_ports[i].fd = -1;
+}
+
+static UartPort *uart_port_by_fd(int fd) {
+    if (fd < 0) return NULL;
+    for (int i = 0; i < MAX_UART_PORTS; i++)
+        if (g_uart_ports[i].fd == fd) return &g_uart_ports[i];
+    return NULL;
+}
 
 const char *route_kind_name(RouteKind k) {
     switch (k) {
@@ -619,8 +643,8 @@ static void provision_refresh(uint64_t now) {
 }
 
 // Пакує й пише у UART один кадр (шлюз -> плата). payload_json може бути NULL.
-static bool uart_write_frame(uint8_t type, uint16_t node_id, uint32_t seq, const char *payload_json) {
-    if (g_uart_fd < 0) return false;
+static bool uart_write_frame(int fd, uint8_t type, uint16_t node_id, uint32_t seq, const char *payload_json) {
+    if (fd < 0) return false;
     SensorPacket pkt = {0};
     pkt.version = PROTOCOL_VERSION;
     pkt.msg_type = type;
@@ -639,7 +663,7 @@ static bool uart_write_frame(uint8_t type, uint16_t node_id, uint32_t seq, const
     uint8_t tx[256];
     int len = protocol_pack(&pkt, tx, sizeof(tx));
     if (len <= 0) return false;
-    return write(g_uart_fd, tx, len) == len;
+    return write(fd, tx, len) == len;
 }
 
 // Два невеликі CONFIG-пакети (разом SSID+пароль+IP не влізли б у 128 байт payload).
@@ -651,7 +675,7 @@ static void provision_send(NodeState *n) {
         cJSON_AddStringToObject(o, "s", g_prov.ssid);
         cJSON_AddStringToObject(o, "p", g_prov.pass);
         char *js = cJSON_PrintUnformatted(o);
-        if (js) { uart_write_frame(MSG_CONFIG, n->node_id, n->prov_seq_wifi, js); free(js); }
+        if (js) { uart_write_frame(n->last_route.fd, MSG_CONFIG, n->node_id, n->prov_seq_wifi, js); free(js); }
         cJSON_Delete(o);
     }
     if (!(n->prov_acks & 2)) {
@@ -662,7 +686,7 @@ static void provision_send(NodeState *n) {
         cJSON_AddNumberToObject(o, "udp", g_prov.udp_port);
         cJSON_AddNumberToObject(o, "tcp", g_prov.tcp_port);
         char *js = cJSON_PrintUnformatted(o);
-        if (js) { uart_write_frame(MSG_CONFIG, n->node_id, n->prov_seq_gw, js); free(js); }
+        if (js) { uart_write_frame(n->last_route.fd, MSG_CONFIG, n->node_id, n->prov_seq_gw, js); free(js); }
         cJSON_Delete(o);
     }
 }
@@ -682,12 +706,13 @@ static void provision_on_ack(const SensorPacket *ack) {
 
 // Викликається з головного циклу: "пінг" дроту + повтори автоналаштування.
 static void uart_tick(uint64_t now) {
-    if (g_uart_fd < 0) return;
-
     static uint64_t last_ping = 0;
     if (now - last_ping >= UART_PING_MS) {
         last_ping = now;
-        uart_write_frame(MSG_HEARTBEAT, 0, next_down_seq(), NULL); // node_id 0 = усім
+        uint32_t seq = next_down_seq();
+        // Пінг іде на ВСІ відкриті порти: той, де є наша плата, відповість
+        for (int i = 0; i < MAX_UART_PORTS; i++)
+            uart_write_frame(g_uart_ports[i].fd, MSG_HEARTBEAT, 0, seq, NULL); // node_id 0 = усім
     }
 
     provision_refresh(now);
@@ -695,6 +720,7 @@ static void uart_tick(uint64_t now) {
     for (int i = 0; i < node_count; i++) {
         NodeState *n = &nodes[i];
         if (n->last_route.kind != ROUTE_UART || n->prov_acks == 3) continue;
+        if (!uart_port_by_fd(n->last_route.fd)) continue; // порт, де бачили вузол, зник
         if (now - n->last_seen_ms > NODE_TIMEOUT_MS) continue; // вузол зараз не на дроті
         if (n->prov_last_ms != 0 && now - n->prov_last_ms < PROVISION_RETRY_MS) continue;
         n->prov_last_ms = now ? now : 1;
@@ -895,7 +921,8 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
     // налаштування Wi-Fi могли застаріти -- перенастроюємо.
     uint64_t t_now = get_monotonic_time_ms();
     if (route->kind == ROUTE_UART && node->last_seen_ms != 0 &&
-        (node->last_route.kind != ROUTE_UART || t_now - node->last_seen_ms > NODE_TIMEOUT_MS)) {
+        (node->last_route.kind != ROUTE_UART || node->last_route.fd != route->fd ||
+         t_now - node->last_seen_ms > NODE_TIMEOUT_MS)) {
         log_event("[НАЛАШТУВАННЯ] Вузол %u знову на UART -- перенастроюю\n", pkt.node_id);
         provision_reset(node);
     }
@@ -1008,7 +1035,7 @@ void forward_downlink(const struct mosquitto_message *msg) {
         ReplyRoute route = nodes[i].last_route;
         if (route.kind == ROUTE_MQTT) return;
         // fd для TCP міг змінитись після перепідключення -- беремо поточний
-        if (route.kind == ROUTE_UART) route.fd = g_uart_fd;
+        if (route.kind == ROUTE_UART && !uart_port_by_fd(route.fd)) route.fd = -1;
         if (route.kind == ROUTE_TCP && !tcp_fd_active(route.fd)) route.fd = -1;
         if ((route.kind == ROUTE_TCP || route.kind == ROUTE_UART) && route.fd < 0) {
             log_event("[DOWNLINK] Вузол %u: канал %s не активний, команду з веба не доставлено\n",
@@ -1169,57 +1196,14 @@ void poll_tcp(void) {
     }
 }
 
-// Знаходить, який файл відкривати. Номер ttyUSBx Linux видає за порядком появи
-// пристроїв, тож після перепідключення він "скаче" -- шлях визначаємо наново
-// при КОЖНІЙ спробі відкриття.
-//   GATEWAY_UART=/dev/serial/by-id/usb-FTDI*  -- шаблон (береться перший збіг)
-//   GATEWAY_UART=/dev/ttyUSB1                 -- конкретний шлях
-//   не задано -- перший з /dev/serial/by-id/*, /dev/ttyUSB*, /dev/ttyACM*, UART_DEVICE
-static bool resolve_uart_path(char *out, size_t n) {
-    const char *env = getenv("GATEWAY_UART");
-    const char *defaults[] = { "/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/ttyACM*", UART_DEVICE };
-    const char **cands = defaults;
-    size_t count = sizeof(defaults) / sizeof(defaults[0]);
-    const char *one[1];
-    if (env && *env) { one[0] = env; cands = one; count = 1; }
-
-    for (size_t i = 0; i < count; i++) {
-        glob_t g;
-        if (glob(cands[i], 0, NULL, &g) == 0) {
-            if (g.gl_pathc > 0) snprintf(out, n, "%s", g.gl_pathv[0]);
-            bool ok = g.gl_pathc > 0;
-            globfree(&g);
-            if (ok) return true;
-        }
-    }
-    snprintf(out, n, "%s", (env && *env) ? env : UART_DEVICE); // для повідомлення про помилку
-    return false;
-}
-
-// ---- UART: відкрити послідовний порт (термінально, 8N1), читати з фреймінгом ----
-// verbose=false -- тихі повторні спроби перевідкриття (перехідник висмикнули).
-void setup_uart(bool verbose) {
-    char uart_dev[256];
-    resolve_uart_path(uart_dev, sizeof(uart_dev));
-    g_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (g_uart_fd < 0) {
-        if (!verbose) return;
-        fprintf(stderr,
-                "[UART] Не вдалося відкрити %s (%s) -- UART-вузол недоступний. "
-                "Перевір, що USB-TTL перехідник підключений (`ls /dev/ttyUSB*`), "
-                "і що UART_DEVICE вище відповідає реальному шляху. Гейтвей "
-                "продовжує працювати без UART.\n", uart_dev, strerror(errno));
-        return;
-    }
+// Відкриває порт у сирому режимі 8N1 115200. Повертає fd або -1.
+static int uart_open_configured(const char *path) {
+    int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) return -1;
 
     struct termios tty;
     memset(&tty, 0, sizeof(tty));
-    if (tcgetattr(g_uart_fd, &tty) != 0) {
-        fprintf(stderr, "[UART] tcgetattr: %s\n", strerror(errno));
-        close(g_uart_fd);
-        g_uart_fd = -1;
-        return;
-    }
+    if (tcgetattr(fd, &tty) != 0) { close(fd); return -1; }
 
     cfsetospeed(&tty, UART_BAUD);
     cfsetispeed(&tty, UART_BAUD);
@@ -1243,63 +1227,132 @@ void setup_uart(bool verbose) {
     tty.c_cc[VMIN]  = 0;
     tty.c_cc[VTIME] = 0;
 
-    if (tcsetattr(g_uart_fd, TCSANOW, &tty) != 0) {
-        fprintf(stderr, "[UART] tcsetattr: %s\n", strerror(errno));
-        close(g_uart_fd);
-        g_uart_fd = -1;
-        return;
-    }
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); return -1; }
 
     // USB-UART адаптер плати: DTR/RTS підключені до EN/GPIO0, і відкриття порту
     // їх активує (плата перезавантажується). Знімаємо обидва, щоб далі вона працювала.
     int modem_bits = TIOCM_DTR | TIOCM_RTS;
-    ioctl(g_uart_fd, TIOCMBIC, &modem_bits);
-
-    frame_reader_init(&g_uart_reader);
-    log_event("[UART] Слухаю на %s (115200 8N1)\n", uart_dev);
+    ioctl(fd, TIOCMBIC, &modem_bits);
+    return fd;
 }
 
-#define UART_REOPEN_MS 2000 // як часто пробуємо знову відкрити порт після обриву
+static void uart_close_port(UartPort *p, const char *why) {
+    log_event("[UART] %s: %s -- порт закрито\n", p->path, why);
+    // Вузли, яких чули через цей порт, більше не мають дроту (і fd може дістатися іншому порту).
+    for (int i = 0; i < node_count; i++)
+        if (nodes[i].last_route.kind == ROUTE_UART && nodes[i].last_route.fd == p->fd)
+            nodes[i].last_route.fd = -1;
+    close(p->fd);
+    p->fd = -1;
+}
+
+// Шукає послідовні порти й відкриває нові. Номер ttyUSBx Linux видає за порядком
+// появи пристроїв і він "скаче", тому кожен порт ідентифікуємо за realpath, а які
+// з них наші -- вирішує відповідь на пробний пінг, а не назва.
+//   GATEWAY_UART='/dev/serial/by-id/usb-FTDI*' -- шукати лише за цим шаблоном/шляхом
+//   не задано -- усі /dev/ttyUSB* і /dev/ttyACM*
+static void uart_scan(bool first) {
+    const char *env = getenv("GATEWAY_UART");
+    const char *defaults[] = { "/dev/ttyUSB*", "/dev/ttyACM*" };
+    const char **pats = defaults;
+    size_t npats = sizeof(defaults) / sizeof(defaults[0]);
+    const char *one[1];
+    if (env && *env) { one[0] = env; pats = one; npats = 1; }
+
+    for (size_t i = 0; i < npats; i++) {
+        glob_t g;
+        if (glob(pats[i], 0, NULL, &g) != 0) continue;
+        for (size_t k = 0; k < g.gl_pathc; k++) {
+            char real[256];
+            if (!realpath(g.gl_pathv[k], real)) continue;
+
+            bool known = false;
+            UartPort *slot = NULL;
+            for (int j = 0; j < MAX_UART_PORTS; j++) {
+                if (g_uart_ports[j].fd >= 0 && strcmp(g_uart_ports[j].path, real) == 0) known = true;
+                if (g_uart_ports[j].fd < 0 && !slot) slot = &g_uart_ports[j];
+            }
+            if (known) continue;
+            if (!slot) break; // усі слоти зайняті
+
+            int fd = uart_open_configured(real);
+            if (fd < 0) {
+                if (first) fprintf(stderr, "[UART] Не вдалося відкрити %s (%s)\n", real, strerror(errno));
+                continue;
+            }
+            slot->fd = fd;
+            snprintf(slot->path, sizeof(slot->path), "%s", real);
+            frame_reader_init(&slot->reader);
+            slot->last_rx_ms = 0;
+            slot->opened_ms = get_monotonic_time_ms();
+            slot->responded = false;
+            slot->warned_silent = false;
+            log_event("[UART] Знайдено порт %s (115200 8N1) -- шлю пробні пінги, чекаю відповіді плати\n", real);
+        }
+        globfree(&g);
+    }
+
+    if (first) {
+        bool any = false;
+        for (int j = 0; j < MAX_UART_PORTS; j++) any = any || g_uart_ports[j].fd >= 0;
+        if (!any)
+            fprintf(stderr,
+                    "[UART] Послідовних портів не знайдено (/dev/ttyUSB*, /dev/ttyACM*) -- UART-вузли недоступні. "
+                    "Шлюз шукає знову кожні 2 с, решта каналів працює.\n");
+    }
+}
+
+#define UART_SCAN_MS 2000 // як часто шукаємо нові порти (перехідник могли встромити пізніше)
 
 void poll_uart(void) {
-    if (g_uart_fd < 0) {
-        // Перехідник могли висмикнути й встромити знову: пробуємо перевідкрити.
-        static uint64_t last_try_ms = 0;
-        uint64_t t = get_monotonic_time_ms();
-        if (t - last_try_ms >= UART_REOPEN_MS) {
-            last_try_ms = t;
-            setup_uart(false);
-        }
-        return;
+    uint64_t now_ms = get_monotonic_time_ms();
+    static uint64_t last_scan_ms = 0;
+    static bool first_scan = true;
+    if (first_scan || now_ms - last_scan_ms >= UART_SCAN_MS) {
+        last_scan_ms = now_ms;
+        uart_scan(first_scan);
+        first_scan = false;
     }
 
-    uint8_t rx[256];
-    ssize_t n = read(g_uart_fd, rx, sizeof(rx));
-    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-        log_event("[UART] Порт зник (%s) -- чекаю на повернення перехідника\n", strerror(errno));
-        close(g_uart_fd);
-        g_uart_fd = -1;
-        return;
-    }
-    if (n > 0) {
-        // Кадр плата пише одним блоком (~15 мс на 115200). Пауза довша за
-        // UART_FRAME_GAP_MS всередині недоскладеного кадру означає сміття (завантажувач
-        // ESP32 друкує текст при скиданні) -- скидаємо складання, щоб наступний
-        // справжній кадр не з'їхав на зміщення.
-        uint64_t now_ms = get_monotonic_time_ms();
-        static uint64_t last_rx_ms = 0;
-        if (g_uart_reader.have > 0 && now_ms - last_rx_ms > UART_FRAME_GAP_MS)
-            frame_reader_init(&g_uart_reader);
-        last_rx_ms = now_ms;
-        ReplyRoute route = { .kind = ROUTE_UART, .fd = g_uart_fd };
-        for (ssize_t i = 0; i < n; i++) {
-            if (frame_reader_feed_byte(&g_uart_reader, rx[i])) {
-                handle_packet(g_uart_reader.buf, g_uart_reader.have, &route);
-                frame_reader_init(&g_uart_reader);
+    for (int pi = 0; pi < MAX_UART_PORTS; pi++) {
+        UartPort *p = &g_uart_ports[pi];
+        if (p->fd < 0) continue;
+
+        uint8_t rx[256];
+        ssize_t n = read(p->fd, rx, sizeof(rx));
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            char why[96];
+            snprintf(why, sizeof(why), "порт зник (%s)", strerror(errno));
+            uart_close_port(p, why);
+            continue;
+        }
+        if (n > 0) {
+            // Кадр плата пише одним блоком (~15 мс на 115200). Пауза довша за
+            // UART_FRAME_GAP_MS всередині недоскладеного кадру означає сміття (завантажувач
+            // ESP32 друкує текст при скиданні) -- скидаємо складання, щоб наступний
+            // справжній кадр не з'їхав на зміщення.
+            if (p->reader.have > 0 && now_ms - p->last_rx_ms > UART_FRAME_GAP_MS)
+                frame_reader_init(&p->reader);
+            p->last_rx_ms = now_ms;
+            ReplyRoute route = { .kind = ROUTE_UART, .fd = p->fd };
+            for (ssize_t i = 0; i < n; i++) {
+                if (frame_reader_feed_byte(&p->reader, rx[i])) {
+                    SensorPacket probe;
+                    if (!p->responded && protocol_unpack(p->reader.buf, p->reader.have, &probe) == PROTO_OK) {
+                        p->responded = true;
+                        log_event("[UART] %s: пристрій відповів валідним кадром -- це наш сенсор\n", p->path);
+                    }
+                    handle_packet(p->reader.buf, p->reader.have, &route);
+                    frame_reader_init(&p->reader);
+                }
             }
         }
+        if (!p->responded && !p->warned_silent && now_ms - p->opened_ms > UART_PROBE_WARN_MS) {
+            p->warned_silent = true;
+            log_event("[UART] %s: немає відповіді на пінги %d с -- схоже, не наша плата (порт лишається відкритим)\n",
+                      p->path, UART_PROBE_WARN_MS / 1000);
+        }
     }
-    // n <= 0 -- немає нових байт зараз (O_NONBLOCK), норма.
 }
 
 void print_dashboard() {
@@ -1420,11 +1473,11 @@ int main(void) {
 
     // 30.09 (3) -- три додаткові "сирі" транспорти поряд з MQTT. Кожен
     // піднімається незалежно: якщо, наприклад, UART-перехідник не
-    // підключений, setup_uart() лише друкує попередження і gateway
+    // підключений, UART-сканер лише друкує попередження і gateway
     // продовжує працювати з рештою каналів (MQTT/UDP/TCP).
     setup_udp();
     setup_tcp();
-    setup_uart(true);
+    uart_init();
     g_down_seq = ((uint32_t)time(NULL) & 0x7FFFFFFF) | 1;
     registry_load();
     provision_start_worker();
