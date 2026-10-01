@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Телеметрія вузлів</title>
+<script src="/static/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b1017; --panel: #121b27; --panel2: #1a2636; --line: #25344a;
+    --text: #e6edf7; --muted: #8496b0; --accent: #4f9cff; --accent2: #2dd4bf;
+    --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 10% -10%, #14233a 0%, var(--bg) 60%) fixed;
+    color: var(--text); min-height: 100vh;
+    font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  button, input, select { font: inherit; color: inherit; }
+  header {
+    position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 16px;
+    padding: 12px 24px; background: rgba(11,16,23,.85); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 700; letter-spacing: .2px; }
+  header h1 span { color: var(--accent2); }
+  .spacer { flex: 1; }
+  main { max-width: 1500px; margin: 0 auto; padding: 20px 24px 60px; display: grid; gap: 20px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; border: 1px solid var(--line); background: var(--panel2); color: var(--muted);
+    white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); border-color: rgba(52,211,153,.4); background: rgba(52,211,153,.1); }
+  .pill.bad { color: var(--bad); border-color: rgba(248,113,113,.4); background: rgba(248,113,113,.1); }
+  .pill.warn { color: var(--warn); border-color: rgba(251,191,36,.4); background: rgba(251,191,36,.1); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .btn {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 9px;
+    padding: 6px 12px; cursor: pointer; transition: .15s;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: linear-gradient(135deg,#3b82f6,#2563eb); border-color: transparent; font-weight: 600; }
+  .btn.danger { color: var(--bad); }
+  .btn.small { padding: 3px 9px; font-size: 12px; }
+  input, select {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; padding: 6px 10px; min-width: 0;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  .banner {
+    padding: 10px 14px; border-radius: 10px; border: 1px solid rgba(248,113,113,.4);
+    background: rgba(248,113,113,.1); color: #fecaca;
+  }
+  .banner.warn { border-color: rgba(251,191,36,.4); background: rgba(251,191,36,.1); color: #fde68a; }
+  .hidden { display: none !important; }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+  .kpi { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+  .kpi .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  .kpi .value { font-size: 28px; font-weight: 700; margin-top: 2px; }
+  .kpi .sub { color: var(--muted); font-size: 12px; }
+
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+
+  .nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .node { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+  .node.offline { opacity: .65; }
+  .node.alarm { border-color: rgba(248,113,113,.6); box-shadow: 0 0 0 1px rgba(248,113,113,.25) inset; }
+  .node-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .node-head .title { font-weight: 700; }
+  .node-head .sub { color: var(--muted); font-size: 12px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 10px 0; text-align: center; }
+  .stats div { background: var(--panel2); border-radius: 10px; padding: 6px 4px; }
+  .stats b { display: block; font-size: 18px; }
+  .stats span { color: var(--muted); font-size: 11px; }
+  .bar { height: 6px; background: var(--panel2); border-radius: 99px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--ok); transition: width .4s; }
+  .node-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+
+  .grid2 { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+  @media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px; }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
+  .chart-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; align-items: center; }
+  .chart-bar select { font-size: 12px; padding: 4px 8px; }
+  .chart-wrap { position: relative; height: 210px; }
+  .chart-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); pointer-events: none; }
+
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .row label { color: var(--muted); font-size: 12px; min-width: 60px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); padding: 0; }
+  .ctrl { display: grid; gap: 14px; align-content: start; }
+  .log { max-height: 220px; overflow: auto; display: grid; gap: 6px; }
+  .log div { background: var(--panel2); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+  .log time { color: var(--muted); margin-right: 6px; }
+  .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; min-width: 300px; }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog h3 { margin: 0 0 12px; }
+  dialog .row input { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>●</span> Телеметрія вузлів</h1>
+  <span class="spacer"></span>
+  <span id="gwPill" class="pill"><i class="dot"></i><span>Gateway</span></span>
+  <span id="brokerPill" class="pill"><i class="dot"></i><span id="brokerText">MQTT</span></span>
+  <button class="btn small" id="btnAddNode">+ Вузол</button>
+  <button class="btn small" id="btnBroker">MQTT</button>
+</header>
+
+<main>
+  <div id="banner" class="banner hidden"></div>
+
+  <section class="kpis">
+    <div class="kpi"><div class="label">Вузли online</div><div class="value" id="kOnline">–</div><div class="sub" id="kOnlineSub"></div></div>
+    <div class="kpi"><div class="label">Втрати пакетів</div><div class="value" id="kLoss">–</div><div class="sub">за всіма вузлами</div></div>
+    <div class="kpi"><div class="label">Дублікати</div><div class="value" id="kDup">–</div><div class="sub">відкинуто Gateway</div></div>
+    <div class="kpi"><div class="label">Пошкоджені</div><div class="value" id="kBad">–</div><div class="sub">відхилено за CRC</div></div>
+  </section>
+
+  <section>
+    <h2>Вузли</h2>
+    <div id="nodes" class="nodes"></div>
+  </section>
+
+  <section>
+    <div class="row" style="justify-content: space-between">
+      <h2 style="margin:0">Графіки</h2>
+      <button class="btn small" id="btnAddChart">+ Графік</button>
+    </div>
+    <div id="charts" class="charts"></div>
+  </section>
+
+  <section class="grid2">
+    <div class="panel">
+      <h2>Журнал тривог</h2>
+      <div id="events" class="log"><div class="empty">Тривог ще не було</div></div>
+    </div>
+    <div class="ctrl">
+      <div class="panel">
+        <h2>Сервопривід</h2>
+        <div class="row"><label>Вузол</label><select id="servoNode"></select></div>
+        <div class="row"><label>Кут <b id="servoVal">90</b>°</label><input type="range" id="servoRange" min="0" max="180" value="90"></div>
+        <button class="btn primary" id="btnServo" style="width:100%">Повернути</button>
+      </div>
+      <div class="panel">
+        <h2>Симуляція втрат</h2>
+        <div class="row"><label>Вузол</label><select id="lossNode"></select></div>
+        <div class="row"><label>Втрати %</label><input type="number" id="lossPct" min="0" max="100" value="20" style="width:80px"></div>
+        <div class="row">
+          <button class="btn primary" id="btnLossOn" style="flex:1">Увімкнути</button>
+          <button class="btn" id="btnLossOff" style="flex:1">Вимкнути</button>
+        </div>
+        <div class="sub" style="color:var(--muted);font-size:12px">Команди йдуть як CONFIG; чи виконує їх прошивка — залежить від вузла.</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="dlgNode">
+  <h3>Новий вузол</h3>
+  <div class="row"><label>Node ID</label><input type="number" id="nId" min="1" max="65535" value="1"></div>
+  <div class="row"><label>Назва</label><input type="text" id="nName" maxlength="40"></div>
+  <div class="row"><label>IP</label><input type="text" id="nIp" maxlength="45" placeholder="необов'язково"></div>
+  <div class="row"><button class="btn primary" id="nSave" style="flex:1">Додати</button><button class="btn" data-close>Скасувати</button></div>
+</dialog>
+<dialog id="dlgBroker">
+  <h3>MQTT брокер</h3>
+  <div class="row"><label>Host</label><input type="text" id="bHost"></div>
+  <div class="row"><label>Порт</label><input type="number" id="bPort"></div>
+  <div class="row"><button class="btn primary" id="bSave" style="flex:1">Зберегти</button><button class="btn" data-close>Скасувати</button></div>
+</dialog>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; };
+const COLORS = ["#4f9cff", "#2dd4bf", "#fbbf24", "#f87171", "#a78bfa", "#f472b6"];
+const RANGES = { "5 хв": 300, "30 хв": 1800, "1 год": 3600, "6 год": 21600, "24 год": 86400 };
+
+let state = { nodes: [], mqtt_config: {} };
+let metrics = {};           // {node_id: [metric,...]}
+let charts = [];            // конфіги графіків
+let instances = {};         // id -> Chart
+let nextId = 1;
+let lastSelectKey = "";
+
+/* ---------- збереження налаштувань графіків (лише зручність, не дані) ---------- */
+function loadCharts() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("charts_v4") || "null");
+    if (Array.isArray(raw) && raw.length) { charts = raw; nextId = Math.max(...raw.map(c => c.id)) + 1; return; }
+  } catch (e) {}
+  charts = [{ id: 1, node: null, metric: null, range: 300 }, { id: 2, node: null, metric: null, range: 300 }];
+  nextId = 3;
+}
+function saveCharts() { try { localStorage.setItem("charts_v4", JSON.stringify(charts)); } catch (e) {} }
+
+async function api(path, method = "GET", data) {
+  const opt = { method };
+  if (data !== undefined) { opt.headers = { "Content-Type": "application/json" }; opt.body = JSON.stringify(data); }
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function toast(msg) { const b = $("banner"); b.textContent = msg; b.className = "banner warn"; setTimeout(() => b.classList.add("hidden"), 4000); }
+
+/* ---------- вузли ---------- */
+function nodeCard(n) {
+  const loss = Math.min(100, n.loss_rate || 0);
+  const lossCls = loss > 10 ? "var(--bad)" : loss > 2 ? "var(--warn)" : "var(--ok)";
+  const seen = n.last_seen_s == null ? "ще не було пакетів" : n.last_seen_s + " с тому";
+  return `<div class="node ${n.online ? "" : "offline"} ${n.alarm_active ? "alarm" : ""}">
+    <div class="node-head">
+      <div><div class="title">#${n.node_id} ${esc(n.name)}</div><div class="sub mono">${esc(n.ip_address)}</div></div>
+      <span class="spacer"></span>
+      <span class="pill">${esc(n.transport)}</span>
+      <span class="pill ${n.online ? "ok" : ""}"><i class="dot"></i>${n.online ? "online" : "offline"}</span>
+    </div>
+    <div class="stats">
+      <div><b style="color:var(--ok)">${n.received_count}</b><span>отримано</span></div>
+      <div><b style="color:var(--bad)">${n.lost_count}</b><span>втрачено</span></div>
+      <div><b style="color:var(--warn)">${n.duplicate_count}</b><span>дублікатів</span></div>
+    </div>
+    <div class="bar" title="loss rate"><i style="width:${Math.max(loss, 0.5)}%;background:${lossCls}"></i></div>
+    <div class="node-foot">
+      <span>loss ${loss.toFixed(1)}% · seq ${n.max_seq_seen} · ${seen}</span><span class="spacer"></span>
+      ${n.alarm_active ? `<span class="pill bad">тривога</span><button class="btn small" data-alarm="${n.node_id}" data-state="0">Скинути</button>`
+                       : `<button class="btn small danger" data-alarm="${n.node_id}" data-state="1">Аларм</button>`}
+    </div>
+  </div>`;
+}
+
+function renderState() {
+  const nodes = state.nodes, cfg = state.mqtt_config;
+  const online = nodes.filter(n => n.online).length;
+  const recv = nodes.reduce((a, n) => a + n.received_count, 0);
+  const lost = nodes.reduce((a, n) => a + n.lost_count, 0);
+  const dup = nodes.reduce((a, n) => a + n.duplicate_count, 0);
+  $("kOnline").textContent = online + " / " + nodes.length;
+  $("kLoss").textContent = (recv + lost ? (lost / (recv + lost) * 100).toFixed(1) : "0.0") + "%";
+  $("kDup").textContent = dup;
+  $("kBad").textContent = state.corrupted_count;
+
+  const bp = $("brokerPill");
+  bp.className = "pill " + (cfg.connected ? "ok" : "bad");
+  $("brokerText").textContent = `${cfg.host}:${cfg.port}`;
+  const gw = $("gwPill"), age = state.gateway_age_s;
+  const gwAlive = age != null && age < 6;
+  gw.className = "pill " + (gwAlive ? "ok" : cfg.connected ? "warn" : "");
+  gw.lastElementChild.textContent = gwAlive ? "Gateway активний" : "Gateway мовчить";
+
+  const banner = $("banner");
+  if (!cfg.connected) { banner.className = "banner"; banner.textContent = "MQTT: " + cfg.last_error; }
+  else if (!gwAlive) { banner.className = "banner warn"; banner.textContent = "Gateway не надсилає стан — статуси online/loss можуть бути застарілими."; }
+  else banner.className = "banner hidden";
+
+  $("nodes").innerHTML = nodes.length ? nodes.map(nodeCard).join("")
+    : `<div class="empty panel" style="grid-column:1/-1">Вузлів ще немає. Запустіть Gateway і вузол або додайте вузол вручну.</div>`;
+
+  // селекти керування перемальовуємо лише коли змінився набір вузлів
+  const key = nodes.map(n => n.node_id).join(",");
+  if (key !== lastSelectKey) {
+    lastSelectKey = key;
+    for (const id of ["servoNode", "lossNode"]) {
+      const sel = $(id), prev = sel.value;
+      sel.innerHTML = nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
+      if (prev) sel.value = prev;
+    }
+    renderCharts();
+  }
+}
+
+/* ---------- графіки ---------- */
+function pickDefaults(c) {
+  const ids = Object.keys(metrics);
+  if (c.node == null || !metrics[c.node]) c.node = ids.length ? +ids[0] : (state.nodes[0] ? state.nodes[0].node_id : null);
+  const list = metrics[c.node] || [];
+  if (!list.includes(c.metric)) c.metric = list[0] || null;
+}
+
+function chartHtml(c) {
+  const nodeIds = [...new Set([...Object.keys(metrics).map(Number), ...state.nodes.map(n => n.node_id)])].sort((a, b) => a - b);
+  const mlist = metrics[c.node] || [];
+  return `<div class="chart" data-id="${c.id}">
+    <div class="chart-bar">
+      <select data-f="node">${nodeIds.map(i => `<option value="${i}" ${i == c.node ? "selected" : ""}>Вузол #${i}</option>`).join("")}</select>
+      <select data-f="metric">${mlist.length ? mlist.map(m => `<option ${m == c.metric ? "selected" : ""}>${esc(m)}</option>`).join("") : "<option>—</option>"}</select>
+      <select data-f="range">${Object.entries(RANGES).map(([l, s]) => `<option value="${s}" ${s == c.range ? "selected" : ""}>${l}</option>`).join("")}</select>
+      <span class="spacer"></span>
+      <button class="btn small" data-rm="${c.id}" title="Видалити">✕</button>
+    </div>
+    <div class="chart-wrap"><canvas></canvas><div class="chart-empty">Даних поки немає</div></div>
+  </div>`;
+}
+
+function renderCharts() {
+  Object.values(instances).forEach(i => i.destroy());
+  instances = {};
+  charts.forEach(pickDefaults);
+  $("charts").innerHTML = charts.map(chartHtml).join("");
+  charts.forEach(c => {
+    const el = document.querySelector(`.chart[data-id="${c.id}"] canvas`);
+    const color = COLORS[(c.id - 1) % COLORS.length];
+    instances[c.id] = new Chart(el, {
+      type: "line",
+      data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: color + "22", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: "#8496b0", maxTicksLimit: 6, maxRotation: 0, font: { size: 10 } }, grid: { color: "rgba(37,52,74,.5)" } },
+          y: { ticks: { color: "#8496b0", font: { size: 10 } }, grid: { color: "rgba(37,52,74,.5)" } },
+        },
+      },
+    });
+  });
+  refreshCharts();
+}
+
+async function refreshCharts() {
+  await Promise.all(charts.map(async c => {
+    const inst = instances[c.id];
+    const box = document.querySelector(`.chart[data-id="${c.id}"] .chart-empty`);
+    if (!inst || c.node == null || !c.metric) { if (box) box.classList.remove("hidden"); return; }
+    try {
+      const d = await api(`/api/history?node_id=${c.node}&metric=${encodeURIComponent(c.metric)}&since_s=${c.range}`);
+      const fmt = c.range > 3600 ? { hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit", second: "2-digit" };
+      inst.data.labels = d.points.map(p => new Date(p.t).toLocaleTimeString("uk-UA", fmt));
+      inst.data.datasets[0].data = d.points.map(p => p.v);
+      inst.data.datasets[0].label = c.metric;
+      inst.update("none");
+      box.classList.toggle("hidden", d.points.length > 0);
+    } catch (e) { /* наступна ітерація спробує знову */ }
+  }));
+}
+
+$("charts").addEventListener("change", e => {
+  const f = e.target.dataset.f; if (!f) return;
+  const c = charts.find(x => x.id == e.target.closest(".chart").dataset.id);
+  if (f === "node") { c.node = +e.target.value; c.metric = null; }
+  if (f === "metric") c.metric = e.target.value;
+  if (f === "range") c.range = +e.target.value;
+  saveCharts(); renderCharts();
+});
+$("charts").addEventListener("click", e => {
+  const id = e.target.dataset.rm; if (!id) return;
+  charts = charts.filter(c => c.id != id); saveCharts(); renderCharts();
+});
+$("btnAddChart").onclick = () => { charts.push({ id: nextId++, node: null, metric: null, range: 300 }); saveCharts(); renderCharts(); };
+
+/* ---------- події, керування ---------- */
+async function refreshEvents() {
+  try {
+    const ev = await api("/api/events");
+    $("events").innerHTML = ev.length
+      ? ev.map(e => `<div><time>${new Date(e.t).toLocaleTimeString("uk-UA")}</time><b>#${e.node_id}</b> <span class="mono">${esc(e.text)}</span></div>`).join("")
+      : `<div class="empty">Тривог ще не було</div>`;
+  } catch (e) {}
+}
+
+$("nodes").addEventListener("click", async e => {
+  const id = e.target.dataset.alarm; if (!id) return;
+  try { await api(`/api/alarm/${id}`, "POST", { state: e.target.dataset.state === "1" }); tick(); }
+  catch (err) { toast(err.message); }
+});
+$("servoRange").oninput = e => $("servoVal").textContent = e.target.value;
+$("btnServo").onclick = async () => {
+  try { const r = await api(`/api/servo/${$("servoNode").value}`, "POST", { angle: +$("servoRange").value }); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); }
+  catch (e) { toast(e.message); }
+};
+async function sendLoss(on) {
+  try { const r = await api(`/api/simulate-loss/${$("lossNode").value}`, "POST", { loss_percent: on ? +$("lossPct").value : 0 }); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); }
+  catch (e) { toast(e.message); }
+}
+$("btnLossOn").onclick = () => sendLoss(true);
+$("btnLossOff").onclick = () => sendLoss(false);
+
+/* ---------- діалоги ---------- */
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest("dialog").close());
+$("btnAddNode").onclick = () => $("dlgNode").showModal();
+$("nSave").onclick = async () => {
+  try { await api("/api/nodes/add", "POST", { node_id: +$("nId").value, name: $("nName").value, ip_address: $("nIp").value }); $("dlgNode").close(); tick(); }
+  catch (e) { toast(e.message); }
+};
+$("btnBroker").onclick = () => { $("bHost").value = state.mqtt_config.host || "localhost"; $("bPort").value = state.mqtt_config.port || 1883; $("dlgBroker").showModal(); };
+$("bSave").onclick = async () => {
+  try { await api("/api/config/broker", "POST", { host: $("bHost").value, port: +$("bPort").value }); $("dlgBroker").close(); tick(); }
+  catch (e) { toast(e.message); }
+};
+
+/* ---------- цикл оновлення ---------- */
+async function tick() {
+  try { state = await api("/api/state"); renderState(); }
+  catch (e) { $("banner").className = "banner"; $("banner").textContent = "Немає зв'язку з веб-сервером"; }
+}
+let n = 0;
+async function slowTick() {
+  try {
+    const m = await api("/api/metrics");
+    const changed = JSON.stringify(m) !== JSON.stringify(metrics);
+    metrics = m;
+    if (changed) renderCharts(); else await refreshCharts();
+  } catch (e) {}
+  refreshEvents();
+}
+loadCharts();
+tick().then(slowTick);
+setInterval(tick, 1000);
+setInterval(slowTick, 3000);
+</script>
+</body>
+</html>

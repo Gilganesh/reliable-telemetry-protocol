@@ -10,3 +10,7 @@ build/
 logs/*.jsonl
 logs/*.out
 .vscode/
+*.db
+*.db-wal
+*.db-shm
+gateway_log.txt
