@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
@@ -18,6 +19,7 @@
 
 #define MAX_NODES 10
 #define MAX_SEEN_ALARMS 16
+#define SEQ_WINDOW 64 // скільки останніх sequence пам'ятаємо для відрізнення дубліката від запізнілого пакета
 #define NODE_TIMEOUT_MS 5000 // 5 секунд без повідомлень = вузол OFFLINE
 #define LOG_FILE_PATH "gateway_log.txt"
 
@@ -117,6 +119,11 @@ typedef struct {
     // Кільцевий буфер для дедуплікації критичних повідомлень
     uint32_t recent_alarms[MAX_SEEN_ALARMS];
     int alarm_idx;
+    int alarm_filled; // скільки комірок recent_alarms реально заповнено (щоб порожні нулі не збігались з seq=0)
+
+    // Біт i = "пакет з sequence (max_seq_seen - i) уже отримано". Дозволяє
+    // відрізнити справжній дублікат від запізнілого (reordered) пакета.
+    uint64_t seen_mask;
 
     RouteKind last_transport; // яким каналом прийшов ОСТАННІЙ пакет цього вузла
 } NodeState;
@@ -198,12 +205,18 @@ NodeState* find_or_create_node(uint16_t node_id) {
         log_event("[СТАТУС] Новий вузол %u зареєстрований\n", node_id);
         return new_node;
     }
+    static int last_rejected_id = -1; // щоб не спамити логом на кожен пакет
+    if (last_rejected_id != node_id) {
+        last_rejected_id = node_id;
+        log_event("[ПОПЕРЕДЖЕННЯ] Таблиця вузлів заповнена (MAX_NODES=%d), вузол %u ігнорується\n",
+                   MAX_NODES, node_id);
+    }
     return NULL;
 }
 
 // Перевірка на наявність дублікатів ALARM
 bool is_duplicate_alarm(NodeState *node, uint32_t seq) {
-    for (int i = 0; i < MAX_SEEN_ALARMS; i++) {
+    for (int i = 0; i < node->alarm_filled; i++) {
         if (node->recent_alarms[i] == seq) return true;
     }
     return false;
@@ -213,6 +226,7 @@ bool is_duplicate_alarm(NodeState *node, uint32_t seq) {
 void record_alarm(NodeState *node, uint32_t seq) {
     node->recent_alarms[node->alarm_idx] = seq;
     node->alarm_idx = (node->alarm_idx + 1) % MAX_SEEN_ALARMS;
+    if (node->alarm_filled < MAX_SEEN_ALARMS) node->alarm_filled++;
 }
 
 // Надсилає сирі байти НАЗАД тим самим каналом, звідки прийшов пакет.
@@ -288,18 +302,45 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
     if (!node) return;
 
     node->last_seen_ms = get_monotonic_time_ms();
-    node->received_count++;
     node->last_transport = route->kind;
 
-    // Аналіз втрат та дублікатів
+    // Аналіз втрат, дублікатів і порядку (вікно SEQ_WINDOW останніх sequence).
     if (node->max_seq_seen == -1) {
-        node->max_seq_seen = pkt.sequence;
+        node->max_seq_seen = (int32_t)pkt.sequence;
+        node->seen_mask = 1;
+        node->received_count++;
     } else {
-        if ((int32_t)pkt.sequence > node->max_seq_seen) {
-            node->lost_count += (pkt.sequence - node->max_seq_seen - 1);
-            node->max_seq_seen = pkt.sequence;
+        int64_t diff = (int64_t)pkt.sequence - (int64_t)node->max_seq_seen;
+        if (diff > 0) {
+            // Новий найвищий sequence; усе, що пропущено між ними, -- втрати
+            // (якщо воно потім прийде запізно, лічильник втрат зменшиться).
+            node->lost_count += (uint32_t)(diff - 1);
+            node->seen_mask = (diff >= SEQ_WINDOW) ? 1 : ((node->seen_mask << diff) | 1);
+            node->max_seq_seen = (int32_t)pkt.sequence;
+            node->received_count++;
+        } else if (-diff < SEQ_WINDOW) {
+            uint64_t bit = 1ULL << (-diff);
+            if (node->seen_mask & bit) {
+                node->duplicate_count++;
+            } else {
+                // Запізнілий пакет (порушення порядку): не дублікат, і раніше
+                // він був зарахований як втрачений.
+                node->seen_mask |= bit;
+                node->received_count++;
+                if (node->lost_count > 0) node->lost_count--;
+                log_event("[ПОРЯДОК] Вузол %u: пакет Seq %u прийшов із запізненням (порушення порядку)\n",
+                           pkt.node_id, pkt.sequence);
+            }
         } else {
-            node->duplicate_count++;
+            // sequence відстає від максимуму більше ніж на вікно -- це не
+            // дублікат, а перезапуск вузла (sequence пішов з нуля).
+            log_event("[СТАТУС] Вузол %u, схоже, перезапустився (Seq %u після %d). Скидаю відстеження sequence\n",
+                       pkt.node_id, pkt.sequence, node->max_seq_seen);
+            node->max_seq_seen = (int32_t)pkt.sequence;
+            node->seen_mask = 1;
+            node->alarm_idx = 0;
+            node->alarm_filled = 0;
+            node->received_count++;
         }
     }
 
@@ -626,6 +667,8 @@ int main(void) {
         fprintf(stderr, "[УВАГА] Не вдалося відкрити %s для запису -- лог буде тільки на екрані.\n",
                 LOG_FILE_PATH);
     }
+
+    signal(SIGPIPE, SIG_IGN); // запис у закритий TCP/UART не повинен вбивати шлюз
 
     mosquitto_lib_init();
     mosq_global = mosquitto_new("GatewayClient", true, NULL);
