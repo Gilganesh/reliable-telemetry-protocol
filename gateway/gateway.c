@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <time.h>
@@ -37,6 +38,7 @@
 #define UART_DEVICE   "/dev/ttyUSB0"  /* USB-до-TTL перехідник; якщо інша
                                         * назва -- перевір `ls /dev/ttyUSB*`
                                         * після підключення й зміни тут. */
+#define UART_FRAME_GAP_MS 100
 #define UART_BAUD     B115200         /* має збігатися з Serial2.begin()
                                         * на платі, яка сидить на UART */
 
@@ -401,20 +403,65 @@ static bool detect_wifi_ssid(char *out, size_t n) {
     return found;
 }
 
-// Пароль збереженого профілю. Може вимагати прав (sudo) -- тоді просто
-// не знайдеться, і користувач вписує його в gateway.conf.
+// Ім'я активного Wi-Fi підключення NetworkManager. Воно не завжди збігається
+// з SSID (профіль із Raspberry Pi Imager зветься "preconfigured").
+static bool detect_wifi_conn_name(char *out, size_t n) {
+    FILE *f = popen("nmcli -t -f NAME,TYPE connection show --active 2>/dev/null", "r");
+    if (!f) return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        str_trim(line);
+        char *colon = strrchr(line, ':');
+        if (!colon || strcmp(colon + 1, "802-11-wireless") != 0) continue;
+        *colon = '\0';
+        size_t o = 0;
+        for (const char *p = line; *p && o + 1 < n; p++) {
+            if (*p == '\\' && (p[1] == ':' || p[1] == '\\')) p++;
+            out[o++] = *p;
+        }
+        out[o] = '\0';
+        found = out[0] != '\0';
+        break;
+    }
+    pclose(f);
+    return found;
+}
+
+// Пароль активної Wi-Fi мережі з профілю NetworkManager. Звичайному
+// користувачеві паролі часто недоступні, тому пробуємо ще `sudo -n`
+// (на Raspberry Pi OS sudo без пароля -- типове налаштування). Пароль іде
+// лише в UART-кабель до плати, у лог і в git він не потрапляє.
 static bool detect_wifi_pass(const char *ssid, char *out, size_t n) {
-    if (strchr(ssid, '\'') || strchr(ssid, '\\')) return false; // не складаємо shell-команду з дивних символів
-    char cmd[256];
+    (void)ssid;
+    char conn[128];
+    if (!detect_wifi_conn_name(conn, sizeof(conn))) return false;
+    if (strchr(conn, '\'') || strchr(conn, '\\')) return false; // не складаємо shell-команду з дивних символів
+    char cmd[320];
     snprintf(cmd, sizeof(cmd),
-             "nmcli -s -g 802-11-wireless-security.psk connection show '%s' 2>/dev/null", ssid);
+             "nmcli -s -g 802-11-wireless-security.psk connection show '%s' 2>/dev/null", conn);
+    if (run_first_line(cmd, out, n)) return true;
+    snprintf(cmd, sizeof(cmd),
+             "sudo -n nmcli -s -g 802-11-wireless-security.psk connection show '%s' 2>/dev/null", conn);
     return run_first_line(cmd, out, n);
 }
 
-static void load_provision_config(void) {
-    memset(&g_prov, 0, sizeof(g_prov));
-    g_prov.udp_port = UDP_PORT;
-    g_prov.tcp_port = TCP_PORT;
+// Збирає актуальні налаштування. Мережа Pi може змінитися на ходу, тому
+// ПОТОЧНІ дані (IP, активна Wi-Fi) мають пріоритет. gateway.conf може
+// містити кілька мереж (пари wifi_ssid / wifi_pass): береться та, що збігається
+// з активною Wi-Fi Pi. Якщо в файлі її нема -- пароль шукаємо в NetworkManager.
+#define MAX_KNOWN_NETWORKS 8
+
+static void build_provision_config(ProvisionConfig *out, bool *conf_other_network) {
+    struct { char ssid[64]; char pass[96]; } nets[MAX_KNOWN_NETWORKS];
+    int net_count = 0;
+    char conf_ip[16] = "";
+    memset(nets, 0, sizeof(nets));
+
+    memset(out, 0, sizeof(*out));
+    out->udp_port = UDP_PORT;
+    out->tcp_port = TCP_PORT;
+    *conf_other_network = false;
 
     FILE *f = fopen(CONF_FILE_PATH, "r");
     if (f) {
@@ -426,30 +473,96 @@ static void load_provision_config(void) {
             *eq = '\0';
             char *key = line, *val = eq + 1;
             str_trim(key); str_trim(val);
-            if (!strcmp(key, "wifi_ssid"))      snprintf(g_prov.ssid, sizeof(g_prov.ssid), "%s", val);
-            else if (!strcmp(key, "wifi_pass")) snprintf(g_prov.pass, sizeof(g_prov.pass), "%s", val);
-            else if (!strcmp(key, "gateway_ip"))snprintf(g_prov.ip, sizeof(g_prov.ip), "%s", val);
-            else if (!strcmp(key, "udp_port"))  g_prov.udp_port = atoi(val);
-            else if (!strcmp(key, "tcp_port"))  g_prov.tcp_port = atoi(val);
+            if (!strcmp(key, "wifi_ssid")) {
+                if (net_count < MAX_KNOWN_NETWORKS) {
+                    snprintf(nets[net_count].ssid, sizeof(nets[0].ssid), "%s", val);
+                    net_count++;
+                }
+            } else if (!strcmp(key, "wifi_pass")) {
+                if (net_count > 0) snprintf(nets[net_count-1].pass, sizeof(nets[0].pass), "%s", val);
+            }
+            else if (!strcmp(key, "gateway_ip")) snprintf(conf_ip, sizeof(conf_ip), "%s", val);
+            else if (!strcmp(key, "udp_port"))   out->udp_port = atoi(val);
+            else if (!strcmp(key, "tcp_port"))   out->tcp_port = atoi(val);
         }
         fclose(f);
     }
 
-    if (!g_prov.ip[0]) detect_own_ip(g_prov.ip, sizeof(g_prov.ip));
-    if (!g_prov.ssid[0]) detect_wifi_ssid(g_prov.ssid, sizeof(g_prov.ssid));
-    if (g_prov.ssid[0] && !g_prov.pass[0]) detect_wifi_pass(g_prov.ssid, g_prov.pass, sizeof(g_prov.pass));
+    if (!detect_own_ip(out->ip, sizeof(out->ip))) snprintf(out->ip, sizeof(out->ip), "%s", conf_ip);
 
-    g_prov_ready = g_prov.ssid[0] && g_prov.ip[0];
+    char active[64] = "";
+    if (detect_wifi_ssid(active, sizeof(active))) {
+        snprintf(out->ssid, sizeof(out->ssid), "%s", active);
+        bool matched = false;
+        for (int i = 0; i < net_count; i++) {
+            if (strcmp(nets[i].ssid, active) == 0) {
+                snprintf(out->pass, sizeof(out->pass), "%s", nets[i].pass);
+                matched = true;
+                break;
+            }
+        }
+        if (!out->pass[0]) detect_wifi_pass(active, out->pass, sizeof(out->pass));
+        if (!out->pass[0] && !matched && net_count > 0) *conf_other_network = true;
+    } else if (net_count > 0) {
+        // активну Wi-Fi визначити не вдалося (немає nmcli) -- беремо першу мережу з файлу
+        snprintf(out->ssid, sizeof(out->ssid), "%s", nets[0].ssid);
+        snprintf(out->pass, sizeof(out->pass), "%s", nets[0].pass);
+    }
+}
+
+static bool prov_config_equal(const ProvisionConfig *a, const ProvisionConfig *b) {
+    return strcmp(a->ssid, b->ssid) == 0 && strcmp(a->pass, b->pass) == 0 &&
+           strcmp(a->ip, b->ip) == 0 && a->udp_port == b->udp_port && a->tcp_port == b->tcp_port;
+}
+
+static void log_provision_config(bool conf_other_network) {
     if (g_prov_ready) {
         log_event("[НАЛАШТУВАННЯ] Шлюз передаватиме вузлам по UART: gateway_ip=%s, UDP=%d, TCP=%d, Wi-Fi \"%s\", пароль %s\n",
                    g_prov.ip, g_prov.udp_port, g_prov.tcp_port, g_prov.ssid,
                    g_prov.pass[0] ? "заданий" : "НЕ ЗАДАНИЙ");
-        if (!g_prov.pass[0])
+        if (conf_other_network)
+            log_event("[НАЛАШТУВАННЯ] Pi зараз у мережі \"%s\", а в %s її нема і пароль із системи не отримано -- "
+                       "додайте пару wifi_ssid/wifi_pass для цієї мережі в %s\n", g_prov.ssid, CONF_FILE_PATH, CONF_FILE_PATH);
+        else if (!g_prov.pass[0])
             log_event("[НАЛАШТУВАННЯ] Пароль Wi-Fi не визначено -- впишіть wifi_pass у %s, якщо мережа не відкрита\n", CONF_FILE_PATH);
     } else {
         log_event("[НАЛАШТУВАННЯ] Не вдалося визначити Wi-Fi/IP -- автоналаштування вузлів вимкнено. "
                    "Створіть %s (див. gateway.conf.example)\n", CONF_FILE_PATH);
     }
+}
+
+static void load_provision_config(void) {
+    bool other = false;
+    build_provision_config(&g_prov, &other);
+    g_prov_ready = g_prov.ssid[0] && g_prov.ip[0];
+    log_provision_config(other);
+}
+
+// Скидає стан автоналаштування вузла -- наступний цикл uart_tick() надішле все знову.
+static void provision_reset(NodeState *n) {
+    n->prov_acks = 0;
+    n->prov_seq_wifi = 0;
+    n->prov_seq_gw = 0;
+    n->prov_last_ms = 0;
+}
+
+// Раз на кілька секунд перевіряє, чи не змінилася мережа Pi. Якщо так --
+// плати на дроті отримують нові налаштування без перезапуску шлюзу.
+static void provision_refresh(uint64_t now) {
+    static uint64_t last_check = 0;
+    if (now - last_check < 10000) return;
+    last_check = now;
+
+    ProvisionConfig fresh;
+    bool other = false;
+    build_provision_config(&fresh, &other);
+    if (prov_config_equal(&fresh, &g_prov)) return;
+
+    g_prov = fresh;
+    g_prov_ready = g_prov.ssid[0] && g_prov.ip[0];
+    log_event("[НАЛАШТУВАННЯ] Мережа Pi змінилася -- оновлюю налаштування вузлів\n");
+    log_provision_config(other);
+    for (int i = 0; i < node_count; i++) provision_reset(&nodes[i]);
 }
 
 // Пакує й пише у UART один кадр (шлюз -> плата). payload_json може бути NULL.
@@ -524,6 +637,7 @@ static void uart_tick(uint64_t now) {
         uart_write_frame(MSG_HEARTBEAT, 0, next_down_seq(), NULL); // node_id 0 = усім
     }
 
+    provision_refresh(now);
     if (!g_prov_ready) return;
     for (int i = 0; i < node_count; i++) {
         NodeState *n = &nodes[i];
@@ -724,7 +838,15 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
     NodeState *node = find_or_create_node(pkt.node_id);
     if (!node) return;
 
-    node->last_seen_ms = get_monotonic_time_ms();
+    // Дріт утикнули знову (вузол з'явився на UART після того, як був деінде або мовчав):
+    // налаштування Wi-Fi могли застаріти -- перенастроюємо.
+    uint64_t t_now = get_monotonic_time_ms();
+    if (route->kind == ROUTE_UART && node->last_seen_ms != 0 &&
+        (node->last_route.kind != ROUTE_UART || t_now - node->last_seen_ms > NODE_TIMEOUT_MS)) {
+        log_event("[НАЛАШТУВАННЯ] Вузол %u знову на UART -- перенастроюю\n", pkt.node_id);
+        provision_reset(node);
+    }
+    node->last_seen_ms = t_now;
     node->last_transport = route->kind;
     node->last_route = *route;
 
@@ -774,10 +896,7 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
             node->received_count++;
             node->last_ts_ms = pkt.timestamp_ms;
             // Після перезапуску плата могла втратити налаштування -- шлемо знову
-            node->prov_acks = 0;
-            node->prov_seq_wifi = 0;
-            node->prov_seq_gw = 0;
-            node->prov_last_ms = 0;
+            provision_reset(node);
         }
     }
 
@@ -1029,6 +1148,7 @@ void setup_uart(void) {
     tty.c_cflag |= CS8;        // 8 біт даних
     tty.c_cflag &= ~CRTSCTS;   // без апаратного flow control
     tty.c_cflag |= (CREAD | CLOCAL);
+    tty.c_cflag &= ~HUPCL;     // не смикати DTR/RTS при закритті порту (вони скидають ESP32)
 
     tty.c_lflag &= ~ICANON;    // сирий (не по-рядковий) режим
     tty.c_lflag &= ~(ECHO | ECHOE | ISIG);
@@ -1048,6 +1168,11 @@ void setup_uart(void) {
         return;
     }
 
+    // USB-UART адаптер плати: DTR/RTS підключені до EN/GPIO0, і відкриття порту
+    // їх активує (плата перезавантажується). Знімаємо обидва, щоб далі вона працювала.
+    int modem_bits = TIOCM_DTR | TIOCM_RTS;
+    ioctl(g_uart_fd, TIOCMBIC, &modem_bits);
+
     frame_reader_init(&g_uart_reader);
     log_event("[UART] Слухаю на %s (115200 8N1)\n", uart_dev);
 }
@@ -1058,6 +1183,15 @@ void poll_uart(void) {
     uint8_t rx[256];
     ssize_t n = read(g_uart_fd, rx, sizeof(rx));
     if (n > 0) {
+        // Кадр плата пише одним блоком (~15 мс на 115200). Пауза довша за
+        // UART_FRAME_GAP_MS всередині недоскладеного кадру означає сміття (завантажувач
+        // ESP32 друкує текст при скиданні) -- скидаємо складання, щоб наступний
+        // справжній кадр не з'їхав на зміщення.
+        uint64_t now_ms = get_monotonic_time_ms();
+        static uint64_t last_rx_ms = 0;
+        if (g_uart_reader.have > 0 && now_ms - last_rx_ms > UART_FRAME_GAP_MS)
+            frame_reader_init(&g_uart_reader);
+        last_rx_ms = now_ms;
         ReplyRoute route = { .kind = ROUTE_UART, .fd = g_uart_fd };
         for (ssize_t i = 0; i < n; i++) {
             if (frame_reader_feed_byte(&g_uart_reader, rx[i])) {
