@@ -8,7 +8,7 @@ ifneq ($(BREW),)
   CFLAGS += -I$(BREW)/include
   LDFLAGS += -L$(BREW)/lib
 endif
-CFLAGS += -Iprotocol
+CFLAGS += -Iprotocol -pthread
 
 SRC = gateway.c protocol/protocol.c protocol/reliability.c
 
