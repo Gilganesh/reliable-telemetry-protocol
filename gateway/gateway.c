@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <glob.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1168,11 +1169,38 @@ void poll_tcp(void) {
     }
 }
 
+// Знаходить, який файл відкривати. Номер ttyUSBx Linux видає за порядком появи
+// пристроїв, тож після перепідключення він "скаче" -- шлях визначаємо наново
+// при КОЖНІЙ спробі відкриття.
+//   GATEWAY_UART=/dev/serial/by-id/usb-FTDI*  -- шаблон (береться перший збіг)
+//   GATEWAY_UART=/dev/ttyUSB1                 -- конкретний шлях
+//   не задано -- перший з /dev/serial/by-id/*, /dev/ttyUSB*, /dev/ttyACM*, UART_DEVICE
+static bool resolve_uart_path(char *out, size_t n) {
+    const char *env = getenv("GATEWAY_UART");
+    const char *defaults[] = { "/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/ttyACM*", UART_DEVICE };
+    const char **cands = defaults;
+    size_t count = sizeof(defaults) / sizeof(defaults[0]);
+    const char *one[1];
+    if (env && *env) { one[0] = env; cands = one; count = 1; }
+
+    for (size_t i = 0; i < count; i++) {
+        glob_t g;
+        if (glob(cands[i], 0, NULL, &g) == 0) {
+            if (g.gl_pathc > 0) snprintf(out, n, "%s", g.gl_pathv[0]);
+            bool ok = g.gl_pathc > 0;
+            globfree(&g);
+            if (ok) return true;
+        }
+    }
+    snprintf(out, n, "%s", (env && *env) ? env : UART_DEVICE); // для повідомлення про помилку
+    return false;
+}
+
 // ---- UART: відкрити послідовний порт (термінально, 8N1), читати з фреймінгом ----
 // verbose=false -- тихі повторні спроби перевідкриття (перехідник висмикнули).
 void setup_uart(bool verbose) {
-    const char *uart_dev = getenv("GATEWAY_UART"); // перевизначення шляху: GATEWAY_UART=/dev/serial0
-    if (!uart_dev || !*uart_dev) uart_dev = UART_DEVICE;
+    char uart_dev[256];
+    resolve_uart_path(uart_dev, sizeof(uart_dev));
     g_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (g_uart_fd < 0) {
         if (!verbose) return;
