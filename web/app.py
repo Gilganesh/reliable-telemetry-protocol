@@ -5,8 +5,9 @@ web/app.py -- Блок E: веб-дашборд телеметрії (графі
   * Gateway (gateway.c) -- ЄДИНЕ джерело правди про received/lost/duplicate/
     online/corrupted. Веб лише читає його готовий стан з STATE_TOPIC і нічого
     з цього не рахує сам.
-  * Веб читає UPLINK_TOPIC ТІЛЬКИ щоб зберегти значення сенсорів для графіків
-    (SQLite). Лічильників тут нема.
+  * Значення сенсорів для графіків (SQLite) веб бере з TELEMETRY_TOPIC, куди
+    Gateway публікує кожен валідний пакет НЕЗАЛЕЖНО від транспорту (плати на
+    UDP/TCP/UART у case24/uplink не потрапляють). Лічильників тут нема.
   * Дублікати не потрапляють у базу: UNIQUE(node_id, sequence, ts_ms) +
     INSERT OR IGNORE. Повторна доставка того самого пакета (retry, буфер
     store-and-forward) ігнорується; перезапуск плати (sequence з нуля, інший
@@ -31,10 +32,10 @@ from pathlib import Path
 import paho.mqtt.client as mqtt
 from flask import Flask, jsonify, request, send_from_directory
 
-from protocol_codec import CorruptPacketError, MsgType, Packet
+from protocol_codec import MsgType, Packet
 
 STATE_TOPIC = "case24/gateway/state"
-UPLINK_TOPIC = "case24/uplink"
+TELEMETRY_TOPIC = "case24/gateway/telemetry"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TELEMETRY_DB", BASE_DIR / "telemetry.db"))
@@ -250,36 +251,37 @@ def on_gateway_state(msg):
                     node[key] = gw[key]
 
 
-def on_uplink(msg):
-    """Тільки збереження даних для графіків. Битий пакет мовчки пропускаємо --
-    Gateway його вже порахував (corrupted_count) і записав у свій лог."""
+def on_telemetry(msg):
+    """Збереження даних для графіків із повідомлення Gateway:
+    {node_id, sequence, ts_ms, type, transport, payload: {...}}.
+    Валідацію CRC уже зробив Gateway."""
     try:
-        pkt = Packet.unpack(msg.payload)
-    except CorruptPacketError:
+        d = json.loads(msg.payload.decode("utf-8"))
+        node_id, sequence = int(d["node_id"]), int(d["sequence"])
+        ts_ms, msg_type = int(d["ts_ms"]), int(d["type"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
         return
 
-    if pkt.msg_type not in (MsgType.TELEMETRY, MsgType.HEARTBEAT, MsgType.ALARM):
+    if msg_type not in (MsgType.TELEMETRY, MsgType.HEARTBEAT, MsgType.ALARM):
         return
-
-    try:
-        payload = json.loads(pkt.payload.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        payload = {}
+    payload = d.get("payload")
     if not isinstance(payload, dict):
         payload = {}
+    # Packet тут -- лише контейнер полів для store_*; payload вже розібраний
+    pkt = Packet(1, msg_type, node_id, sequence, ts_ms, b"")
 
     with nodes_lock:
-        node = get_or_create_node(pkt.node_id)
+        node = get_or_create_node(node_id)
         if "ip" in payload:
             node["ip_address"] = str(payload["ip"])[:45]
-        if pkt.msg_type == MsgType.ALARM:
+        if msg_type == MsgType.ALARM:
             node["alarm_active"] = True
 
     try:
-        if pkt.msg_type == MsgType.ALARM:
-            store_event(pkt.node_id, pkt, json.dumps(payload, ensure_ascii=False))
+        if msg_type == MsgType.ALARM:
+            store_event(node_id, pkt, json.dumps(payload or d.get("payload_raw", ""), ensure_ascii=False))
         else:
-            store_sample(pkt.node_id, pkt, payload)
+            store_sample(node_id, pkt, payload)
     except sqlite3.Error as e:
         print(f"[DB] помилка запису: {e}")
 
@@ -287,8 +289,8 @@ def on_uplink(msg):
 def on_message(client, userdata, msg):
     if msg.topic == STATE_TOPIC:
         on_gateway_state(msg)
-    elif msg.topic == UPLINK_TOPIC:
-        on_uplink(msg)
+    elif msg.topic == TELEMETRY_TOPIC:
+        on_telemetry(msg)
 
 
 def _rc_failed(rc) -> bool:
@@ -304,7 +306,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
         return
     mqtt_state["connected"] = True
     mqtt_state["last_error"] = "Успішно підключено"
-    client.subscribe([(STATE_TOPIC, 0), (UPLINK_TOPIC, 0)])
+    client.subscribe([(STATE_TOPIC, 0), (TELEMETRY_TOPIC, 0)])
     print(f"[MQTT] Підключено до {mqtt_state['broker_host']}:{mqtt_state['broker_port']}")
 
 

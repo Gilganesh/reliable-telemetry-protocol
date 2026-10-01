@@ -2,9 +2,7 @@
 protocol_codec.py -- Python-кодек, сумісний зі СПРАВЖНІМ протоколом на C
 (protocol.h/protocol.c), який реально ходить по MQTT зараз.
 
-ВАЖЛИВО: НЕ бери ../python-reference/protocol/packet.py для цього
-проєкту -- та версія написана під СТАРУ (v1, UDP) архітектуру і
-серіалізує в big-endian ("!", мережевий порядок байтів). Реальний C-код
+ВАЖЛИВО: тут НЕ big-endian ("!", мережевий порядок байтів). Реальний C-код
 свідомо використовує NATIVE little-endian без htonl
 (docs/team-blocks/00-overview-shared-contract.md, розділ "Важливо для
 Блоку A") -- бо ESP32, ноутбук і Raspberry Pi всі little-endian.
