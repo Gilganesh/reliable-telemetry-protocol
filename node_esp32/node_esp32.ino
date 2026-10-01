@@ -1,135 +1,106 @@
 /*
- * node_esp32.ino -- Блок B, Рівні 1-4 (ЗЛИТА версія, 30.09)
+ * node_esp32.ino -- Блок B: вузол з УСІМА каналами зв'язку одночасно.
  *
- * Ця версія об'єднує дві незалежні гілки розвитку, які команда
- * принесла паралельно:
- *   1. "node_esp32_buffer" -- виправлення РЕАЛЬНОГО бага: старий
- *      reconnect_mqtt()/setup_wifi() були БЛОКУЮЧИМИ (while-цикл з
- *      delay всередині), тому під час реального обриву зв'язку весь
- *      loop() зависав усередині них і send_telemetry() просто НЕ
- *      викликався -- буфер (Критерій приймання №4) міг не наповнюватись
- *      так, як очікується під час демо. Тепер перепідключення до WiFi
- *      і транспорту -- НЕБЛОКУЮЧЕ (перевірка раз на кілька секунд через
- *      millis(), без delay/while), loop() продовжує працювати і
- *      телеметрія продовжує генеруватись (і буферизуватись) навіть
- *      поки зв'язку немає.
- *   2. "Node_esp32_IMU" -- реальний сенсор MPU9250 (10-DOF IMU,
- *      бібліотека "MPU9250" авторства hideakitai) замість фейкових
- *      температури/вологості: payload телеметрії тепер реальні
- *      roll/pitch/yaw з фізичного давача.
+ * Плата не обирає транспорт при прошивці. Вона тримає одночасно:
+ *   UART (дріт до Pi через USB-TTL) -- ОСНОВНИЙ, поки дріт живий;
+ *   TCP  (Wi-Fi, сирий сокет)       -- резервний №1;
+ *   UDP  (Wi-Fi, датаграми)         -- резервний №2.
+ * Пріоритет: UART > TCP > UDP. Якщо жодного немає -- пакети йдуть у
+ * локальний буфер (store-and-forward) і вивантажуються, щойно канал
+ * з'явився.
  *
- * Обидві гілки лишали ACK/retry (reliability.c, Блок A) -- лишено.
+ * Налаштування Wi-Fi плата НЕ питає в людини. Шлюз на Pi, побачивши плату
+ * на UART, сам передає їй двома CONFIG-пакетами:
+ *   {"cmd":"wifi","s":"<SSID>","p":"<пароль>"}
+ *   {"cmd":"gw","ip":"<IP шлюзу>","udp":5005,"tcp":5006}
+ * Плата зберігає їх у енергонезалежній пам'яті (NVS), підтверджує кожен
+ * пакет через ACK і далі тримає Wi-Fi у фоні. Після перезапуску плата
+ * бере збережені налаштування, тож може працювати по Wi-Fi і без дроту.
+ * (Пароль лежить у NVS плати відкритим текстом -- для демо це прийнятно.)
  *
- * 30.09 (2) -- ФІКС ЗАВИСАННЯ ПЛАТИ (Вузол 1 зависав повністю, без
- * жодного виводу в Serial, після тривалого офлайну):
- *   1. Wire.setTimeOut(1000) -- без цього зависла I2C-шина (просідання
- *      живлення IMU під час передачі Wi-Fi, слабкий контакт SDA/SCL)
- *      блокує mpu.update() НАЗАВЖДИ, а з ним і весь loop(), і Serial.
- *   2. imu_ok -- mpu.update() більше не викликається, якщо IMU не
- *      відповіла при старті.
- *   3. MQTT client_id тепер char[], а не String -- у неблокуючому
- *      reconnect-циклі (кожні 2с, поки офлайн) повторне String-
- *      конкатенування довго міг фрагментувати heap.
- *
- * 30.09 (3) -- ТРИ РІЗНІ ТРАНСПОРТИ, ОДИН ПРОТОКОЛ. Кейс вимагає, щоб
- * архітектура дозволяла замінити транспортний рівень (UDP/TCP/UART/
- * імітований канал) без переписування логіки протоколу. Замість трьох
- * окремих .ino-файлів, які з часом розійдуться -- ОДИН файл, і перед
- * прошивкою кожної плати змінюється лише NODE_TRANSPORT нижче (так само,
- * як MY_NODE_ID). protocol.c/reliability.c/буфер/IMU -- спільні для всіх
- * трьох режимів, не знають і не питають, яким дротом підуть байти.
- *
- *   NODE_TRANSPORT_UDP  -- WiFiUDP, датаграми напряму на IP шлюзу:UDP_PORT.
- *   NODE_TRANSPORT_TCP  -- WiFiClient (сирий TCP-сокет, БЕЗ MQTT-обгортки),
- *                          з'єднання тримається, як раніше тримався MQTT.
- *   NODE_TRANSPORT_UART -- пряма дротова лінія (апаратний UART2, НЕ той
- *                          самий Serial, що йде в USB/Serial Monitor) до
- *                          USB-TTL перехідника, підключеного до Pi. Ця
- *                          плата НЕ використовує WiFi взагалі -- фізично
- *                          прив'язана дротом до шлюзу, тому мусить стояти
- *                          поруч з Pi на демо.
+ * "Дріт живий" = за останні WIRE_TIMEOUT_MS плата отримала хоча б один
+ * валідний кадр від шлюзу по UART (шлюз шле "пінг" щосекунди).
+ * Відключили дріт -- за кілька секунд плата сама переходить на Wi-Fi.
+ * Втрата/дублікати під час перемикання лишаються видимими в лічильниках
+ * шлюзу (sequence наскрізний, один на всі канали).
  *
  * ПОТРІБНА БІБЛІОТЕКА (Arduino IDE -> Tools -> Manage Libraries):
- *   "MPU9250" автора hideakitai (шукати саме цю назву автора --
- *   є кілька бібліотек зі схожою назвою для інших давачів).
+ *   "MPU9250" автора hideakitai.
  *
- * ВАЖЛИВО ПЕРЕД ПРОШИВКОЮ КОЖНОЇ ПЛАТИ:
- *   1. Постав правильний MY_NODE_ID нижче (кожен фізичний вузол мережі
- *      МАЄ мати унікальний ID).
- *   2. Постав правильний NODE_TRANSPORT нижче (UDP / TCP / UART --
- *      відповідно до того, яким каналом ЦЯ плата йде на демо).
+ * node_id ПЛАТА НЕ ПРОПИСУЄ -- його призначає шлюз за старшинством: хто
+ * першим з'явився на шлюзі, той отримує менший id (1, 2, 3...). Плата
+ * ідентифікує себе MAC-адресою (HELLO), шлюз повертає id, плата зберігає
+ * його в NVS. Реєстр веде шлюз, тож після перезапуску плати id той самий.
+ * Поки id не призначено, телеметрія не шлеться (немає від чийого імені).
  *
- * ВАЖЛИВО перед прошивкою: поклади поруч із цим .ino файлом (в ту саму
- * папку) protocol.h, protocol.c, reliability.h, reliability.c.
+ * Серво: лише на ОДНІЙ платі, де воно фізично підключене, постав
+ * SERVO_ENABLED true (бібліотека "ESP32Servo"); на решті команда servo
+ * просто підтверджується й логується.
+ *
+ * Поруч з .ino мають лежати protocol.h/.c і reliability.h/.c.
  */
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
 #include "MPU9250.h"
 
 extern "C" {
-  #include "protocol.h"     /* Блок A: SensorPacket, protocol_pack/unpack */
-  #include "reliability.h"  /* Блок A: ACK/retry для MSG_ALARM/MSG_CONFIG */
+  #include "protocol.h"     /* SensorPacket, protocol_pack/unpack */
+  #include "reliability.h"  /* ACK/retry для MSG_ALARM */
 }
 
-// ==== ВИБІР ТРАНСПОРТУ (постав перед прошивкою КОЖНОЇ плати) ====
-#define NODE_TRANSPORT_UDP  1
-#define NODE_TRANSPORT_TCP  2
-#define NODE_TRANSPORT_UART 3
-#define NODE_TRANSPORT NODE_TRANSPORT_UDP   // <-- ЗМІНИ ТУТ: UDP / TCP / UART
+// node_id призначає шлюз (0 = ще не призначено). Зберігається в NVS.
+uint16_t MY_NODE_ID = 0;
+char device_mac[18] = "";           // унікальна ідентичність плати (eFuse MAC)
+bool id_confirmed = false;          // шлюз підтвердив id у цій сесії
 
-// !!! ЗМІНИТИ ПЕРЕД ПРОШИВКОЮ КОЖНОЇ ПЛАТИ -- унікальний ID вузла !!!
-uint16_t MY_NODE_ID     = 1;
-
-#if NODE_TRANSPORT == NODE_TRANSPORT_UDP
-  #include <WiFi.h>
-  #include <WiFiUdp.h>
-  #define GATEWAY_PORT 5005          // має збігатися з UDP_PORT у gateway.c
-  #define UDP_LOCAL_PORT 12345       // порт, з якого плата і шле, і слухає ACK
-  WiFiUDP udp;
-#elif NODE_TRANSPORT == NODE_TRANSPORT_TCP
-  #include <WiFi.h>
-  #define GATEWAY_PORT 5006          // має збігатися з TCP_PORT у gateway.c
-  WiFiClient tcp_client;
-#elif NODE_TRANSPORT == NODE_TRANSPORT_UART
-  // Апаратний UART2 -- ОКРЕМИЙ від Serial (USB/Serial Monitor), тому
-  // консоль для команди "alarm" і для діагностики лишається вільною.
-  // GPIO16/17 -- дефолтні піни UART2 на більшості ESP32 DevKit-плат; якщо
-  // у твоєї плати вони зайняті під щось інше -- зміни тут.
-  #define UART_RX_PIN 16
-  #define UART_TX_PIN 17
-  #define UART_BAUD   115200         // має збігатися з UART_BAUD у gateway.c
-  HardwareSerial GatewaySerial(2);
+// ---- Серво (лише на одній платі в мережі) ----
+#define SERVO_ENABLED false
+#define SERVO_PIN     18
+#if SERVO_ENABLED
+  #include <ESP32Servo.h>
+  Servo servo;
 #endif
 
-#if NODE_TRANSPORT != NODE_TRANSPORT_UART
-// --- НАЛАШТУВАННЯ WiFi ТА АДРЕСИ ШЛЮЗУ (питаються через Serial при старті) ---
-char wifi_ssid[64]      = "";
-char wifi_password[64]  = "";
-char gateway_host[16]   = ""; // IP Raspberry Pi (той самий шлюз, що і для MQTT)
+// ---- UART до шлюзу (апаратний UART2, НЕ той Serial, що в USB) ----
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
+#define UART_BAUD   115200          // має збігатися з UART_BAUD у gateway.c
+HardwareSerial GatewaySerial(2);
+
+#define WIRE_TIMEOUT_MS   3000      // стільки без кадрів від шлюзу = дріт мертвий
+#define UDP_LOCAL_PORT    12345     // з нього плата і шле UDP, і слухає ACK
+#define BUFFER_CAPACITY   50
+#define TCP_KEEPALIVE_MS  5000      // щоб шлюз не закрив "тихе" резервне TCP
+
+// ---- Налаштування, що приходять від шлюзу (зберігаються в NVS) ----
+Preferences prefs;
+char wifi_ssid[64] = "";
+char wifi_pass[96] = "";
+char gw_ip_str[16] = "";
+uint16_t udp_port = 5005;
+uint16_t tcp_port = 5006;
+bool wifi_configured = false;
+bool gw_configured = false;
 IPAddress gateway_ip;
-#endif
 
-#define BUFFER_CAPACITY 50
+WiFiUDP udp;
+WiFiClient tcp_client;
+bool udp_started = false;
 
-MPU9250 mpu;                // Об'єкт IMU (бібліотека hideakitai)
-uint32_t seq_counter = 0;   // наскрізний sequence -- спільний для TELEMETRY і ALARM
+unsigned long last_wire_rx = 0;     // millis() останнього валідного кадру по UART
 
+MPU9250 mpu;
+uint32_t seq_counter = 0;           // наскрізний sequence для TELEMETRY і ALARM
 SensorPacket buffer[BUFFER_CAPACITY];
 int buffer_count = 0;
-
-// true, якщо IMU відповіла при старті. НЕ гарантує, що шина I2C не
-// "зависне" пізніше (просідання живлення, слабкий контакт) -- від цього
-// захищає Wire.setTimeOut() нижче, а цей прапорець лише не дає читати
-// сенсор, якого не було виявлено взагалі.
 bool imu_ok = false;
-
-// --- Надійна доставка критичних повідомлень (Блок A, reliability.c) ---
 ReliableCtx reliable;
+String serial_cmd_buffer = "";
 
-// Складання кадру з байтового потоку (TCP/UART) -- той самий підхід, що
-// і FrameReader у gateway.c: спершу HEADER_SIZE байт, дістати з них
-// payload_len, тоді знати повний розмір кадру. UDP цього не потребує --
-// WiFiUDP і так зберігає межі датаграми (один parsePacket() = один пакет).
-#if NODE_TRANSPORT == NODE_TRANSPORT_TCP || NODE_TRANSPORT == NODE_TRANSPORT_UART
+// Складання кадру з байтового потоку (UART/TCP): спершу HEADER_SIZE байт,
+// з них payload_len, тоді повний розмір. UDP зберігає межі датаграм сам.
 struct FrameAssembler {
   uint8_t buf[HEADER_SIZE + MAX_PAYLOAD_SIZE + CRC_SIZE];
   size_t have = 0;
@@ -138,13 +109,12 @@ struct FrameAssembler {
 
   void reset() { have = 0; need = HEADER_SIZE; header_done = false; }
 
-  // true, якщо ПІСЛЯ цього байта кадр у buf[0..have) повний.
   bool feed(uint8_t b) {
     if (have >= sizeof(buf)) reset();
     buf[have++] = b;
     if (!header_done && have == HEADER_SIZE) {
       uint16_t payload_len;
-      memcpy(&payload_len, buf + 16, 2); // offset payload_len у заголовку
+      memcpy(&payload_len, buf + 16, 2);
       need = HEADER_SIZE + payload_len + CRC_SIZE;
       header_done = true;
       if (need > sizeof(buf)) { reset(); return false; }
@@ -152,140 +122,324 @@ struct FrameAssembler {
     return header_done && have == need;
   }
 };
-FrameAssembler downlink_assembler;
-#endif
+FrameAssembler uart_assembler;
+FrameAssembler tcp_assembler;
 
-// Обгортка над реальною відправкою -- єдине місце, де transport-логіка
-// торкається протокольного коду (esp32_reliable_send, send_telemetry,
-// flush_buffer). Повертає true, якщо байти пішли (best-effort для
-// UDP/UART -- вони не підтверджують доставку на цьому рівні; для TCP --
-// чи вдалось записати в сокет).
-bool node_send(const uint8_t *buf, int len) {
-#if NODE_TRANSPORT == NODE_TRANSPORT_UDP
-  if (WiFi.status() != WL_CONNECTED) return false;
-  udp.beginPacket(gateway_ip, GATEWAY_PORT);
+// ================== КАНАЛИ ==================
+enum Channel { CH_NONE, CH_UART, CH_TCP, CH_UDP };
+
+bool wire_alive() {
+  return last_wire_rx != 0 && (millis() - last_wire_rx) < WIRE_TIMEOUT_MS;
+}
+bool wifi_up() { return wifi_configured && WiFi.status() == WL_CONNECTED; }
+bool tcp_up()  { return wifi_up() && gw_configured && tcp_client.connected(); }
+bool udp_up()  { return wifi_up() && gw_configured && udp_started; }
+
+Channel active_channel() {
+  if (wire_alive()) return CH_UART;
+  if (tcp_up()) return CH_TCP;
+  if (udp_up()) return CH_UDP;
+  return CH_NONE;
+}
+
+const char* channel_name(Channel c) {
+  switch (c) {
+    case CH_UART: return "UART";
+    case CH_TCP:  return "TCP";
+    case CH_UDP:  return "UDP";
+    default:      return "немає каналу";
+  }
+}
+
+bool udp_send(const uint8_t *buf, int len) {
+  if (!udp_up()) return false;
+  udp.beginPacket(gateway_ip, udp_port);
   udp.write(buf, len);
   return udp.endPacket() == 1;
-#elif NODE_TRANSPORT == NODE_TRANSPORT_TCP
-  if (!tcp_client.connected()) return false;
-  return tcp_client.write(buf, len) == (size_t)len;
-#elif NODE_TRANSPORT == NODE_TRANSPORT_UART
-  GatewaySerial.write(buf, len);
-  return true; // пряма дротова лінія -- з погляду плати завжди "готова"
-#endif
 }
 
-// Чи готовий транспорт до відправки ПРЯМО ЗАРАЗ (від цього залежить,
-// чи йде пакет одразу, чи в локальний буфер -- Критерій приймання №4).
-bool transport_ready() {
-#if NODE_TRANSPORT == NODE_TRANSPORT_UDP
-  return WiFi.status() == WL_CONNECTED;
-#elif NODE_TRANSPORT == NODE_TRANSPORT_TCP
-  return WiFi.status() == WL_CONNECTED && tcp_client.connected();
-#elif NODE_TRANSPORT == NODE_TRANSPORT_UART
-  return true; // дріт або є, або плата взагалі не отримує живлення
-#endif
+// Єдине місце, де транспорт торкається протокольного коду. Обирає
+// найкращий доступний канал; якщо TCP-запис не вдався -- пробує UDP.
+bool node_send(const uint8_t *buf, int len) {
+  switch (active_channel()) {
+    case CH_UART:
+      GatewaySerial.write(buf, len);
+      return true;
+    case CH_TCP:
+      if (tcp_client.write(buf, len) == (size_t)len) return true;
+      return udp_send(buf, len);
+    case CH_UDP:
+      return udp_send(buf, len);
+    default:
+      return false;
+  }
 }
 
-// Обгортка над відправкою з сигнатурою, якої вимагає reliability.c.
-// Викликається і для першої спроби, і для кожного retry (ті самі байти).
+bool transport_ready() { return active_channel() != CH_NONE; }
+
+// Сигнатура, якої вимагає reliability.c (і перша спроба, і кожен retry).
 void esp32_reliable_send(void *userdata, const uint8_t *buf, int len) {
   (void)userdata;
   node_send(buf, len);
 }
 
-// Буфер для нечутливого до блокувань читання команд з Serial Monitor.
-String serial_cmd_buffer = "";
-
-#if NODE_TRANSPORT != NODE_TRANSPORT_UART
-void setup_wifi() {
-  Serial.println("\n=================================");
-  Serial.print("Підключення до WiFi: ");
-  Serial.println(wifi_ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifi_ssid, wifi_password);
-
-  // Обмежена за часом спроба лише тут, при старті (щоб не сидіти
-  // вічно, якщо мережа недоступна на старті) -- подальші спроби вже
-  // неблокуючі, дивись loop().
-  unsigned long start_attempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start_attempt < 15000) {
-    delay(500);
-    Serial.print(".");
+// ================== ПРИЙОМ НАЛАШТУВАНЬ ВІД ШЛЮЗУ ==================
+// Мінімальний розбір JSON для наших двох CONFIG-пакетів. Знаходить
+// "key":"значення" з екрануванням \" \\ \/ і \u00XX (ASCII).
+bool json_find_value(const char *js, const char *key, const char **val_start) {
+  char pat[24];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char *p = js;
+  while ((p = strstr(p, pat)) != NULL) {
+    const char *q = p + strlen(pat);
+    while (*q == ' ') q++;
+    if (*q == ':') {
+      q++;
+      while (*q == ' ') q++;
+      *val_start = q;
+      return true;
+    }
+    p += 1; // це було значення, а не ключ -- шукаємо далі
   }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi підключено, IP плати: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("Не вдалося підключитися до Wi-Fi під час старту, продовжимо у фоновому режимі.");
+  return false;
+}
+
+bool json_get_string(const char *js, const char *key, char *out, size_t n) {
+  const char *v;
+  if (!json_find_value(js, key, &v) || *v != '"') return false;
+  v++;
+  size_t o = 0;
+  while (*v && *v != '"') {
+    char c = *v++;
+    if (c == '\\' && *v) {
+      char e = *v++;
+      if (e == 'u' && strlen(v) >= 4) {
+        char hex[5] = { v[0], v[1], v[2], v[3], 0 };
+        long code = strtol(hex, NULL, 16);
+        v += 4;
+        c = (code < 0x80) ? (char)code : '?';
+      } else {
+        c = e; // \" \\ \/
+      }
+    }
+    if (o + 1 < n) out[o++] = c;
+  }
+  out[o] = '\0';
+  return *v == '"';
+}
+
+bool json_get_int(const char *js, const char *key, long *out) {
+  const char *v;
+  if (!json_find_value(js, key, &v)) return false;
+  *out = strtol(v, NULL, 10);
+  return true;
+}
+
+void wifi_start() {
+  if (!wifi_configured) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.begin(wifi_ssid, wifi_pass);
+  Serial.print("[WIFI] Підключаюсь до \"");
+  Serial.print(wifi_ssid);
+  Serial.println("\"...");
+}
+
+void apply_wifi_config(const char *ssid, const char *pass) {
+  bool changed = strcmp(ssid, wifi_ssid) != 0 || strcmp(pass, wifi_pass) != 0 || !wifi_configured;
+  snprintf(wifi_ssid, sizeof(wifi_ssid), "%s", ssid);
+  snprintf(wifi_pass, sizeof(wifi_pass), "%s", pass);
+  wifi_configured = wifi_ssid[0] != '\0';
+  if (changed) {
+    prefs.putString("ssid", wifi_ssid);
+    prefs.putString("pass", wifi_pass);
+    Serial.println("[CONFIG] Отримано нові налаштування Wi-Fi від шлюзу, збережено.");
+    wifi_start();
   }
 }
-#endif
 
-// Спільна обробка вхідного (downlink) кадру -- незалежно від того, UDP
-// це, TCP чи UART. MSG_ACK -- підтвердження критичної відправки;
-// MSG_CONFIG (керування з веб-інтерфейсу) -- ще НЕ оброблюється.
-void handle_downlink_bytes(const uint8_t *raw, size_t len) {
+void apply_gw_config(const char *ip, long udp_p, long tcp_p) {
+  IPAddress parsed;
+  if (!parsed.fromString(ip)) {
+    Serial.println("[CONFIG] Шлюз надіслав некоректний IP, ігнорую.");
+    return;
+  }
+  bool changed = !gw_configured || strcmp(ip, gw_ip_str) != 0 ||
+                 (udp_p > 0 && udp_p != udp_port) || (tcp_p > 0 && tcp_p != tcp_port);
+  snprintf(gw_ip_str, sizeof(gw_ip_str), "%s", ip);
+  gateway_ip = parsed;
+  if (udp_p > 0) udp_port = (uint16_t)udp_p;
+  if (tcp_p > 0) tcp_port = (uint16_t)tcp_p;
+  gw_configured = true;
+  if (changed) {
+    prefs.putString("gw", gw_ip_str);
+    prefs.putUShort("udp", udp_port);
+    prefs.putUShort("tcp", tcp_port);
+    tcp_client.stop(); // перепідключиться вже за новою адресою
+    Serial.print("[CONFIG] Адреса шлюзу від Pi: ");
+    Serial.print(gw_ip_str);
+    Serial.print(" (UDP ");
+    Serial.print(udp_port);
+    Serial.print(", TCP ");
+    Serial.print(tcp_port);
+    Serial.println("), збережено.");
+  }
+}
+
+// Підтвердження CONFIG-пакета шлюзу: ACK з тим самим sequence.
+void send_ack_to_gateway(uint32_t seq) {
+  SensorPacket ack = {0};
+  ack.version = PROTOCOL_VERSION;
+  ack.msg_type = MSG_ACK;
+  ack.node_id = MY_NODE_ID;
+  ack.sequence = seq;
+  ack.timestamp_ms = millis();
+  uint8_t tx[64];
+  int len = protocol_pack(&ack, tx, sizeof(tx));
+  if (len > 0) node_send(tx, len);
+}
+
+// Запит id у шлюзу: HEARTBEAT з node_id=0 і нашим MAC (+ збережений id, якщо був).
+void send_hello() {
+  SensorPacket h = {0};
+  h.version = PROTOCOL_VERSION;
+  h.msg_type = MSG_HEARTBEAT;
+  h.node_id = 0;
+  h.sequence = 0;
+  h.timestamp_ms = millis();
+  snprintf((char*)h.payload, MAX_PAYLOAD_SIZE, "{\"mac\":\"%s\",\"id\":%u}", device_mac, MY_NODE_ID);
+  h.payload_len = strlen((char*)h.payload);
+  uint8_t tx[128];
+  int len = protocol_pack(&h, tx, sizeof(tx));
+  if (len > 0) node_send(tx, len);
+}
+
+void handle_config_packet(const SensorPacket *pkt) {
+  char js[MAX_PAYLOAD_SIZE + 1];
+  memcpy(js, pkt->payload, pkt->payload_len);
+  js[pkt->payload_len] = '\0';
+
+  char cmd[16];
+  if (!json_get_string(js, "cmd", cmd, sizeof(cmd))) {
+    Serial.println("[CONFIG] CONFIG без поля cmd, ігнорую.");
+    return;
+  }
+  if (strcmp(cmd, "id") == 0) {
+    char mac[18];
+    long id = 0;
+    if (!json_get_string(js, "mac", mac, sizeof(mac)) || strcmp(mac, device_mac) != 0) return; // не нам
+    if (!json_get_int(js, "id", &id) || id <= 0 || id > 65535) return;
+    if (MY_NODE_ID != (uint16_t)id) {
+      Serial.print("[ID] Шлюз призначив node_id=");
+      Serial.print(id);
+      Serial.print(MY_NODE_ID ? " (було " : " (нова плата");
+      if (MY_NODE_ID) { Serial.print(MY_NODE_ID); Serial.print(", переписано)"); } else Serial.print(")");
+      Serial.println();
+      MY_NODE_ID = (uint16_t)id;
+      prefs.putUShort("nid", MY_NODE_ID);
+    }
+    id_confirmed = true;
+  } else if (strcmp(cmd, "servo") == 0) {
+    long angle = 90;
+    json_get_int(js, "angle", &angle);
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+#if SERVO_ENABLED
+    servo.write((int)angle);
+    Serial.print("[SERVO] Кут: ");
+    Serial.println(angle);
+#else
+    Serial.print("[SERVO] Команда отримана (angle=");
+    Serial.print(angle);
+    Serial.println("), але SERVO_ENABLED=false на цій платі");
+#endif
+    send_ack_to_gateway(pkt->sequence);
+  } else if (strcmp(cmd, "wifi") == 0) {
+    char ssid[64], pass[96];
+    if (!json_get_string(js, "s", ssid, sizeof(ssid))) return;
+    if (!json_get_string(js, "p", pass, sizeof(pass))) pass[0] = '\0';
+    apply_wifi_config(ssid, pass);
+    send_ack_to_gateway(pkt->sequence);
+  } else if (strcmp(cmd, "gw") == 0) {
+    char ip[16];
+    long u = 0, t = 0;
+    if (!json_get_string(js, "ip", ip, sizeof(ip))) return;
+    json_get_int(js, "udp", &u);
+    json_get_int(js, "tcp", &t);
+    apply_gw_config(ip, u, t);
+    send_ack_to_gateway(pkt->sequence);
+  } else {
+    // servo / simulate_loss з веб-інтерфейсу: на платі ще не реалізовано
+    Serial.print("[CONFIG] Невідома команда: ");
+    Serial.println(cmd);
+  }
+}
+
+// ================== ПРИЙОМ ВІД ШЛЮЗУ ==================
+void handle_downlink_bytes(const uint8_t *raw, size_t len, bool from_wire) {
   SensorPacket pkt;
   int rc = protocol_unpack(raw, len, &pkt);
   if (rc != PROTO_OK) {
-    Serial.print("[WARN] Пошкоджений downlink-пакет, код=");
+    Serial.print("[WARN] Пошкоджений кадр від шлюзу, код=");
     Serial.println(rc);
     return;
   }
+  if (from_wire) last_wire_rx = millis(); // будь-який валідний кадр = дріт живий
+
+  if (pkt.node_id != 0 && pkt.node_id != MY_NODE_ID) return; // чужий вузол; 0 = усім
+
   if (pkt.msg_type == MSG_ACK) {
-    Serial.print("[ACK] Отримано підтвердження sequence=");
+    Serial.print("[ACK] Підтвердження sequence=");
     Serial.println(pkt.sequence);
     reliable_on_ack_received(&reliable, pkt.sequence);
+  } else if (pkt.msg_type == MSG_CONFIG) {
+    handle_config_packet(&pkt);
   }
-  // MSG_CONFIG -- коли підключимо реальну симуляцію втрат/серво на платі,
-  // тут з'явиться гілка "if (pkt.msg_type == MSG_CONFIG) { ... }".
+  // MSG_HEARTBEAT від шлюзу ("пінг" дроту) -- потрібен лише заради last_wire_rx
 }
 
-// Перевіряє, чи прийшло щось на downlink (ACK/CONFIG), і передає в
-// handle_downlink_bytes(). Викликається щоразу в loop().
 void poll_downlink() {
-#if NODE_TRANSPORT == NODE_TRANSPORT_UDP
-  int packet_size = udp.parsePacket();
-  if (packet_size > 0) {
-    uint8_t buf[HEADER_SIZE + MAX_PAYLOAD_SIZE + CRC_SIZE];
-    int len = udp.read(buf, sizeof(buf));
-    if (len > 0) handle_downlink_bytes(buf, (size_t)len);
-  }
-#elif NODE_TRANSPORT == NODE_TRANSPORT_TCP
-  while (tcp_client.available()) {
-    if (downlink_assembler.feed((uint8_t)tcp_client.read())) {
-      handle_downlink_bytes(downlink_assembler.buf, downlink_assembler.have);
-      downlink_assembler.reset();
-    }
-  }
-#elif NODE_TRANSPORT == NODE_TRANSPORT_UART
   while (GatewaySerial.available()) {
-    if (downlink_assembler.feed((uint8_t)GatewaySerial.read())) {
-      handle_downlink_bytes(downlink_assembler.buf, downlink_assembler.have);
-      downlink_assembler.reset();
+    if (uart_assembler.feed((uint8_t)GatewaySerial.read())) {
+      handle_downlink_bytes(uart_assembler.buf, uart_assembler.have, true);
+      uart_assembler.reset();
     }
   }
-#endif
+  if (udp_started) {
+    int packet_size = udp.parsePacket();
+    if (packet_size > 0) {
+      uint8_t buf[HEADER_SIZE + MAX_PAYLOAD_SIZE + CRC_SIZE];
+      int len = udp.read(buf, sizeof(buf));
+      if (len > 0) handle_downlink_bytes(buf, (size_t)len, false);
+    }
+  }
+  if (tcp_client.connected()) {
+    while (tcp_client.available()) {
+      if (tcp_assembler.feed((uint8_t)tcp_client.read())) {
+        handle_downlink_bytes(tcp_assembler.buf, tcp_assembler.have, false);
+        tcp_assembler.reset();
+      }
+    }
+  }
 }
 
+// ================== БУФЕР STORE-AND-FORWARD ==================
 void buffer_packet(const SensorPacket* pkt) {
   if (buffer_count < BUFFER_CAPACITY) {
     buffer[buffer_count++] = *pkt;
   } else {
-    for (int i = 1; i < BUFFER_CAPACITY; i++) {
-      buffer[i - 1] = buffer[i];
-    }
+    for (int i = 1; i < BUFFER_CAPACITY; i++) buffer[i - 1] = buffer[i];
     buffer[BUFFER_CAPACITY - 1] = *pkt;
   }
-  Serial.print("[BUFFER] Немає зв'язку -- пакет збережено локально. У буфері: ");
+  Serial.print("[BUFFER] Немає каналу -- пакет збережено локально. У буфері: ");
   Serial.println(buffer_count);
 }
 
 void flush_buffer() {
   if (buffer_count == 0) return;
-  Serial.print("[BUFFER] Зв'язок відновлено! Вивантажую накопичені пакети: ");
+  Serial.print("[BUFFER] Канал є (");
+  Serial.print(channel_name(active_channel()));
+  Serial.print("). Вивантажую накопичені пакети: ");
   Serial.println(buffer_count);
 
   int sent = 0;
@@ -295,27 +449,25 @@ void flush_buffer() {
     if (packed_len > 0) {
       if (node_send(tx_buf, packed_len)) {
         sent++;
-        delay(50); // невелика пауза між пакетами для стабільності приймача
+        delay(50); // пауза між пакетами для стабільності приймача
       } else {
-        Serial.println("[BUFFER] Помилка відправки буферизованого пакета, перериваю вивантаження.");
+        Serial.println("[BUFFER] Помилка відправки, перериваю вивантаження.");
         break;
       }
     }
   }
-
   if (sent < buffer_count) {
     int remaining = buffer_count - sent;
-    for (int i = 0; i < remaining; i++) {
-      buffer[i] = buffer[sent + i];
-    }
+    for (int i = 0; i < remaining; i++) buffer[i] = buffer[sent + i];
     buffer_count = remaining;
   } else {
     buffer_count = 0;
   }
-  Serial.print("[BUFFER] Вивантаження завершено. Залишок у буфері: ");
+  Serial.print("[BUFFER] Вивантаження завершено. Залишок: ");
   Serial.println(buffer_count);
 }
 
+// ================== ТЕЛЕМЕТРІЯ І ALARM ==================
 void send_telemetry() {
   SensorPacket pkt = {0};
   pkt.version = PROTOCOL_VERSION;
@@ -324,13 +476,11 @@ void send_telemetry() {
   pkt.sequence = seq_counter++;
   pkt.timestamp_ms = millis();
 
-  // Реальні дані з IMU (MPU9250) замість фейкових t/h.
   snprintf((char*)pkt.payload, MAX_PAYLOAD_SIZE,
            "{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f}",
            mpu.getRoll(), mpu.getPitch(), mpu.getYaw());
   pkt.payload_len = strlen((char*)pkt.payload);
 
-  // Якщо транспорт не готовий -- одразу у буфер!
   if (!transport_ready()) {
     buffer_packet(&pkt);
     return;
@@ -339,24 +489,28 @@ void send_telemetry() {
   uint8_t tx_buf[256];
   int packed_len = protocol_pack(&pkt, tx_buf, sizeof(tx_buf));
   if (packed_len > 0) {
-    bool success = node_send(tx_buf, packed_len);
-    if (!success) {
-      buffer_packet(&pkt);
-    } else {
+    Channel ch = active_channel();
+    if (node_send(tx_buf, packed_len)) {
       Serial.print("[TX] seq=");
       Serial.print(pkt.sequence);
-      Serial.print(" -> шлюз (");
+      Serial.print(" -> ");
+      Serial.print(channel_name(ch));
+      Serial.print(" (");
       Serial.print(packed_len);
       Serial.println(" байт)");
+    } else {
+      buffer_packet(&pkt);
     }
   }
 }
 
-// Ініціює ОДНУ надійну відправку ALARM. Сама відправка (і всі retry)
-// відбувається асинхронно через reliable_tick() в loop().
 void send_alarm() {
+  if (MY_NODE_ID == 0) {
+    Serial.println("[ALARM] node_id ще не призначено шлюзом.");
+    return;
+  }
   if (!transport_ready()) {
-    Serial.println("[ALARM] Транспорт не готовий -- ALARM не відправлено.");
+    Serial.println("[ALARM] Немає каналу -- ALARM не відправлено.");
     return;
   }
   if (reliable_is_busy(&reliable)) {
@@ -380,11 +534,26 @@ void send_alarm() {
   reliable_send_critical(&reliable, &pkt, millis());
 }
 
-// Нечутливе до блокувань читання команд з Serial Monitor. Введи "alarm"
-// і натисни Enter -- це відправить одну критичну подію з ACK/retry.
-// Працює однаково в усіх трьох режимах транспорту -- це завжди основний
-// USB-Serial, навіть коли плата на UART-транспорті (той -- окремий,
-// апаратний UART2, не займає цю консоль).
+void print_status() {
+  Serial.print("[STATUS] node_id=");
+  Serial.print(MY_NODE_ID);
+  Serial.print(id_confirmed ? " (підтверджено)" : " (не підтверджено)");
+  Serial.print(" | канал=");
+  Serial.print(channel_name(active_channel()));
+  Serial.print(" | дріт=");
+  Serial.print(wire_alive() ? "живий" : "немає");
+  Serial.print(" | Wi-Fi=");
+  Serial.print(wifi_configured ? (WiFi.status() == WL_CONNECTED ? "підключено" : "підключаюсь") : "не налаштовано");
+  Serial.print(" | шлюз=");
+  Serial.print(gw_configured ? gw_ip_str : "не налаштовано");
+  Serial.print(" | TCP=");
+  Serial.print(tcp_client.connected() ? "так" : "ні");
+  Serial.print(" | буфер=");
+  Serial.println(buffer_count);
+}
+
+// Команди з Serial Monitor: "alarm" -- критична подія з ACK/retry,
+// "status" -- поточний стан каналів, "forget" -- стерти збережені налаштування.
 void check_serial_commands() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -394,6 +563,11 @@ void check_serial_commands() {
         serial_cmd_buffer.toLowerCase();
         if (serial_cmd_buffer == "alarm") {
           send_alarm();
+        } else if (serial_cmd_buffer == "status") {
+          print_status();
+        } else if (serial_cmd_buffer == "forget") {
+          prefs.clear();
+          Serial.println("[CONFIG] Налаштування стерто. Перезавантаж плату і підключи дріт до Pi.");
         } else {
           Serial.print("[SERIAL] Невідома команда: ");
           Serial.println(serial_cmd_buffer);
@@ -406,184 +580,118 @@ void check_serial_commands() {
   }
 }
 
+// ================== SETUP / LOOP ==================
+void load_saved_config() {
+  prefs.begin("node", false);
+  String s = prefs.getString("ssid", "");
+  String p = prefs.getString("pass", "");
+  String g = prefs.getString("gw", "");
+  udp_port = prefs.getUShort("udp", 5005);
+  tcp_port = prefs.getUShort("tcp", 5006);
+  MY_NODE_ID = prefs.getUShort("nid", 0);
+  s.toCharArray(wifi_ssid, sizeof(wifi_ssid));
+  p.toCharArray(wifi_pass, sizeof(wifi_pass));
+  g.toCharArray(gw_ip_str, sizeof(gw_ip_str));
+  wifi_configured = wifi_ssid[0] != '\0';
+  gw_configured = gw_ip_str[0] != '\0' && gateway_ip.fromString(gw_ip_str);
+}
+
 void setup() {
   Serial.begin(115200);
-  Wire.begin();               // Ініціалізація I2C для IMU
-  Wire.setTimeOut(1000);      // КРИТИЧНО: без цього I2C-транзакція, що не
-                              // отримала відповіді від давача (обрив дроту,
-                              // просідання живлення під час TX Wi-Fi), може
-                              // блокувати шину НАЗАВЖДИ -- а разом з нею і
-                              // mpu.update() у loop(), тобто ВЕСЬ loop() і
-                              // Serial теж (це і є "плата зависла, нічого
-                              // не виводить" без жодного повідомлення).
-  delay(2000);                // Дати час платі й давачу на старт
+  Wire.begin();
+  Wire.setTimeOut(1000);      // без цього завислий I2C блокує весь loop()
+  delay(2000);
 
   Serial.println("\nІніціалізація IMU MPU9250...");
   imu_ok = mpu.setup(0x68);
-  if (!imu_ok) {
-    Serial.println("[ПОМИЛКА] IMU не знайдено! Перевірте підключення (SDA/SCL). Телеметрія піде з нульовими roll/pitch/yaw, вузол продовжить працювати.");
-  } else {
-    Serial.println("[OK] IMU успішно підключено.");
-  }
+  Serial.println(imu_ok ? "[OK] IMU успішно підключено."
+                        : "[ПОМИЛКА] IMU не знайдено! Телеметрія піде з нульовими roll/pitch/yaw.");
 
-#if NODE_TRANSPORT == NODE_TRANSPORT_UART
-  // UART-режим: жодного WiFi -- пряма дротова лінія до Pi через USB-TTL
-  // перехідник. Serial (USB) лишається вільним для діагностики/"alarm".
   GatewaySerial.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  Serial.println("\n=================================");
-  Serial.println("Режим транспорту: UART (пряма дротова лінія до шлюзу)");
-  Serial.print("UART2: RX=GPIO"); Serial.print(UART_RX_PIN);
-  Serial.print(", TX=GPIO"); Serial.print(UART_TX_PIN);
-  Serial.print(", "); Serial.print(UART_BAUD); Serial.println(" 8N1");
-  Serial.println("=================================\n");
-#else
-  // Очищаємо буфер Serial від стартового сміття перед опитуванням
-  while (Serial.available() > 0) { Serial.read(); delay(10); }
 
-  // 1. SSID
-  Serial.println("\n=================================");
-  Serial.println("1. Введіть назву Wi-Fi мережі (SSID):");
-  Serial.println("=================================");
-  while (true) {
-    if (Serial.available() > 0) {
-      String input_ssid = Serial.readStringUntil('\n');
-      input_ssid.trim();
-      if (input_ssid.length() > 0 && input_ssid.length() < sizeof(wifi_ssid)) {
-        input_ssid.toCharArray(wifi_ssid, sizeof(wifi_ssid));
-        break;
-      }
-    }
-    delay(50);
-  }
-  Serial.print("Записано SSID: ");
-  Serial.println(wifi_ssid);
-
-  while (Serial.available() > 0) { Serial.read(); delay(10); }
-
-  // 2. PASSWORD
-  Serial.println("\n=================================");
-  Serial.print("2. Введіть пароль для Wi-Fi '");
-  Serial.print(wifi_ssid);
-  Serial.println("':");
-  Serial.println("=================================");
-  while (true) {
-    if (Serial.available() > 0) {
-      String pass = Serial.readStringUntil('\n');
-      pass.trim();
-      // Дозволяємо порожній пароль, якщо мережа відкрита.
-      if (pass.length() < sizeof(wifi_password)) {
-        pass.toCharArray(wifi_password, sizeof(wifi_password));
-        break;
-      }
-    }
-    delay(50);
-  }
-  Serial.print("Записано пароль: ");
-  Serial.println(wifi_password);
-
-  while (Serial.available() > 0) { Serial.read(); delay(10); }
-
-  // 3. IP шлюзу (той самий Raspberry Pi, що і для MQTT -- просто інший порт)
-  Serial.println("\n=================================");
-  Serial.println("3. Введіть IP-адресу шлюзу (Raspberry Pi):");
-  Serial.println("=================================");
-  while (true) {
-    if (Serial.available() > 0) {
-      String ip = Serial.readStringUntil('\n');
-      ip.trim();
-      if (ip.length() > 0 && ip.length() < sizeof(gateway_host)) {
-        ip.toCharArray(gateway_host, sizeof(gateway_host));
-        break;
-      }
-    }
-    delay(50);
-  }
-  Serial.print("Використовую шлюз: ");
-  Serial.print(gateway_host);
-  Serial.print(":");
-  Serial.println(GATEWAY_PORT);
-  Serial.println("=================================\n");
-
-  if (!gateway_ip.fromString(gateway_host)) {
-    Serial.println("[ПОМИЛКА] Не вдалося розпізнати IP-адресу шлюзу!");
-  }
-
-  setup_wifi();
-
-  #if NODE_TRANSPORT == NODE_TRANSPORT_UDP
-    udp.begin(UDP_LOCAL_PORT); // той самий локальний порт і для send, і для ACK
-    Serial.println("Режим транспорту: UDP");
-  #elif NODE_TRANSPORT == NODE_TRANSPORT_TCP
-    Serial.println("Режим транспорту: TCP (сирий сокет, без MQTT)");
-  #endif
+  uint64_t efuse = ESP.getEfuseMac();
+  snprintf(device_mac, sizeof(device_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+           (uint8_t)(efuse), (uint8_t)(efuse >> 8), (uint8_t)(efuse >> 16),
+           (uint8_t)(efuse >> 24), (uint8_t)(efuse >> 32), (uint8_t)(efuse >> 40));
+#if SERVO_ENABLED
+  servo.attach(SERVO_PIN);
+  servo.write(90);
 #endif
+
+  load_saved_config();
+  WiFi.mode(WIFI_STA);
+  if (wifi_configured) {
+    Serial.println("[CONFIG] Знайдено збережені налаштування -- Wi-Fi стартує у фоні.");
+    wifi_start();
+  } else {
+    Serial.println("[CONFIG] Налаштувань Wi-Fi ще немає: підключи дріт до Pi (UART), шлюз передасть їх сам.");
+  }
 
   reliable_init(&reliable, esp32_reliable_send, NULL);
 
-  Serial.print("Готово. Вузол ID=");
-  Serial.print(MY_NODE_ID);
-  Serial.println(". Введи \"alarm\" в цьому Serial Monitor і натисни Enter,");
-  Serial.println("щоб надіслати критичну подію з ACK/retry.");
+  Serial.print("Готово. MAC=");
+  Serial.print(device_mac);
+  Serial.print(", node_id=");
+  Serial.print(MY_NODE_ID ? String(MY_NODE_ID) : String("очікую від шлюзу"));
+  Serial.println(". Команди в Serial Monitor: alarm, status, forget.");
 }
 
 void loop() {
-#if NODE_TRANSPORT == NODE_TRANSPORT_UDP
-  // 1. Неблокуюча перевірка та автоперепідключення до Wi-Fi. UDP сам по
-  //    собі без стану з'єднання -- досить, щоб WiFi був живий. Буфер
-  //    вивантажуємо РІВНО ОДИН РАЗ на переході "не було WiFi" -> "є WiFi"
-  //    (was_connected перевіряє саме цей перехід, не просто "зараз є WiFi").
-  static bool udp_was_connected = false;
-  bool udp_now_connected = (WiFi.status() == WL_CONNECTED);
-  if (!udp_now_connected) {
-    static unsigned long last_wifi_attempt = 0;
-    if (millis() - last_wifi_attempt > 3000) {
-      last_wifi_attempt = millis();
-      Serial.println("[WIFI] Зв'язок втрачено або відсутній. Пробую перепідключитися...");
+  // --- Wi-Fi у фоні (неблокуюче) ---
+  static bool was_wifi = false;
+  bool now_wifi = wifi_up();
+  if (wifi_configured && !now_wifi) {
+    static unsigned long last_attempt = 0;
+    if (millis() - last_attempt > 8000) {
+      last_attempt = millis();
       WiFi.disconnect();
-      WiFi.begin(wifi_ssid, wifi_password);
+      WiFi.begin(wifi_ssid, wifi_pass);
     }
-  } else if (!udp_was_connected) {
-    flush_buffer(); // щойно (пере)з'явився WiFi -- вивантажуємо накопичене
   }
-  udp_was_connected = udp_now_connected;
-#elif NODE_TRANSPORT == NODE_TRANSPORT_TCP
-  // 1. Неблокуюче перепідключення Wi-Fi, потім TCP-сокета -- той самий
-  //    патерн, що раніше був для WiFi+MQTT, просто без MQTT-обгортки.
-  if (WiFi.status() != WL_CONNECTED) {
-    static unsigned long last_wifi_attempt = 0;
-    if (millis() - last_wifi_attempt > 3000) {
-      last_wifi_attempt = millis();
-      Serial.println("[WIFI] Зв'язок втрачено або відсутній. Пробую перепідключитися...");
-      WiFi.disconnect();
-      WiFi.begin(wifi_ssid, wifi_password);
-    }
-  } else if (!tcp_client.connected()) {
+  if (now_wifi && !was_wifi) {
+    Serial.print("[WIFI] Підключено, IP плати: ");
+    Serial.println(WiFi.localIP());
+    if (!udp_started) udp_started = udp.begin(UDP_LOCAL_PORT);
+  }
+  if (!now_wifi && was_wifi) {
+    Serial.println("[WIFI] Зв'язок втрачено.");
+    tcp_client.stop();
+  }
+  was_wifi = now_wifi;
+
+  // --- TCP-з'єднання з шлюзом (резервний канал) ---
+  if (wifi_up() && gw_configured && !tcp_client.connected()) {
     static unsigned long last_tcp_attempt = 0;
-    if (millis() - last_tcp_attempt > 2000) {
+    if (millis() - last_tcp_attempt > 3000) {
       last_tcp_attempt = millis();
-      Serial.print("[TCP] Підключення до шлюзу...");
-      downlink_assembler.reset();
-      if (tcp_client.connect(gateway_ip, GATEWAY_PORT)) {
-        Serial.println(" підключено!");
-        flush_buffer();
-      } else {
-        Serial.println(" не вдалося.");
+      tcp_assembler.reset();
+      if (tcp_client.connect(gateway_ip, tcp_port, 1500)) {
+        Serial.println("[TCP] Підключено до шлюзу (резервний канал).");
       }
     }
   }
-#endif
-  // NODE_TRANSPORT_UART -- немає ні WiFi, ні "з'єднання" для перевірки:
-  // дріт або є, або плата взагалі не отримує живлення/даних.
+
+  // Поки TCP не основний, шлемо по ньому службовий ACK з невикористаним
+  // sequence -- шлюз бачить трафік і не закриває "тихе" з'єднання.
+  if (tcp_client.connected() && active_channel() != CH_TCP) {
+    static unsigned long last_keepalive = 0;
+    if (millis() - last_keepalive >= TCP_KEEPALIVE_MS) {
+      last_keepalive = millis();
+      SensorPacket ka = {0};
+      ka.version = PROTOCOL_VERSION;
+      ka.msg_type = MSG_ACK;
+      ka.node_id = MY_NODE_ID;
+      ka.sequence = 0xFFFFFFFF;
+      ka.timestamp_ms = millis();
+      uint8_t tx[64];
+      int len = protocol_pack(&ka, tx, sizeof(tx));
+      if (len > 0) tcp_client.write(tx, len);
+    }
+  }
 
   poll_downlink();
 
-  // Постійно оновлюємо дані з IMU для коректної роботи фільтра орієнтації
-  // (незалежно від стану транспорту -- давач має оновлюватись завжди).
-  // Викликаємо лише якщо IMU взагалі відповіла при старті -- інакше це
-  // гарантовано або "сміття", або (без Wire.setTimeOut вище) залипання.
-  if (imu_ok) {
-    mpu.update();
-  }
+  if (imu_ok) mpu.update();
 
   check_serial_commands();
 
@@ -600,11 +708,35 @@ void loop() {
     Serial.println(reliable.attempts);
   }
 
-  // 3. Генерація та відправка телеметрії кожні 5 секунд -- якщо транспорт
-  //    не готовий, send_telemetry() сама збереже пакет у буфер.
+  // Щойно з'явився будь-який канал -- вивантажуємо накопичене (раз на секунду)
+  static unsigned long last_flush_check = 0;
+  if (buffer_count > 0 && transport_ready() && millis() - last_flush_check > 1000) {
+    last_flush_check = millis();
+    flush_buffer();
+  }
+
+  // Поки шлюз не підтвердив id, просимо його (раз на 2 с, коли є канал)
+  static unsigned long last_hello = 0;
+  if (!id_confirmed && transport_ready() && millis() - last_hello >= 2000) {
+    last_hello = millis();
+    send_hello();
+  }
+
+  // Телеметрія кожні 5 секунд (лише коли є node_id)
   static unsigned long last_send = 0;
   if (millis() - last_send >= 5000) {
     last_send = millis();
-    send_telemetry();
+    if (MY_NODE_ID != 0) send_telemetry();
+  }
+
+  // Перемикання каналу -- видно в Serial
+  static Channel last_channel = CH_NONE;
+  Channel ch = active_channel();
+  if (ch != last_channel) {
+    Serial.print("[КАНАЛ] ");
+    Serial.print(channel_name(last_channel));
+    Serial.print(" -> ");
+    Serial.println(channel_name(ch));
+    last_channel = ch;
   }
 }

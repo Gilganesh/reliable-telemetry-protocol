@@ -15,3 +15,6 @@ logs/*.out
 *.db-shm
 gateway_log.txt
 gateway/gateway
+gateway/gateway.conf
+gateway/node_registry.txt
+node_registry.txt
