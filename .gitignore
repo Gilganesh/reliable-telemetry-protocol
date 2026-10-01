@@ -18,3 +18,4 @@ gateway/gateway
 gateway/gateway.conf
 gateway/node_registry.txt
 node_registry.txt
+.venv/
