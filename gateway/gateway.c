@@ -1169,11 +1169,13 @@ void poll_tcp(void) {
 }
 
 // ---- UART: відкрити послідовний порт (термінально, 8N1), читати з фреймінгом ----
-void setup_uart(void) {
+// verbose=false -- тихі повторні спроби перевідкриття (перехідник висмикнули).
+void setup_uart(bool verbose) {
     const char *uart_dev = getenv("GATEWAY_UART"); // перевизначення шляху: GATEWAY_UART=/dev/serial0
     if (!uart_dev || !*uart_dev) uart_dev = UART_DEVICE;
     g_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (g_uart_fd < 0) {
+        if (!verbose) return;
         fprintf(stderr,
                 "[UART] Не вдалося відкрити %s (%s) -- UART-вузол недоступний. "
                 "Перевір, що USB-TTL перехідник підключений (`ls /dev/ttyUSB*`), "
@@ -1229,11 +1231,28 @@ void setup_uart(void) {
     log_event("[UART] Слухаю на %s (115200 8N1)\n", uart_dev);
 }
 
+#define UART_REOPEN_MS 2000 // як часто пробуємо знову відкрити порт після обриву
+
 void poll_uart(void) {
-    if (g_uart_fd < 0) return;
+    if (g_uart_fd < 0) {
+        // Перехідник могли висмикнути й встромити знову: пробуємо перевідкрити.
+        static uint64_t last_try_ms = 0;
+        uint64_t t = get_monotonic_time_ms();
+        if (t - last_try_ms >= UART_REOPEN_MS) {
+            last_try_ms = t;
+            setup_uart(false);
+        }
+        return;
+    }
 
     uint8_t rx[256];
     ssize_t n = read(g_uart_fd, rx, sizeof(rx));
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        log_event("[UART] Порт зник (%s) -- чекаю на повернення перехідника\n", strerror(errno));
+        close(g_uart_fd);
+        g_uart_fd = -1;
+        return;
+    }
     if (n > 0) {
         // Кадр плата пише одним блоком (~15 мс на 115200). Пауза довша за
         // UART_FRAME_GAP_MS всередині недоскладеного кадру означає сміття (завантажувач
@@ -1377,7 +1396,7 @@ int main(void) {
     // продовжує працювати з рештою каналів (MQTT/UDP/TCP).
     setup_udp();
     setup_tcp();
-    setup_uart();
+    setup_uart(true);
     g_down_seq = ((uint32_t)time(NULL) & 0x7FFFFFFF) | 1;
     registry_load();
     provision_start_worker();
