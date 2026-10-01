@@ -130,15 +130,38 @@ struct FrameAssembler {
 
   void reset() { have = 0; need = HEADER_SIZE; header_done = false; }
 
+  unsigned long last_byte_ms = 0;
+
+  // Чи може buf[0..have) бути початком справжнього кадру (версія, тип, довжина).
+  bool plausible() {
+    if (have >= 1 && buf[0] != PROTOCOL_VERSION) return false;
+    if (have >= 2 && buf[1] > MSG_ACK) return false;
+    if (have >= HEADER_SIZE) {
+      uint16_t payload_len;
+      memcpy(&payload_len, buf + 16, 2);
+      if (payload_len > MAX_PAYLOAD_SIZE) return false;
+    }
+    return true;
+  }
+
   bool feed(uint8_t b) {
+    unsigned long now = millis();
+    if (have > 0 && now - last_byte_ms > 100) reset(); // пауза всередині кадру = сміття
+    last_byte_ms = now;
     if (have >= sizeof(buf)) reset();
     buf[have++] = b;
-    if (!header_done && have == HEADER_SIZE) {
+    while (have > 0 && !plausible()) { // самосинхронізація: відкидаємо сміття побайтово
+      memmove(buf, buf + 1, have - 1);
+      have--;
+    }
+    if (have >= HEADER_SIZE) {
       uint16_t payload_len;
       memcpy(&payload_len, buf + 16, 2);
       need = HEADER_SIZE + payload_len + CRC_SIZE;
       header_done = true;
-      if (need > sizeof(buf)) { reset(); return false; }
+    } else {
+      header_done = false;
+      need = HEADER_SIZE;
     }
     return header_done && have == need;
   }
