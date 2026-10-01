@@ -43,7 +43,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Preferences.h>
-#include "MPU9250.h"
+#include <MPU9250.h>
 
 extern "C" {
   #include "protocol.h"     /* SensorPacket, protocol_pack/unpack */
@@ -63,11 +63,32 @@ bool id_confirmed = false;          // шлюз підтвердив id у ці�
   Servo servo;
 #endif
 
-// ---- UART до шлюзу (апаратний UART2, НЕ той Serial, що в USB) ----
-#define UART_RX_PIN 16
-#define UART_TX_PIN 17
+// ---- UART до шлюзу ----
+// LINK_VIA_USB_CABLE 1: зв'язок зі шлюзом іде прямо через USB-кабель плати
+//   (вбудований USB-UART адаптер = UART0 = Serial). Кабель з'єднує плату з
+//   Pi, жодних пінів і перехідників. УВАГА: Serial тоді зайнятий каналом, тож
+//   текстові логи й команди (alarm/status) у Serial Monitor недоступні
+//   (логи гасяться). Для налагодження поставте 0 і підключіть кабель до ПК.
+// LINK_VIA_USB_CABLE 0: окремий UART2 на пінах GPIO16/17 (через USB-TTL
+//   перехідник до Pi); Serial лишається вільним для логів і команд.
+#define LINK_VIA_USB_CABLE 1
+#define UART_RX_PIN 16              // лише для режиму 0
+#define UART_TX_PIN 17              // лише для режиму 0
 #define UART_BAUD   115200          // має збігатися з UART_BAUD у gateway.c
-HardwareSerial GatewaySerial(2);
+
+#if LINK_VIA_USB_CABLE
+  #define GatewaySerial Serial
+  // Приймач логів, що нічого не друкує (інакше текст псував би кадри протоколу)
+  class NullPrint : public Print {
+   public:
+    size_t write(uint8_t) override { return 1; }
+    size_t write(const uint8_t*, size_t n) override { return n; }
+  };
+  NullPrint DBG;
+#else
+  HardwareSerial GatewaySerial(2);
+  #define DBG Serial
+#endif
 
 #define WIRE_TIMEOUT_MS   3000      // стільки без кадрів від шлюзу = дріт мертвий
 #define UDP_LOCAL_PORT    12345     // з нього плата і шле UDP, і слухає ACK
@@ -240,9 +261,9 @@ void wifi_start() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   WiFi.begin(wifi_ssid, wifi_pass);
-  Serial.print("[WIFI] Підключаюсь до \"");
-  Serial.print(wifi_ssid);
-  Serial.println("\"...");
+  DBG.print("[WIFI] Підключаюсь до \"");
+  DBG.print(wifi_ssid);
+  DBG.println("\"...");
 }
 
 void apply_wifi_config(const char *ssid, const char *pass) {
@@ -253,7 +274,7 @@ void apply_wifi_config(const char *ssid, const char *pass) {
   if (changed) {
     prefs.putString("ssid", wifi_ssid);
     prefs.putString("pass", wifi_pass);
-    Serial.println("[CONFIG] Отримано нові налаштування Wi-Fi від шлюзу, збережено.");
+    DBG.println("[CONFIG] Отримано нові налаштування Wi-Fi від шлюзу, збережено.");
     wifi_start();
   }
 }
@@ -261,7 +282,7 @@ void apply_wifi_config(const char *ssid, const char *pass) {
 void apply_gw_config(const char *ip, long udp_p, long tcp_p) {
   IPAddress parsed;
   if (!parsed.fromString(ip)) {
-    Serial.println("[CONFIG] Шлюз надіслав некоректний IP, ігнорую.");
+    DBG.println("[CONFIG] Шлюз надіслав некоректний IP, ігнорую.");
     return;
   }
   bool changed = !gw_configured || strcmp(ip, gw_ip_str) != 0 ||
@@ -276,13 +297,13 @@ void apply_gw_config(const char *ip, long udp_p, long tcp_p) {
     prefs.putUShort("udp", udp_port);
     prefs.putUShort("tcp", tcp_port);
     tcp_client.stop(); // перепідключиться вже за новою адресою
-    Serial.print("[CONFIG] Адреса шлюзу від Pi: ");
-    Serial.print(gw_ip_str);
-    Serial.print(" (UDP ");
-    Serial.print(udp_port);
-    Serial.print(", TCP ");
-    Serial.print(tcp_port);
-    Serial.println("), збережено.");
+    DBG.print("[CONFIG] Адреса шлюзу від Pi: ");
+    DBG.print(gw_ip_str);
+    DBG.print(" (UDP ");
+    DBG.print(udp_port);
+    DBG.print(", TCP ");
+    DBG.print(tcp_port);
+    DBG.println("), збережено.");
   }
 }
 
@@ -321,7 +342,7 @@ void handle_config_packet(const SensorPacket *pkt) {
 
   char cmd[16];
   if (!json_get_string(js, "cmd", cmd, sizeof(cmd))) {
-    Serial.println("[CONFIG] CONFIG без поля cmd, ігнорую.");
+    DBG.println("[CONFIG] CONFIG без поля cmd, ігнорую.");
     return;
   }
   if (strcmp(cmd, "id") == 0) {
@@ -330,11 +351,11 @@ void handle_config_packet(const SensorPacket *pkt) {
     if (!json_get_string(js, "mac", mac, sizeof(mac)) || strcmp(mac, device_mac) != 0) return; // не нам
     if (!json_get_int(js, "id", &id) || id <= 0 || id > 65535) return;
     if (MY_NODE_ID != (uint16_t)id) {
-      Serial.print("[ID] Шлюз призначив node_id=");
-      Serial.print(id);
-      Serial.print(MY_NODE_ID ? " (було " : " (нова плата");
-      if (MY_NODE_ID) { Serial.print(MY_NODE_ID); Serial.print(", переписано)"); } else Serial.print(")");
-      Serial.println();
+      DBG.print("[ID] Шлюз призначив node_id=");
+      DBG.print(id);
+      DBG.print(MY_NODE_ID ? " (було " : " (нова плата");
+      if (MY_NODE_ID) { DBG.print(MY_NODE_ID); DBG.print(", переписано)"); } else DBG.print(")");
+      DBG.println();
       MY_NODE_ID = (uint16_t)id;
       prefs.putUShort("nid", MY_NODE_ID);
     }
@@ -346,12 +367,12 @@ void handle_config_packet(const SensorPacket *pkt) {
     if (angle > 180) angle = 180;
 #if SERVO_ENABLED
     servo.write((int)angle);
-    Serial.print("[SERVO] Кут: ");
-    Serial.println(angle);
+    DBG.print("[SERVO] Кут: ");
+    DBG.println(angle);
 #else
-    Serial.print("[SERVO] Команда отримана (angle=");
-    Serial.print(angle);
-    Serial.println("), але SERVO_ENABLED=false на цій платі");
+    DBG.print("[SERVO] Команда отримана (angle=");
+    DBG.print(angle);
+    DBG.println("), але SERVO_ENABLED=false на цій платі");
 #endif
     send_ack_to_gateway(pkt->sequence);
   } else if (strcmp(cmd, "wifi") == 0) {
@@ -370,8 +391,8 @@ void handle_config_packet(const SensorPacket *pkt) {
     send_ack_to_gateway(pkt->sequence);
   } else {
     // servo / simulate_loss з веб-інтерфейсу: на платі ще не реалізовано
-    Serial.print("[CONFIG] Невідома команда: ");
-    Serial.println(cmd);
+    DBG.print("[CONFIG] Невідома команда: ");
+    DBG.println(cmd);
   }
 }
 
@@ -380,8 +401,8 @@ void handle_downlink_bytes(const uint8_t *raw, size_t len, bool from_wire) {
   SensorPacket pkt;
   int rc = protocol_unpack(raw, len, &pkt);
   if (rc != PROTO_OK) {
-    Serial.print("[WARN] Пошкоджений кадр від шлюзу, код=");
-    Serial.println(rc);
+    DBG.print("[WARN] Пошкоджений кадр від шлюзу, код=");
+    DBG.println(rc);
     return;
   }
   if (from_wire) last_wire_rx = millis(); // будь-який валідний кадр = дріт живий
@@ -389,8 +410,8 @@ void handle_downlink_bytes(const uint8_t *raw, size_t len, bool from_wire) {
   if (pkt.node_id != 0 && pkt.node_id != MY_NODE_ID) return; // чужий вузол; 0 = усім
 
   if (pkt.msg_type == MSG_ACK) {
-    Serial.print("[ACK] Підтвердження sequence=");
-    Serial.println(pkt.sequence);
+    DBG.print("[ACK] Підтвердження sequence=");
+    DBG.println(pkt.sequence);
     reliable_on_ack_received(&reliable, pkt.sequence);
   } else if (pkt.msg_type == MSG_CONFIG) {
     handle_config_packet(&pkt);
@@ -431,16 +452,16 @@ void buffer_packet(const SensorPacket* pkt) {
     for (int i = 1; i < BUFFER_CAPACITY; i++) buffer[i - 1] = buffer[i];
     buffer[BUFFER_CAPACITY - 1] = *pkt;
   }
-  Serial.print("[BUFFER] Немає каналу -- пакет збережено локально. У буфері: ");
-  Serial.println(buffer_count);
+  DBG.print("[BUFFER] Немає каналу -- пакет збережено локально. У буфері: ");
+  DBG.println(buffer_count);
 }
 
 void flush_buffer() {
   if (buffer_count == 0) return;
-  Serial.print("[BUFFER] Канал є (");
-  Serial.print(channel_name(active_channel()));
-  Serial.print("). Вивантажую накопичені пакети: ");
-  Serial.println(buffer_count);
+  DBG.print("[BUFFER] Канал є (");
+  DBG.print(channel_name(active_channel()));
+  DBG.print("). Вивантажую накопичені пакети: ");
+  DBG.println(buffer_count);
 
   int sent = 0;
   for (int i = 0; i < buffer_count; i++) {
@@ -451,7 +472,7 @@ void flush_buffer() {
         sent++;
         delay(50); // пауза між пакетами для стабільності приймача
       } else {
-        Serial.println("[BUFFER] Помилка відправки, перериваю вивантаження.");
+        DBG.println("[BUFFER] Помилка відправки, перериваю вивантаження.");
         break;
       }
     }
@@ -463,8 +484,8 @@ void flush_buffer() {
   } else {
     buffer_count = 0;
   }
-  Serial.print("[BUFFER] Вивантаження завершено. Залишок: ");
-  Serial.println(buffer_count);
+  DBG.print("[BUFFER] Вивантаження завершено. Залишок: ");
+  DBG.println(buffer_count);
 }
 
 // ================== ТЕЛЕМЕТРІЯ І ALARM ==================
@@ -491,13 +512,13 @@ void send_telemetry() {
   if (packed_len > 0) {
     Channel ch = active_channel();
     if (node_send(tx_buf, packed_len)) {
-      Serial.print("[TX] seq=");
-      Serial.print(pkt.sequence);
-      Serial.print(" -> ");
-      Serial.print(channel_name(ch));
-      Serial.print(" (");
-      Serial.print(packed_len);
-      Serial.println(" байт)");
+      DBG.print("[TX] seq=");
+      DBG.print(pkt.sequence);
+      DBG.print(" -> ");
+      DBG.print(channel_name(ch));
+      DBG.print(" (");
+      DBG.print(packed_len);
+      DBG.println(" байт)");
     } else {
       buffer_packet(&pkt);
     }
@@ -506,15 +527,15 @@ void send_telemetry() {
 
 void send_alarm() {
   if (MY_NODE_ID == 0) {
-    Serial.println("[ALARM] node_id ще не призначено шлюзом.");
+    DBG.println("[ALARM] node_id ще не призначено шлюзом.");
     return;
   }
   if (!transport_ready()) {
-    Serial.println("[ALARM] Немає каналу -- ALARM не відправлено.");
+    DBG.println("[ALARM] Немає каналу -- ALARM не відправлено.");
     return;
   }
   if (reliable_is_busy(&reliable)) {
-    Serial.println("[ALARM] Попередня критична відправка ще активна, зачекай.");
+    DBG.println("[ALARM] Попередня критична відправка ще активна, зачекай.");
     return;
   }
 
@@ -529,32 +550,35 @@ void send_alarm() {
   pkt.payload_len = strlen(json);
   memcpy(pkt.payload, json, pkt.payload_len);
 
-  Serial.print("[ALARM] Ініціюю надійну відправку sequence=");
-  Serial.println(pkt.sequence);
+  DBG.print("[ALARM] Ініціюю надійну відправку sequence=");
+  DBG.println(pkt.sequence);
   reliable_send_critical(&reliable, &pkt, millis());
 }
 
 void print_status() {
-  Serial.print("[STATUS] node_id=");
-  Serial.print(MY_NODE_ID);
-  Serial.print(id_confirmed ? " (підтверджено)" : " (не підтверджено)");
-  Serial.print(" | канал=");
-  Serial.print(channel_name(active_channel()));
-  Serial.print(" | дріт=");
-  Serial.print(wire_alive() ? "живий" : "немає");
-  Serial.print(" | Wi-Fi=");
-  Serial.print(wifi_configured ? (WiFi.status() == WL_CONNECTED ? "підключено" : "підключаюсь") : "не налаштовано");
-  Serial.print(" | шлюз=");
-  Serial.print(gw_configured ? gw_ip_str : "не налаштовано");
-  Serial.print(" | TCP=");
-  Serial.print(tcp_client.connected() ? "так" : "ні");
-  Serial.print(" | буфер=");
-  Serial.println(buffer_count);
+  DBG.print("[STATUS] node_id=");
+  DBG.print(MY_NODE_ID);
+  DBG.print(id_confirmed ? " (підтверджено)" : " (не підтверджено)");
+  DBG.print(" | канал=");
+  DBG.print(channel_name(active_channel()));
+  DBG.print(" | дріт=");
+  DBG.print(wire_alive() ? "живий" : "немає");
+  DBG.print(" | Wi-Fi=");
+  DBG.print(wifi_configured ? (WiFi.status() == WL_CONNECTED ? "підключено" : "підключаюсь") : "не налаштовано");
+  DBG.print(" | шлюз=");
+  DBG.print(gw_configured ? gw_ip_str : "не налаштовано");
+  DBG.print(" | TCP=");
+  DBG.print(tcp_client.connected() ? "так" : "ні");
+  DBG.print(" | буфер=");
+  DBG.println(buffer_count);
 }
 
 // Команди з Serial Monitor: "alarm" -- критична подія з ACK/retry,
 // "status" -- поточний стан каналів, "forget" -- стерти збережені налаштування.
 void check_serial_commands() {
+#if LINK_VIA_USB_CABLE
+  return; // Serial зайнятий каналом зі шлюзом -- команди з консолі недоступні
+#endif
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
@@ -567,10 +591,10 @@ void check_serial_commands() {
           print_status();
         } else if (serial_cmd_buffer == "forget") {
           prefs.clear();
-          Serial.println("[CONFIG] Налаштування стерто. Перезавантаж плату і підключи дріт до Pi.");
+          DBG.println("[CONFIG] Налаштування стерто. Перезавантаж плату і підключи дріт до Pi.");
         } else {
-          Serial.print("[SERIAL] Невідома команда: ");
-          Serial.println(serial_cmd_buffer);
+          DBG.print("[SERIAL] Невідома команда: ");
+          DBG.println(serial_cmd_buffer);
         }
         serial_cmd_buffer = "";
       }
@@ -602,12 +626,14 @@ void setup() {
   Wire.setTimeOut(1000);      // без цього завислий I2C блокує весь loop()
   delay(2000);
 
-  Serial.println("\nІніціалізація IMU MPU9250...");
+  DBG.println("\nІніціалізація IMU MPU9250...");
   imu_ok = mpu.setup(0x68);
-  Serial.println(imu_ok ? "[OK] IMU успішно підключено."
+  DBG.println(imu_ok ? "[OK] IMU успішно підключено."
                         : "[ПОМИЛКА] IMU не знайдено! Телеметрія піде з нульовими roll/pitch/yaw.");
 
+#if !LINK_VIA_USB_CABLE
   GatewaySerial.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+#endif
 
   uint64_t efuse = ESP.getEfuseMac();
   snprintf(device_mac, sizeof(device_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -621,19 +647,19 @@ void setup() {
   load_saved_config();
   WiFi.mode(WIFI_STA);
   if (wifi_configured) {
-    Serial.println("[CONFIG] Знайдено збережені налаштування -- Wi-Fi стартує у фоні.");
+    DBG.println("[CONFIG] Знайдено збережені налаштування -- Wi-Fi стартує у фоні.");
     wifi_start();
   } else {
-    Serial.println("[CONFIG] Налаштувань Wi-Fi ще немає: підключи дріт до Pi (UART), шлюз передасть їх сам.");
+    DBG.println("[CONFIG] Налаштувань Wi-Fi ще немає: підключи дріт до Pi (UART), шлюз передасть їх сам.");
   }
 
   reliable_init(&reliable, esp32_reliable_send, NULL);
 
-  Serial.print("Готово. MAC=");
-  Serial.print(device_mac);
-  Serial.print(", node_id=");
-  Serial.print(MY_NODE_ID ? String(MY_NODE_ID) : String("очікую від шлюзу"));
-  Serial.println(". Команди в Serial Monitor: alarm, status, forget.");
+  DBG.print("Готово. MAC=");
+  DBG.print(device_mac);
+  DBG.print(", node_id=");
+  DBG.print(MY_NODE_ID ? String(MY_NODE_ID) : String("очікую від шлюзу"));
+  DBG.println(". Команди в Serial Monitor: alarm, status, forget.");
 }
 
 void loop() {
@@ -649,12 +675,12 @@ void loop() {
     }
   }
   if (now_wifi && !was_wifi) {
-    Serial.print("[WIFI] Підключено, IP плати: ");
-    Serial.println(WiFi.localIP());
+    DBG.print("[WIFI] Підключено, IP плати: ");
+    DBG.println(WiFi.localIP());
     if (!udp_started) udp_started = udp.begin(UDP_LOCAL_PORT);
   }
   if (!now_wifi && was_wifi) {
-    Serial.println("[WIFI] Зв'язок втрачено.");
+    DBG.println("[WIFI] Зв'язок втрачено.");
     tcp_client.stop();
   }
   was_wifi = now_wifi;
@@ -666,7 +692,7 @@ void loop() {
       last_tcp_attempt = millis();
       tcp_assembler.reset();
       if (tcp_client.connect(gateway_ip, tcp_port, 1500)) {
-        Serial.println("[TCP] Підключено до шлюзу (резервний канал).");
+        DBG.println("[TCP] Підключено до шлюзу (резервний канал).");
       }
     }
   }
@@ -697,15 +723,15 @@ void loop() {
 
   ReliableStatus rst = reliable_tick(&reliable, millis());
   if (rst == RELIABLE_SUCCESS) {
-    Serial.print("[ALARM] seq=");
-    Serial.print(reliable.sequence);
-    Serial.print(" ДОСТАВЛЕНО, спроб=");
-    Serial.println(reliable.attempts);
+    DBG.print("[ALARM] seq=");
+    DBG.print(reliable.sequence);
+    DBG.print(" ДОСТАВЛЕНО, спроб=");
+    DBG.println(reliable.attempts);
   } else if (rst == RELIABLE_EXHAUSTED) {
-    Serial.print("[ALARM] seq=");
-    Serial.print(reliable.sequence);
-    Serial.print(": RETRY ВИЧЕРПАНО, НЕ доставлено, спроб=");
-    Serial.println(reliable.attempts);
+    DBG.print("[ALARM] seq=");
+    DBG.print(reliable.sequence);
+    DBG.print(": RETRY ВИЧЕРПАНО, НЕ доставлено, спроб=");
+    DBG.println(reliable.attempts);
   }
 
   // Щойно з'явився будь-який канал -- вивантажуємо накопичене (раз на секунду)
@@ -733,10 +759,10 @@ void loop() {
   static Channel last_channel = CH_NONE;
   Channel ch = active_channel();
   if (ch != last_channel) {
-    Serial.print("[КАНАЛ] ");
-    Serial.print(channel_name(last_channel));
-    Serial.print(" -> ");
-    Serial.println(channel_name(ch));
+    DBG.print("[КАНАЛ] ");
+    DBG.print(channel_name(last_channel));
+    DBG.print(" -> ");
+    DBG.println(channel_name(ch));
     last_channel = ch;
   }
 }
