@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
@@ -134,6 +136,13 @@ typedef struct {
 
     RouteKind last_transport; // яким каналом прийшов ОСТАННІЙ пакет цього вузла
     ReplyRoute last_route;    // куди слати команди з веба (downlink) для UDP/TCP/UART-вузла
+
+    uint64_t last_ts_ms;      // timestamp_ms (millis плати) найновішого пакета -- для виявлення перезапуску
+    // Автоналаштування вузла по UART (Wi-Fi + адреса шлюзу)
+    uint8_t  prov_acks;       // біт0 -- wifi підтверджено, біт1 -- gw підтверджено
+    uint32_t prov_seq_wifi;   // sequence наших CONFIG-пакетів (0 = ще не надсилали)
+    uint32_t prov_seq_gw;
+    uint64_t prov_last_ms;    // коли востаннє слали (для повторів)
 } NodeState;
 
 NodeState nodes[MAX_NODES];
@@ -145,9 +154,17 @@ struct mosquitto *mosq_global = NULL;
 // канал у циклі опитування, решта транспортів працюють як і раніше.
 int g_udp_fd = -1;
 int g_tcp_listen_fd = -1;
-int g_tcp_client_fd = -1;
+// Кілька TCP-клієнтів одночасно: кожна плата, що має TCP як резервний
+// канал, тримає своє з'єднання. Кадр складається окремо для кожного.
+#define MAX_TCP_CLIENTS 4
+#define TCP_IDLE_TIMEOUT_MS 20000 // плата шле раз на 5 с; мовчання довше = з'єднання мертве
+typedef struct {
+    int fd;
+    FrameReader reader;
+    uint64_t last_rx_ms;
+} TcpClient;
+TcpClient g_tcp_clients[MAX_TCP_CLIENTS];
 int g_uart_fd = -1;
-FrameReader g_tcp_reader;
 FrameReader g_uart_reader;
 
 const char *route_kind_name(RouteKind k) {
@@ -287,6 +304,364 @@ void send_ack_via(uint16_t node_id, uint32_t seq, const ReplyRoute *route) {
 // чи UART. Саме це і є "транспорт замінний, логіка протоколу одна", а не
 // просто документ-намір: протокол/дедуп/дашборд не знають і не питають,
 // яким дротом прийшли байти.
+// ==== Автоналаштування вузла по UART ====
+// Коли вузол вийшов на зв'язок через UART-дріт, Gateway сам передає йому
+// налаштування хоста, на якому працює: Wi-Fi (SSID/пароль) і власну IP з
+// портами UDP/TCP. Плата зберігає їх у пам'яті й надалі тримає Wi-Fi
+// резервним каналом: коли дріт відключили, дані йдуть по Wi-Fi.
+// Налаштування беруться (по пріоритету): gateway.conf -> автовизначення
+// (IP з мережевих інтерфейсів, SSID/пароль активного Wi-Fi через nmcli).
+// Файл gateway.conf НЕ в git: пароль Wi-Fi не повинен потрапляти в репозиторій.
+#define CONF_FILE_PATH "gateway.conf"
+#define PROVISION_RETRY_MS 3000
+#define UART_PING_MS 1000 // як часто шлемо "дріт живий" -- по ньому плата розуміє, що Pi на іншому кінці
+
+typedef struct {
+    char ssid[64];
+    char pass[96];
+    char ip[16];
+    int  udp_port;
+    int  tcp_port;
+} ProvisionConfig;
+
+static ProvisionConfig g_prov;
+static bool g_prov_ready = false;
+static uint32_t g_down_seq = 1; // sequence наших пакетів до плат; 0 зарезервовано як "не надсилали"
+
+static uint32_t next_down_seq(void) {
+    uint32_t v = g_down_seq++;
+    if (g_down_seq == 0) g_down_seq = 1;
+    return v;
+}
+
+static void str_trim(char *s) {
+    size_t l = strlen(s);
+    while (l > 0 && (s[l-1] == '\n' || s[l-1] == '\r' || s[l-1] == ' ' || s[l-1] == '\t')) s[--l] = '\0';
+    size_t lead = strspn(s, " \t");
+    if (lead) memmove(s, s + lead, strlen(s + lead) + 1);
+}
+
+static int iface_score(const char *name) {
+    if (!strncmp(name, "lo", 2) || !strncmp(name, "docker", 6) ||
+        !strncmp(name, "br-", 3) || !strncmp(name, "veth", 4)) return 0;
+    if (!strncmp(name, "wl", 2)) return 3;                      // wlan0, wlp...
+    if (!strncmp(name, "eth", 3) || !strncmp(name, "en", 2)) return 2;
+    return 1;
+}
+
+static bool detect_own_ip(char *out, size_t n) {
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) != 0) return false;
+    int best = 0;
+    for (struct ifaddrs *a = list; a; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+        if (!(a->ifa_flags & IFF_UP) || (a->ifa_flags & IFF_LOOPBACK)) continue;
+        int sc = iface_score(a->ifa_name);
+        if (sc > best) {
+            char buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &((struct sockaddr_in*)a->ifa_addr)->sin_addr, buf, sizeof(buf));
+            snprintf(out, n, "%s", buf);
+            best = sc;
+        }
+    }
+    freeifaddrs(list);
+    return best > 0;
+}
+
+// Виконує команду й повертає перший непорожній рядок виводу (без \n).
+static bool run_first_line(const char *cmd, char *out, size_t n) {
+    FILE *f = popen(cmd, "r");
+    if (!f) return false;
+    bool ok = fgets(out, (int)n, f) != NULL;
+    pclose(f);
+    if (!ok) return false;
+    str_trim(out);
+    return out[0] != '\0';
+}
+
+// SSID активної Wi-Fi мережі (NetworkManager). У режимі -t двокрапка й
+// зворотна скісна в назві екрануються як "\:" і "\\".
+static bool detect_wifi_ssid(char *out, size_t n) {
+    FILE *f = popen("nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null", "r");
+    if (!f) return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "yes:", 4) != 0) continue;
+        size_t o = 0;
+        for (const char *p = line + 4; *p && *p != '\n' && o + 1 < n; p++) {
+            if (*p == '\\' && (p[1] == ':' || p[1] == '\\')) p++;
+            out[o++] = *p;
+        }
+        out[o] = '\0';
+        found = out[0] != '\0';
+        break;
+    }
+    pclose(f);
+    return found;
+}
+
+// Пароль збереженого профілю. Може вимагати прав (sudo) -- тоді просто
+// не знайдеться, і користувач вписує його в gateway.conf.
+static bool detect_wifi_pass(const char *ssid, char *out, size_t n) {
+    if (strchr(ssid, '\'') || strchr(ssid, '\\')) return false; // не складаємо shell-команду з дивних символів
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "nmcli -s -g 802-11-wireless-security.psk connection show '%s' 2>/dev/null", ssid);
+    return run_first_line(cmd, out, n);
+}
+
+static void load_provision_config(void) {
+    memset(&g_prov, 0, sizeof(g_prov));
+    g_prov.udp_port = UDP_PORT;
+    g_prov.tcp_port = TCP_PORT;
+
+    FILE *f = fopen(CONF_FILE_PATH, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '#') continue;
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            char *key = line, *val = eq + 1;
+            str_trim(key); str_trim(val);
+            if (!strcmp(key, "wifi_ssid"))      snprintf(g_prov.ssid, sizeof(g_prov.ssid), "%s", val);
+            else if (!strcmp(key, "wifi_pass")) snprintf(g_prov.pass, sizeof(g_prov.pass), "%s", val);
+            else if (!strcmp(key, "gateway_ip"))snprintf(g_prov.ip, sizeof(g_prov.ip), "%s", val);
+            else if (!strcmp(key, "udp_port"))  g_prov.udp_port = atoi(val);
+            else if (!strcmp(key, "tcp_port"))  g_prov.tcp_port = atoi(val);
+        }
+        fclose(f);
+    }
+
+    if (!g_prov.ip[0]) detect_own_ip(g_prov.ip, sizeof(g_prov.ip));
+    if (!g_prov.ssid[0]) detect_wifi_ssid(g_prov.ssid, sizeof(g_prov.ssid));
+    if (g_prov.ssid[0] && !g_prov.pass[0]) detect_wifi_pass(g_prov.ssid, g_prov.pass, sizeof(g_prov.pass));
+
+    g_prov_ready = g_prov.ssid[0] && g_prov.ip[0];
+    if (g_prov_ready) {
+        log_event("[НАЛАШТУВАННЯ] Шлюз передаватиме вузлам по UART: gateway_ip=%s, UDP=%d, TCP=%d, Wi-Fi \"%s\", пароль %s\n",
+                   g_prov.ip, g_prov.udp_port, g_prov.tcp_port, g_prov.ssid,
+                   g_prov.pass[0] ? "заданий" : "НЕ ЗАДАНИЙ");
+        if (!g_prov.pass[0])
+            log_event("[НАЛАШТУВАННЯ] Пароль Wi-Fi не визначено -- впишіть wifi_pass у %s, якщо мережа не відкрита\n", CONF_FILE_PATH);
+    } else {
+        log_event("[НАЛАШТУВАННЯ] Не вдалося визначити Wi-Fi/IP -- автоналаштування вузлів вимкнено. "
+                   "Створіть %s (див. gateway.conf.example)\n", CONF_FILE_PATH);
+    }
+}
+
+// Пакує й пише у UART один кадр (шлюз -> плата). payload_json може бути NULL.
+static bool uart_write_frame(uint8_t type, uint16_t node_id, uint32_t seq, const char *payload_json) {
+    if (g_uart_fd < 0) return false;
+    SensorPacket pkt = {0};
+    pkt.version = PROTOCOL_VERSION;
+    pkt.msg_type = type;
+    pkt.node_id = node_id;
+    pkt.sequence = seq;
+    pkt.timestamp_ms = get_monotonic_time_ms();
+    if (payload_json) {
+        size_t n = strlen(payload_json);
+        if (n > MAX_PAYLOAD_SIZE) {
+            log_event("[НАЛАШТУВАННЯ] Payload %zu байт > %d -- не надіслано (задовгий SSID/пароль?)\n", n, MAX_PAYLOAD_SIZE);
+            return false;
+        }
+        memcpy(pkt.payload, payload_json, n);
+        pkt.payload_len = (uint16_t)n;
+    }
+    uint8_t tx[256];
+    int len = protocol_pack(&pkt, tx, sizeof(tx));
+    if (len <= 0) return false;
+    return write(g_uart_fd, tx, len) == len;
+}
+
+// Два невеликі CONFIG-пакети (разом SSID+пароль+IP не влізли б у 128 байт payload).
+static void provision_send(NodeState *n) {
+    if (!(n->prov_acks & 1)) {
+        if (n->prov_seq_wifi == 0) n->prov_seq_wifi = next_down_seq();
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "cmd", "wifi");
+        cJSON_AddStringToObject(o, "s", g_prov.ssid);
+        cJSON_AddStringToObject(o, "p", g_prov.pass);
+        char *js = cJSON_PrintUnformatted(o);
+        if (js) { uart_write_frame(MSG_CONFIG, n->node_id, n->prov_seq_wifi, js); free(js); }
+        cJSON_Delete(o);
+    }
+    if (!(n->prov_acks & 2)) {
+        if (n->prov_seq_gw == 0) n->prov_seq_gw = next_down_seq();
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "cmd", "gw");
+        cJSON_AddStringToObject(o, "ip", g_prov.ip);
+        cJSON_AddNumberToObject(o, "udp", g_prov.udp_port);
+        cJSON_AddNumberToObject(o, "tcp", g_prov.tcp_port);
+        char *js = cJSON_PrintUnformatted(o);
+        if (js) { uart_write_frame(MSG_CONFIG, n->node_id, n->prov_seq_gw, js); free(js); }
+        cJSON_Delete(o);
+    }
+}
+
+static void provision_on_ack(const SensorPacket *ack) {
+    for (int i = 0; i < node_count; i++) {
+        NodeState *n = &nodes[i];
+        if (n->node_id != ack->node_id) continue;
+        uint8_t before = n->prov_acks;
+        if (n->prov_seq_wifi != 0 && ack->sequence == n->prov_seq_wifi) n->prov_acks |= 1;
+        if (n->prov_seq_gw != 0 && ack->sequence == n->prov_seq_gw) n->prov_acks |= 2;
+        if (before != 3 && n->prov_acks == 3)
+            log_event("[НАЛАШТУВАННЯ] Вузол %u прийняв налаштування (Wi-Fi + адреса шлюзу)\n", n->node_id);
+        return;
+    }
+}
+
+// Викликається з головного циклу: "пінг" дроту + повтори автоналаштування.
+static void uart_tick(uint64_t now) {
+    if (g_uart_fd < 0) return;
+
+    static uint64_t last_ping = 0;
+    if (now - last_ping >= UART_PING_MS) {
+        last_ping = now;
+        uart_write_frame(MSG_HEARTBEAT, 0, next_down_seq(), NULL); // node_id 0 = усім
+    }
+
+    if (!g_prov_ready) return;
+    for (int i = 0; i < node_count; i++) {
+        NodeState *n = &nodes[i];
+        if (n->last_route.kind != ROUTE_UART || n->prov_acks == 3) continue;
+        if (now - n->last_seen_ms > NODE_TIMEOUT_MS) continue; // вузол зараз не на дроті
+        if (n->prov_last_ms != 0 && now - n->prov_last_ms < PROVISION_RETRY_MS) continue;
+        n->prov_last_ms = now ? now : 1;
+        provision_send(n);
+        log_event("[НАЛАШТУВАННЯ] Надіслано налаштування вузлу %u по UART\n", n->node_id);
+    }
+}
+
+// ==== Автопризначення node_id за старшинством ====
+// Плата не має "своєї" node_id: вона шле HELLO (HEARTBEAT з node_id=0 і
+// payload {"mac":"...","id":<збережений або 0>}). Шлюз веде реєстр
+// MAC -> node_id: хто з'явився першим, той отримує найменший вільний id
+// (1, 2, 3...). Реєстр зберігається у файлі, тож id не міняються після
+// перезапуску шлюзу. Якщо плата мала вже прописаний id, що не збігається з
+// реєстром (наприклад, такий самий, як у іншої плати), вона перезаписує його
+// на призначений. Шлюз відповідає на кожен HELLO (відповідь ідемпотентна),
+// плата повторює HELLO, поки не отримає id.
+#define REGISTRY_FILE "node_registry.txt"
+
+typedef struct {
+    char     mac[24];
+    uint16_t id;
+} RegEntry;
+
+static RegEntry g_reg[MAX_NODES];
+static int g_reg_count = 0;
+
+static void registry_save(void) {
+    FILE *f = fopen(REGISTRY_FILE, "w");
+    if (!f) {
+        log_event("[ID] Не вдалося записати %s: %s\n", REGISTRY_FILE, strerror(errno));
+        return;
+    }
+    for (int i = 0; i < g_reg_count; i++) fprintf(f, "%s %u\n", g_reg[i].mac, g_reg[i].id);
+    fclose(f);
+}
+
+static void registry_load(void) {
+    FILE *f = fopen(REGISTRY_FILE, "r");
+    if (!f) return;
+    char mac[24];
+    unsigned id;
+    while (g_reg_count < MAX_NODES && fscanf(f, "%23s %u", mac, &id) == 2) {
+        if (id == 0 || id > 65535) continue;
+        snprintf(g_reg[g_reg_count].mac, sizeof(g_reg[0].mac), "%s", mac);
+        g_reg[g_reg_count].id = (uint16_t)id;
+        g_reg_count++;
+    }
+    fclose(f);
+    if (g_reg_count > 0) log_event("[ID] Завантажено реєстр плат: %d шт. (%s)\n", g_reg_count, REGISTRY_FILE);
+}
+
+static bool id_in_use(uint16_t id) {
+    for (int i = 0; i < g_reg_count; i++) if (g_reg[i].id == id) return true;
+    for (int i = 0; i < node_count; i++) if (nodes[i].node_id == id) return true; // вузли без HELLO (sim_node)
+    return false;
+}
+
+// Повертає id для MAC (існуючий або новий найменший вільний); 0 -- реєстр заповнений.
+static uint16_t registry_assign(const char *mac, bool *is_new) {
+    *is_new = false;
+    for (int i = 0; i < g_reg_count; i++) {
+        if (strcmp(g_reg[i].mac, mac) == 0) return g_reg[i].id;
+    }
+    if (g_reg_count >= MAX_NODES) return 0;
+    uint16_t id = 1;
+    while (id_in_use(id)) id++;
+    snprintf(g_reg[g_reg_count].mac, sizeof(g_reg[0].mac), "%s", mac);
+    g_reg[g_reg_count].id = id;
+    g_reg_count++;
+    registry_save();
+    *is_new = true;
+    return id;
+}
+
+// Пакує кадр і відправляє ТИМ КАНАЛОМ, звідки прийшов запит (UART/UDP/TCP).
+static void send_frame_route(const ReplyRoute *route, uint8_t type, uint16_t node_id,
+                             uint32_t seq, const char *payload_json) {
+    SensorPacket pkt = {0};
+    pkt.version = PROTOCOL_VERSION;
+    pkt.msg_type = type;
+    pkt.node_id = node_id;
+    pkt.sequence = seq;
+    pkt.timestamp_ms = get_monotonic_time_ms();
+    size_t n = payload_json ? strlen(payload_json) : 0;
+    if (n > MAX_PAYLOAD_SIZE) return;
+    if (n) memcpy(pkt.payload, payload_json, n);
+    pkt.payload_len = (uint16_t)n;
+    uint8_t tx[256];
+    int len = protocol_pack(&pkt, tx, sizeof(tx));
+    if (len > 0) route_reply(route, tx, len);
+}
+
+static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
+    if (route->kind == ROUTE_MQTT) return; // MQTT-вузли id не отримують (sim_node має свій)
+    char js[MAX_PAYLOAD_SIZE + 1];
+    memcpy(js, pkt->payload, pkt->payload_len);
+    js[pkt->payload_len] = '\0';
+
+    cJSON *j = cJSON_Parse(js);
+    cJSON *mac_j = j ? cJSON_GetObjectItemCaseSensitive(j, "mac") : NULL;
+    if (!cJSON_IsString(mac_j) || strlen(mac_j->valuestring) < 8 || strlen(mac_j->valuestring) >= sizeof(g_reg[0].mac)) {
+        log_event("[ID] HELLO без коректного mac, відхилено (канал=%s)\n", route_kind_name(route->kind));
+        cJSON_Delete(j);
+        return;
+    }
+    cJSON *had_j = cJSON_GetObjectItemCaseSensitive(j, "id");
+    unsigned had = cJSON_IsNumber(had_j) ? (unsigned)had_j->valuedouble : 0;
+
+    bool is_new;
+    uint16_t id = registry_assign(mac_j->valuestring, &is_new);
+    if (id == 0) {
+        log_event("[ID] Реєстр заповнений (%d плат), плата %s id не отримала\n", MAX_NODES, mac_j->valuestring);
+        cJSON_Delete(j);
+        return;
+    }
+    if (is_new)
+        log_event("[ID] Нова плата %s (канал=%s) -> node_id=%u\n", mac_j->valuestring, route_kind_name(route->kind), id);
+    if (had != 0 && had != id)
+        log_event("[ID] Плата %s мала id=%u, переписано на %u\n", mac_j->valuestring, had, id);
+
+    cJSON *reply = cJSON_CreateObject();
+    cJSON_AddStringToObject(reply, "cmd", "id");
+    cJSON_AddStringToObject(reply, "mac", mac_j->valuestring);
+    cJSON_AddNumberToObject(reply, "id", id);
+    char *rs = cJSON_PrintUnformatted(reply);
+    if (rs) {
+        send_frame_route(route, MSG_CONFIG, 0, next_down_seq(), rs); // node_id=0: адресат визначається за mac
+        free(rs);
+    }
+    cJSON_Delete(reply);
+    cJSON_Delete(j);
+}
+
 // Публікує пакет у TELEMETRY_TOPIC. Payload, якщо це валідний JSON, іде як
 // вкладений об'єкт; інакше -- сирим рядком у "payload_raw".
 static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, RouteKind kind) {
@@ -331,6 +706,20 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
         return;
     }
 
+    // ACK від вузла (підтвердження наших CONFIG-пакетів автоналаштування) --
+    // це не телеметрія, у облік sequence/втрат не потрапляє.
+    if (pkt.msg_type == MSG_ACK) {
+        provision_on_ack(&pkt);
+        return;
+    }
+
+    // HELLO від плати без id: HEARTBEAT з node_id=0 -- запит на призначення id.
+    if (pkt.msg_type == MSG_HEARTBEAT && pkt.node_id == 0) {
+        handle_hello(&pkt, route);
+        return;
+    }
+    if (pkt.node_id == 0) return; // node_id=0 зарезервовано; інші пакети без id не приймаємо
+
     // Трекінг вузла
     NodeState *node = find_or_create_node(pkt.node_id);
     if (!node) return;
@@ -341,10 +730,14 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
 
     // Аналіз втрат, дублікатів і порядку (вікно SEQ_WINDOW останніх sequence).
     bool is_seq_duplicate = false;
+    // Перезапуск плати: millis() пішов з нуля, тобто timestamp різко впав.
+    // Лише за sequence це видно не одразу (поки не набіжить SEQ_WINDOW пакетів).
+    bool ts_restart = node->max_seq_seen != -1 && pkt.timestamp_ms + 30000 < node->last_ts_ms;
     if (node->max_seq_seen == -1) {
         node->max_seq_seen = (int32_t)pkt.sequence;
         node->seen_mask = 1;
         node->received_count++;
+        node->last_ts_ms = pkt.timestamp_ms;
     } else {
         int64_t diff = (int64_t)pkt.sequence - (int64_t)node->max_seq_seen;
         if (diff > 0) {
@@ -354,7 +747,8 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
             node->seen_mask = (diff >= SEQ_WINDOW) ? 1 : ((node->seen_mask << diff) | 1);
             node->max_seq_seen = (int32_t)pkt.sequence;
             node->received_count++;
-        } else if (-diff < SEQ_WINDOW) {
+            node->last_ts_ms = pkt.timestamp_ms;
+        } else if (-diff < SEQ_WINDOW && !ts_restart) {
             uint64_t bit = 1ULL << (-diff);
             if (node->seen_mask & bit) {
                 is_seq_duplicate = true;
@@ -371,13 +765,19 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
         } else {
             // sequence відстає від максимуму більше ніж на вікно -- це не
             // дублікат, а перезапуск вузла (sequence пішов з нуля).
-            log_event("[СТАТУС] Вузол %u, схоже, перезапустився (Seq %u після %d). Скидаю відстеження sequence\n",
-                       pkt.node_id, pkt.sequence, node->max_seq_seen);
+            log_event("[СТАТУС] Вузол %u, схоже, перезапустився (Seq %u після %d, timestamp %llu мс). Скидаю відстеження sequence\n",
+                       pkt.node_id, pkt.sequence, node->max_seq_seen, (unsigned long long)pkt.timestamp_ms);
             node->max_seq_seen = (int32_t)pkt.sequence;
             node->seen_mask = 1;
             node->alarm_idx = 0;
             node->alarm_filled = 0;
             node->received_count++;
+            node->last_ts_ms = pkt.timestamp_ms;
+            // Після перезапуску плата могла втратити налаштування -- шлемо знову
+            node->prov_acks = 0;
+            node->prov_seq_wifi = 0;
+            node->prov_seq_gw = 0;
+            node->prov_last_ms = 0;
         }
     }
 
@@ -413,6 +813,14 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
 // Колбек MQTT -- лише розпаковує ReplyRoute{ROUTE_MQTT} і передає в
 // спільний handle_packet(). Лишається для sim_node і для сумісності --
 // фізичні плати тепер ідуть через UDP/TCP/UART нижче.
+static bool tcp_fd_active(int fd) {
+    if (fd < 0) return false;
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        if (g_tcp_clients[i].fd == fd) return true;
+    }
+    return false;
+}
+
 // Команди з веба (ALARM/CONFIG) приходять в MQTT-топік case24/downlink/<id>.
 // Плата на UDP/TCP/UART цього топіка не слухає, тому Gateway сам пересилає
 // кадр тим каналом, яким вузол останній раз вийшов на зв'язок. Для MQTT-вузлів
@@ -428,8 +836,8 @@ void forward_downlink(const struct mosquitto_message *msg) {
         ReplyRoute route = nodes[i].last_route;
         if (route.kind == ROUTE_MQTT) return;
         // fd для TCP міг змінитись після перепідключення -- беремо поточний
-        if (route.kind == ROUTE_TCP) route.fd = g_tcp_client_fd;
         if (route.kind == ROUTE_UART) route.fd = g_uart_fd;
+        if (route.kind == ROUTE_TCP && !tcp_fd_active(route.fd)) route.fd = -1;
         if ((route.kind == ROUTE_TCP || route.kind == ROUTE_UART) && route.fd < 0) {
             log_event("[DOWNLINK] Вузол %u: канал %s не активний, команду з веба не доставлено\n",
                        pkt.node_id, route_kind_name(route.kind));
@@ -518,7 +926,7 @@ void setup_tcp(void) {
         g_tcp_listen_fd = -1;
         return;
     }
-    if (listen(g_tcp_listen_fd, 1) < 0) {
+    if (listen(g_tcp_listen_fd, MAX_TCP_CLIENTS) < 0) {
         fprintf(stderr, "[TCP] listen() не вдався: %s\n", strerror(errno));
         close(g_tcp_listen_fd);
         g_tcp_listen_fd = -1;
@@ -526,55 +934,80 @@ void setup_tcp(void) {
     }
     int flags = fcntl(g_tcp_listen_fd, F_GETFL, 0);
     fcntl(g_tcp_listen_fd, F_SETFL, flags | O_NONBLOCK);
-    frame_reader_init(&g_tcp_reader);
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) g_tcp_clients[i].fd = -1;
     log_event("[TCP] Слухаю на порту %d\n", TCP_PORT);
+}
+
+static void tcp_client_close(TcpClient *c, const char *why) {
+    log_event("[TCP] Вузол (fd=%d) відключено: %s\n", c->fd, why);
+    close(c->fd);
+    c->fd = -1;
 }
 
 void poll_tcp(void) {
     if (g_tcp_listen_fd < 0) return;
+    uint64_t now = get_monotonic_time_ms();
 
-    if (g_tcp_client_fd < 0) {
+    // Приймаємо всі нові з'єднання, що чекають
+    for (;;) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int fd = accept(g_tcp_listen_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (fd >= 0) {
-            int flags = fcntl(fd, F_GETFL, 0);
-            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-            g_tcp_client_fd = fd;
-            frame_reader_init(&g_tcp_reader);
-            log_event("[TCP] Вузол підключився з %s (fd=%d)\n",
-                       inet_ntoa(client_addr.sin_addr), fd);
+        if (fd < 0) break;
+        int slot = -1;
+        for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+            if (g_tcp_clients[i].fd < 0) { slot = i; break; }
         }
-        return; // ще нема з ким читати цього циклу
+        if (slot < 0) {
+            log_event("[TCP] Забагато клієнтів (макс. %d), з'єднання з %s відхилено\n",
+                       MAX_TCP_CLIENTS, inet_ntoa(client_addr.sin_addr));
+            close(fd);
+            continue;
+        }
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        g_tcp_clients[slot].fd = fd;
+        g_tcp_clients[slot].last_rx_ms = now;
+        frame_reader_init(&g_tcp_clients[slot].reader);
+        log_event("[TCP] Вузол підключився з %s (fd=%d)\n", inet_ntoa(client_addr.sin_addr), fd);
     }
 
-    uint8_t rx[256];
-    ssize_t n = recv(g_tcp_client_fd, rx, sizeof(rx), 0);
-    if (n > 0) {
-        ReplyRoute route = { .kind = ROUTE_TCP, .fd = g_tcp_client_fd };
-        for (ssize_t i = 0; i < n; i++) {
-            if (frame_reader_feed_byte(&g_tcp_reader, rx[i])) {
-                handle_packet(g_tcp_reader.buf, g_tcp_reader.have, &route);
-                frame_reader_init(&g_tcp_reader);
+    for (int c = 0; c < MAX_TCP_CLIENTS; c++) {
+        TcpClient *cl = &g_tcp_clients[c];
+        if (cl->fd < 0) continue;
+
+        uint8_t rx[256];
+        ssize_t n = recv(cl->fd, rx, sizeof(rx), 0);
+        if (n > 0) {
+            cl->last_rx_ms = now;
+            ReplyRoute route = { .kind = ROUTE_TCP, .fd = cl->fd };
+            for (ssize_t i = 0; i < n; i++) {
+                if (frame_reader_feed_byte(&cl->reader, rx[i])) {
+                    handle_packet(cl->reader.buf, cl->reader.have, &route);
+                    frame_reader_init(&cl->reader);
+                }
             }
+        } else if (n == 0) {
+            tcp_client_close(cl, "закрито вузлом");
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            tcp_client_close(cl, strerror(errno));
+        } else if (now - cl->last_rx_ms > TCP_IDLE_TIMEOUT_MS) {
+            tcp_client_close(cl, "немає даних (обрив без FIN)");
         }
-    } else if (n == 0) {
-        log_event("[TCP] Вузол (fd=%d) відключився\n", g_tcp_client_fd);
-        close(g_tcp_client_fd);
-        g_tcp_client_fd = -1;
     }
-    // n < 0 (EAGAIN) -- просто немає нових байт зараз.
 }
 
 // ---- UART: відкрити послідовний порт (термінально, 8N1), читати з фреймінгом ----
 void setup_uart(void) {
-    g_uart_fd = open(UART_DEVICE, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    const char *uart_dev = getenv("GATEWAY_UART"); // перевизначення шляху: GATEWAY_UART=/dev/serial0
+    if (!uart_dev || !*uart_dev) uart_dev = UART_DEVICE;
+    g_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (g_uart_fd < 0) {
         fprintf(stderr,
                 "[UART] Не вдалося відкрити %s (%s) -- UART-вузол недоступний. "
                 "Перевір, що USB-TTL перехідник підключений (`ls /dev/ttyUSB*`), "
                 "і що UART_DEVICE вище відповідає реальному шляху. Гейтвей "
-                "продовжує працювати без UART.\n", UART_DEVICE, strerror(errno));
+                "продовжує працювати без UART.\n", uart_dev, strerror(errno));
         return;
     }
 
@@ -616,7 +1049,7 @@ void setup_uart(void) {
     }
 
     frame_reader_init(&g_uart_reader);
-    log_event("[UART] Слухаю на %s (115200 8N1)\n", UART_DEVICE);
+    log_event("[UART] Слухаю на %s (115200 8N1)\n", uart_dev);
 }
 
 void poll_uart(void) {
@@ -759,6 +1192,9 @@ int main(void) {
     setup_udp();
     setup_tcp();
     setup_uart();
+    g_down_seq = ((uint32_t)time(NULL) & 0x7FFFFFFF) | 1;
+    registry_load();
+    load_provision_config();
 
     printf("Шлюз успішно запущено. Очікування телеметрії (MQTT/UDP/TCP/UART)...\n");
 
@@ -771,6 +1207,7 @@ int main(void) {
         poll_uart();
 
         uint64_t now = get_monotonic_time_ms();
+        uart_tick(now);
         if (now - last_dash_ms >= 2000) {
             print_dashboard();
             publish_gateway_state(); // те саме, що дашборд, але для веб (Блок E)
