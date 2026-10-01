@@ -23,7 +23,7 @@
 #define MAX_NODES 10
 #define MAX_SEEN_ALARMS 16
 #define SEQ_WINDOW 64 // скільки останніх sequence пам'ятаємо для відрізнення дубліката від запізнілого пакета
-#define NODE_TIMEOUT_MS 5000 // 5 секунд без повідомлень = вузол OFFLINE
+#define NODE_TIMEOUT_MS 15000 // 15 с без повідомлень = вузол OFFLINE (плата шле раз на 5 с, тож 3 пропуски поспіль)
 #define LOG_FILE_PATH "gateway_log.txt"
 
 /* ==== 30.09 (3) -- три РІЗНІ транспорти для трьох фізичних плат ====
@@ -81,6 +81,21 @@ static void frame_reader_init(FrameReader *fr) {
     fr->header_done = false;
 }
 
+/* Чи може fr->buf[0..have) бути початком справжнього кадру: версія протоколу,
+ * відомий тип повідомлення, правдоподібний payload_len. Це дає самосинхронізацію:
+ * сміття (завантажувач ESP32, підключення посеред кадру) відкидається побайтово,
+ * а не з'їдає наступні справжні кадри і не рахується битим пакетом. */
+static bool frame_prefix_plausible(const FrameReader *fr) {
+    if (fr->have >= 1 && fr->buf[0] != PROTOCOL_VERSION) return false;
+    if (fr->have >= 2 && fr->buf[1] > MSG_ACK) return false;
+    if (fr->have >= HEADER_SIZE) {
+        uint16_t payload_len;
+        memcpy(&payload_len, fr->buf + 16, 2); /* offset payload_len у заголовку, див. protocol.h */
+        if (payload_len > MAX_PAYLOAD_SIZE) return false;
+    }
+    return true;
+}
+
 /* Повертає true, якщо ПІСЛЯ цього байта кадр у fr->buf[0..fr->have) повний
  * і готовий для protocol_unpack(). Викликач має одразу забрати дані й
  * викликати frame_reader_init() перед наступним feed. */
@@ -90,15 +105,18 @@ static bool frame_reader_feed_byte(FrameReader *fr, uint8_t byte) {
     }
     fr->buf[fr->have++] = byte;
 
-    if (!fr->header_done && fr->have == HEADER_SIZE) {
+    while (fr->have > 0 && !frame_prefix_plausible(fr)) {
+        memmove(fr->buf, fr->buf + 1, fr->have - 1); /* зсув на байт: шукаємо початок кадру далі */
+        fr->have--;
+    }
+    if (fr->have >= HEADER_SIZE) {
         uint16_t payload_len;
-        memcpy(&payload_len, fr->buf + 16, 2); /* offset payload_len у заголовку, див. protocol.h */
+        memcpy(&payload_len, fr->buf + 16, 2);
         fr->need = HEADER_SIZE + payload_len + CRC_SIZE;
         fr->header_done = true;
-        if (fr->need > sizeof(fr->buf)) {
-            frame_reader_init(fr); /* неможливий payload_len -- сміття на лінії */
-            return false;
-        }
+    } else {
+        fr->header_done = false;
+        fr->need = HEADER_SIZE;
     }
     return fr->header_done && fr->have == fr->need;
 }
@@ -1150,7 +1168,7 @@ void setup_uart(void) {
     tty.c_cflag |= (CREAD | CLOCAL);
     tty.c_cflag &= ~HUPCL;     // не смикати DTR/RTS при закритті порту (вони скидають ESP32)
 
-    tty.c_lflag &= ~ICANON;    // сирий (не по-рядковий) режим
+    tty.c_lflag &= ~(ICANON | IEXTEN);    // сирий режим: без по-рядкової обробки і службових символів (DISCARD, LNEXT)
     tty.c_lflag &= ~(ECHO | ECHOE | ISIG);
 
     tty.c_iflag &= ~(IXON | IXOFF | IXANY);
