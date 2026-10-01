@@ -106,6 +106,13 @@ static bool frame_reader_feed_byte(FrameReader *fr, uint8_t byte) {
 // винятково Блоку C). Публікується разом з терміналним дашбордом.
 #define STATE_TOPIC "case24/gateway/state"
 
+// Сюди Gateway публікує КОЖЕН валідний (не дубльований) пакет вузла у вигляді
+// JSON, незалежно від того, яким транспортом він прийшов (UDP/TCP/UART/MQTT).
+// Веб бере значення сенсорів для графіків і БД ЛИШЕ звідси -- плати на
+// UDP/TCP/UART у case24/uplink взагалі не потрапляють.
+#define TELEMETRY_TOPIC "case24/gateway/telemetry"
+#define DOWNLINK_PREFIX "case24/downlink/"
+
 // Структура для відстеження стану кожного сенсорного вузла
 typedef struct {
     uint16_t node_id;
@@ -126,6 +133,7 @@ typedef struct {
     uint64_t seen_mask;
 
     RouteKind last_transport; // яким каналом прийшов ОСТАННІЙ пакет цього вузла
+    ReplyRoute last_route;    // куди слати команди з веба (downlink) для UDP/TCP/UART-вузла
 } NodeState;
 
 NodeState nodes[MAX_NODES];
@@ -279,6 +287,32 @@ void send_ack_via(uint16_t node_id, uint32_t seq, const ReplyRoute *route) {
 // чи UART. Саме це і є "транспорт замінний, логіка протоколу одна", а не
 // просто документ-намір: протокол/дедуп/дашборд не знають і не питають,
 // яким дротом прийшли байти.
+// Публікує пакет у TELEMETRY_TOPIC. Payload, якщо це валідний JSON, іде як
+// вкладений об'єкт; інакше -- сирим рядком у "payload_raw".
+static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, RouteKind kind) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+    cJSON_AddNumberToObject(root, "node_id", pkt->node_id);
+    cJSON_AddNumberToObject(root, "sequence", pkt->sequence);
+    cJSON_AddNumberToObject(root, "ts_ms", (double)pkt->timestamp_ms);
+    cJSON_AddNumberToObject(root, "type", pkt->msg_type);
+    cJSON_AddStringToObject(root, "transport", route_kind_name(kind));
+
+    cJSON *payload = pkt->payload_len > 0 ? cJSON_Parse(payload_str) : NULL;
+    if (payload) {
+        cJSON_AddItemToObject(root, "payload", payload);
+    } else if (pkt->payload_len > 0) {
+        cJSON_AddStringToObject(root, "payload_raw", payload_str);
+    }
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str) {
+        mosquitto_publish(mosq_global, NULL, TELEMETRY_TOPIC, (int)strlen(json_str), json_str, 0, false);
+        free(json_str);
+    }
+    cJSON_Delete(root);
+}
+
 void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) {
     SensorPacket pkt = {0};
 
@@ -303,8 +337,10 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
 
     node->last_seen_ms = get_monotonic_time_ms();
     node->last_transport = route->kind;
+    node->last_route = *route;
 
     // Аналіз втрат, дублікатів і порядку (вікно SEQ_WINDOW останніх sequence).
+    bool is_seq_duplicate = false;
     if (node->max_seq_seen == -1) {
         node->max_seq_seen = (int32_t)pkt.sequence;
         node->seen_mask = 1;
@@ -321,6 +357,7 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
         } else if (-diff < SEQ_WINDOW) {
             uint64_t bit = 1ULL << (-diff);
             if (node->seen_mask & bit) {
+                is_seq_duplicate = true;
                 node->duplicate_count++;
             } else {
                 // Запізнілий пакет (порушення порядку): не дублікат, і раніше
@@ -347,14 +384,13 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
     // Парсинг JSON-корисного навантаження (у локальний буфер +1 байт для
     // '\0' -- НЕ пишемо термінатор у сам pkt.payload, бо payload_len може
     // дорівнювати MAX_PAYLOAD_SIZE і це був би вихід за межі масиву).
-    if (pkt.payload_len > 0) {
-        char tmp[MAX_PAYLOAD_SIZE + 1];
-        memcpy(tmp, pkt.payload, pkt.payload_len);
-        tmp[pkt.payload_len] = '\0';
-        cJSON *json = cJSON_Parse(tmp);
-        if (json) {
-            cJSON_Delete(json);
-        }
+    char tmp[MAX_PAYLOAD_SIZE + 1];
+    memcpy(tmp, pkt.payload, pkt.payload_len);
+    tmp[pkt.payload_len] = '\0';
+
+    // Дублі не віддаємо вебу -- у БД вони теж не потрібні.
+    if (!is_seq_duplicate && pkt.msg_type != MSG_ACK) {
+        publish_telemetry(&pkt, tmp, route->kind);
     }
 
     // Обробка критичних подій -- тепер логуємо ОБИДВА випадки: і нову
@@ -377,8 +413,42 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
 // Колбек MQTT -- лише розпаковує ReplyRoute{ROUTE_MQTT} і передає в
 // спільний handle_packet(). Лишається для sim_node і для сумісності --
 // фізичні плати тепер ідуть через UDP/TCP/UART нижче.
+// Команди з веба (ALARM/CONFIG) приходять в MQTT-топік case24/downlink/<id>.
+// Плата на UDP/TCP/UART цього топіка не слухає, тому Gateway сам пересилає
+// кадр тим каналом, яким вузол останній раз вийшов на зв'язок. Для MQTT-вузлів
+// (sim_node) нічого не робимо -- вони підписані на топік самі. Власні ACK
+// Gateway, які теж ідуть у цей топік, ігноруємо (msg_type == ACK).
+void forward_downlink(const struct mosquitto_message *msg) {
+    SensorPacket pkt = {0};
+    if (protocol_unpack((const uint8_t*)msg->payload, (size_t)msg->payloadlen, &pkt) != PROTO_OK) return;
+    if (pkt.msg_type == MSG_ACK) return;
+
+    for (int i = 0; i < node_count; i++) {
+        if (nodes[i].node_id != pkt.node_id) continue;
+        ReplyRoute route = nodes[i].last_route;
+        if (route.kind == ROUTE_MQTT) return;
+        // fd для TCP міг змінитись після перепідключення -- беремо поточний
+        if (route.kind == ROUTE_TCP) route.fd = g_tcp_client_fd;
+        if (route.kind == ROUTE_UART) route.fd = g_uart_fd;
+        if ((route.kind == ROUTE_TCP || route.kind == ROUTE_UART) && route.fd < 0) {
+            log_event("[DOWNLINK] Вузол %u: канал %s не активний, команду з веба не доставлено\n",
+                       pkt.node_id, route_kind_name(route.kind));
+            return;
+        }
+        route_reply(&route, (const uint8_t*)msg->payload, msg->payloadlen);
+        log_event("[DOWNLINK] Команда з веба (тип %u, Seq %u) -> вузол %u через %s\n",
+                   pkt.msg_type, pkt.sequence, pkt.node_id, route_kind_name(route.kind));
+        return;
+    }
+    log_event("[DOWNLINK] Команду для невідомого вузла %u відкинуто\n", pkt.node_id);
+}
+
 void on_mqtt_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg) {
     (void)mosq; (void)userdata;
+    if (strncmp(msg->topic, DOWNLINK_PREFIX, strlen(DOWNLINK_PREFIX)) == 0) {
+        forward_downlink(msg);
+        return;
+    }
     ReplyRoute route = { .kind = ROUTE_MQTT };
     handle_packet((const uint8_t*)msg->payload, (size_t)msg->payloadlen, &route);
 }
@@ -680,6 +750,7 @@ int main(void) {
     }
 
     mosquitto_subscribe(mosq_global, NULL, "case24/uplink", 0);
+    mosquitto_subscribe(mosq_global, NULL, DOWNLINK_PREFIX "+", 0);
 
     // 30.09 (3) -- три додаткові "сирі" транспорти поряд з MQTT. Кожен
     // піднімається незалежно: якщо, наприклад, UART-перехідник не

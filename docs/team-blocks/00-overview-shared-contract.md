@@ -161,7 +161,6 @@ gateway/          — C-програма шлюзу, лінкується з lib
 sim_node/         — симульований вузол (C, той самий protocol.c) (Блок D)
 tests/            — юніт-тести на C (codec round-trip, corrupt packet) (Блок A/D)
 docs/             — специфікація, README, threat model, звіт (спільно, фінальний день)
-python-reference/ — v1, Python-прототип, лишається як довідник, не як deliverable
 ```
 
 ## Фінальний день — РАЗОМ, не окремий блок
