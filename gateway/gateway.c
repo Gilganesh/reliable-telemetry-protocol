@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -549,13 +550,6 @@ static void log_provision_config(bool conf_other_network) {
     }
 }
 
-static void load_provision_config(void) {
-    bool other = false;
-    build_provision_config(&g_prov, &other);
-    g_prov_ready = g_prov.ssid[0] && g_prov.ip[0];
-    log_provision_config(other);
-}
-
 // Скидає стан автоналаштування вузла -- наступний цикл uart_tick() надішле все знову.
 static void provision_reset(NodeState *n) {
     n->prov_acks = 0;
@@ -564,21 +558,61 @@ static void provision_reset(NodeState *n) {
     n->prov_last_ms = 0;
 }
 
-// Раз на кілька секунд перевіряє, чи не змінилася мережа Pi. Якщо так --
-// плати на дроті отримують нові налаштування без перезапуску шлюзу.
-static void provision_refresh(uint64_t now) {
-    static uint64_t last_check = 0;
-    if (now - last_check < 10000) return;
-    last_check = now;
+// Визначення мережі (nmcli, sudo) може тривати секунди, тому воно йде у
+// ФОНОВОМУ потоці раз на 10 с, щоб головний цикл не зупинявся (інакше він не
+// читає порти й не шле "пінги", і плата вважає дріт мертвим). Потік лише
+// будує конфіг і кладе його в g_prov_pending; логує й застосовує головний потік.
+static pthread_mutex_t g_prov_mtx = PTHREAD_MUTEX_INITIALIZER;
+static ProvisionConfig g_prov_pending;
+static bool g_prov_pending_other = false;
+static bool g_prov_pending_valid = false;
 
+static void *prov_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        ProvisionConfig fresh;
+        bool other = false;
+        build_provision_config(&fresh, &other);
+        pthread_mutex_lock(&g_prov_mtx);
+        g_prov_pending = fresh;
+        g_prov_pending_other = other;
+        g_prov_pending_valid = true;
+        pthread_mutex_unlock(&g_prov_mtx);
+        sleep(10);
+    }
+    return NULL;
+}
+
+static void provision_start_worker(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, prov_worker, NULL) == 0) pthread_detach(t);
+    else log_event("[НАЛАШТУВАННЯ] Не вдалося запустити фоновий потік визначення мережі\n");
+}
+
+// Викликається з головного циклу: забирає готовий результат фонового потоку.
+// Мережа Pi змінилася -- плати на дроті отримують нові налаштування без
+// перезапуску шлюзу.
+static void provision_refresh(uint64_t now) {
+    (void)now;
     ProvisionConfig fresh;
-    bool other = false;
-    build_provision_config(&fresh, &other);
-    if (prov_config_equal(&fresh, &g_prov)) return;
+    bool other = false, have = false;
+    pthread_mutex_lock(&g_prov_mtx);
+    if (g_prov_pending_valid) {
+        fresh = g_prov_pending;
+        other = g_prov_pending_other;
+        g_prov_pending_valid = false;
+        have = true;
+    }
+    pthread_mutex_unlock(&g_prov_mtx);
+    if (!have) return;
+
+    static bool first = true;
+    if (!first && prov_config_equal(&fresh, &g_prov)) return;
 
     g_prov = fresh;
     g_prov_ready = g_prov.ssid[0] && g_prov.ip[0];
-    log_event("[НАЛАШТУВАННЯ] Мережа Pi змінилася -- оновлюю налаштування вузлів\n");
+    if (!first) log_event("[НАЛАШТУВАННЯ] Мережа Pi змінилася -- оновлюю налаштування вузлів\n");
+    first = false;
     log_provision_config(other);
     for (int i = 0; i < node_count; i++) provision_reset(&nodes[i]);
 }
@@ -1346,7 +1380,7 @@ int main(void) {
     setup_uart();
     g_down_seq = ((uint32_t)time(NULL) & 0x7FFFFFFF) | 1;
     registry_load();
-    load_provision_config();
+    provision_start_worker();
 
     printf("Шлюз успішно запущено. Очікування телеметрії (MQTT/UDP/TCP/UART)...\n");
 
