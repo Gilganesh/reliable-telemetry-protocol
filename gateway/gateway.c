@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <glob.h>
+#include <poll.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1475,6 +1477,18 @@ void poll_uart(void) {
         UartPort *p = &g_uart_ports[pi];
         if (p->fd < 0) continue;
 
+        // Після вимкнення USB-перехідника Linux "кладе слухавку" (hangup) на відкритий порт:
+        // read() тоді повертає 0, так само як при відсутності даних, і помилки не видно.
+        // Без цієї перевірки мертвий порт лишається відкритим, займає слот (їх лише
+        // MAX_UART_PORTS), а нова назва після replug (ttyUSB1...) не з'являється в маршрутах.
+        struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
+        struct stat st;
+        if ((poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) ||
+            stat(p->path, &st) != 0) {
+            uart_close_port(p, "порт відключено");
+            continue;
+        }
+
         uint8_t rx[256];
         ssize_t n = read(p->fd, rx, sizeof(rx));
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -1504,7 +1518,9 @@ void poll_uart(void) {
                 }
             }
         }
-        if (!p->responded && !p->warned_silent && now_ms - p->opened_ms > UART_PROBE_WARN_MS) {
+        // now_ms узято до uart_scan() вище, тож для щойно відкритого порту він "старіший" за opened_ms
+        if (!p->responded && !p->warned_silent && now_ms > p->opened_ms &&
+            now_ms - p->opened_ms > UART_PROBE_WARN_MS) {
             p->warned_silent = true;
             log_event("[UART] %s: немає відповіді на пінги %d с -- схоже, не наша плата (порт лишається відкритим)\n",
                       p->path, UART_PROBE_WARN_MS / 1000);

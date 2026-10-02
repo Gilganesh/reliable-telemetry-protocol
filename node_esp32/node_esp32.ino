@@ -72,7 +72,7 @@ bool id_confirmed = false;          // шлюз підтвердив id у ці�
 //   (логи гасяться). Для налагодження поставте 0 і підключіть кабель до ПК.
 // LINK_VIA_USB_CABLE 0: окремий UART2 на пінах GPIO16/17 (через USB-TTL
 //   перехідник до Pi); Serial лишається вільним для логів і команд.
-#define LINK_VIA_USB_CABLE 0
+#define LINK_VIA_USB_CABLE 1
 #define UART_RX_PIN 3              // лише для режиму 0
 #define UART_TX_PIN 1              // лише для режиму 0
 #define UART_BAUD   115200          // має збігатися з UART_BAUD у gateway.c
