@@ -48,6 +48,7 @@
 extern "C" {
   #include "protocol.h"     /* SensorPacket, protocol_pack/unpack */
   #include "reliability.h"  /* ACK/retry для MSG_ALARM */
+  #include "packet_queue.h" /* кільцева черга: буфер телеметрії і черга ALARM */
 }
 
 // node_id призначає шлюз (0 = ще не призначено). Зберігається в NVS.
@@ -93,6 +94,10 @@ bool id_confirmed = false;          // шлюз підтвердив id у ці�
 #define WIRE_TIMEOUT_MS   3000      // стільки без кадрів від шлюзу = дріт мертвий
 #define UDP_LOCAL_PORT    12345     // з нього плата і шле UDP, і слухає ACK
 #define BUFFER_CAPACITY   50
+#define FLUSH_INTERVAL_MS 50        // пауза між пакетами при вивантаженні буфера
+#define FLUSH_RETRY_PAUSE_MS 1000   // пауза після невдалої відправки з буфера (щоб не спамити)
+#define ALARM_QUEUE_CAP   8         // критичні повідомлення, що чекають на канал
+#define ALARM_RETRY_COOLDOWN_MS 5000 // пауза після "retry вичерпано", перш ніж пробувати знову
 #define TCP_KEEPALIVE_MS  5000      // щоб шлюз не закрив "тихе" резервне TCP
 
 // ---- Налаштування, що приходять від шлюзу (зберігаються в NVS) ----
@@ -114,8 +119,19 @@ unsigned long last_wire_rx = 0;     // millis() останнього валід�
 
 MPU9250 mpu;
 uint32_t seq_counter = 0;           // наскрізний sequence для TELEMETRY і ALARM
-SensorPacket buffer[BUFFER_CAPACITY];
-int buffer_count = 0;
+// Буфер телеметрії (store-and-forward): при переповненні відкидається найстаріше.
+SensorPacket buffer_storage[BUFFER_CAPACITY];
+PacketQueue tele_q = { buffer_storage, BUFFER_CAPACITY, 0, 0, 0 };
+// Черга ALARM: критичне ніколи не відкидаємо заради телеметрії, лишається в черзі,
+// доки reliable_* не отримає ACK.
+SensorPacket alarm_storage[ALARM_QUEUE_CAP];
+PacketQueue alarm_q = { alarm_storage, ALARM_QUEUE_CAP, 0, 0, 0 };
+SensorPacket alarm_inflight;        // копія пакета, що зараз іде через ACK/retry
+bool alarm_inflight_valid = false;
+unsigned long alarm_retry_after = 0;
+// Керування з веба: симуляція втрат на виході плати і віддалений ALARM
+uint8_t sim_loss_percent = 0;       // 0..100, команда simulate_loss
+bool remote_alarm_active = false;   // команда alarm з веба (MSG_ALARM від шлюзу)
 bool imu_ok = false;
 ReliableCtx reliable;
 String serial_cmd_buffer = "";
@@ -205,6 +221,14 @@ bool udp_send(const uint8_t *buf, int len) {
 // Єдине місце, де транспорт торкається протокольного коду. Обирає
 // найкращий доступний канал; якщо TCP-запис не вдався -- пробує UDP.
 bool node_send(const uint8_t *buf, int len) {
+  // Симуляція поганого каналу (веб -> simulate_loss): частину пакетів "губимо"
+  // на виході, для решти коду вони виглядають відправленими.
+  if (sim_loss_percent > 0 && random(100) < sim_loss_percent) {
+    DBG.print("[LOSS-SIM] пакет НЕ відправлено (симуляція ");
+    DBG.print(sim_loss_percent);
+    DBG.println("% втрат)");
+    return true;
+  }
   switch (active_channel()) {
     case CH_UART:
       GatewaySerial.write(buf, len);
@@ -270,6 +294,14 @@ bool json_get_string(const char *js, const char *key, char *out, size_t n) {
   }
   out[o] = '\0';
   return *v == '"';
+}
+
+bool json_get_bool(const char *js, const char *key, bool *out) {
+  const char *v;
+  if (!json_find_value(js, key, &v)) return false;
+  if (strncmp(v, "true", 4) == 0)  { *out = true;  return true; }
+  if (strncmp(v, "false", 5) == 0) { *out = false; return true; }
+  return false;
 }
 
 bool json_get_int(const char *js, const char *key, long *out) {
@@ -412,11 +444,39 @@ void handle_config_packet(const SensorPacket *pkt) {
     json_get_int(js, "tcp", &t);
     apply_gw_config(ip, u, t);
     send_ack_to_gateway(pkt->sequence);
+  } else if (strcmp(cmd, "simulate_loss") == 0) {
+    long pct = 0;
+    json_get_int(js, "loss_percent", &pct);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    send_ack_to_gateway(pkt->sequence); // ACK ДО увімкнення втрат, інакше він сам міг би загубитись
+    sim_loss_percent = (uint8_t)pct;
+    DBG.print("[CONFIG] Симуляція втрат на виході: ");
+    DBG.print(pct);
+    DBG.println("%");
   } else {
-    // servo / simulate_loss з веб-інтерфейсу: на платі ще не реалізовано
     DBG.print("[CONFIG] Невідома команда: ");
     DBG.println(cmd);
   }
+}
+
+// ALARM з веб-інтерфейсу: {"cmd":"alarm","active":true|false}. Плата підтверджує
+// командою ACK, запам'ятовує стан і вмикає/вимикає вбудований світлодіод.
+void handle_remote_alarm(const SensorPacket *pkt) {
+  char js[MAX_PAYLOAD_SIZE + 1];
+  memcpy(js, pkt->payload, pkt->payload_len);
+  js[pkt->payload_len] = '\0';
+
+  bool active = true;
+  json_get_bool(js, "active", &active);
+  send_ack_to_gateway(pkt->sequence);
+  remote_alarm_active = active;
+#ifdef LED_BUILTIN
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, active ? HIGH : LOW);
+#endif
+  DBG.print("[ALARM] Команда з веба: ");
+  DBG.println(active ? "УВІМКНЕНО" : "вимкнено");
 }
 
 // ================== ПРИЙОМ ВІД ШЛЮЗУ ==================
@@ -438,6 +498,8 @@ void handle_downlink_bytes(const uint8_t *raw, size_t len, bool from_wire) {
     reliable_on_ack_received(&reliable, pkt.sequence);
   } else if (pkt.msg_type == MSG_CONFIG) {
     handle_config_packet(&pkt);
+  } else if (pkt.msg_type == MSG_ALARM) {
+    handle_remote_alarm(&pkt); // ALARM від шлюзу = команда з веба
   }
   // MSG_HEARTBEAT від шлюзу ("пінг" дроту) -- потрібен лише заради last_wire_rx
 }
@@ -469,46 +531,88 @@ void poll_downlink() {
 
 // ================== БУФЕР STORE-AND-FORWARD ==================
 void buffer_packet(const SensorPacket* pkt) {
-  if (buffer_count < BUFFER_CAPACITY) {
-    buffer[buffer_count++] = *pkt;
-  } else {
-    for (int i = 1; i < BUFFER_CAPACITY; i++) buffer[i - 1] = buffer[i];
-    buffer[BUFFER_CAPACITY - 1] = *pkt;
+  if (pq_push(&tele_q, pkt)) {
+    DBG.print("[BUFFER] Переповнення -- втрачено найстаріший пакет. Всього втрачено: ");
+    DBG.println(tele_q.dropped);
   }
-  DBG.print("[BUFFER] Немає каналу -- пакет збережено локально. У буфері: ");
-  DBG.println(buffer_count);
+  DBG.print("[BUFFER] Пакет збережено локально. У буфері: ");
+  DBG.println(tele_q.count);
 }
 
-void flush_buffer() {
-  if (buffer_count == 0) return;
-  DBG.print("[BUFFER] Канал є (");
-  DBG.print(channel_name(active_channel()));
-  DBG.print("). Вивантажую накопичені пакети: ");
-  DBG.println(buffer_count);
+// Неблокуючий flush: за один виклик відправляє один пакет з голови буфера.
+// Викликається з loop() не частіше за FLUSH_INTERVAL_MS.
+void flush_buffer_step() {
+  static bool flushing = false;
+  static unsigned long pause_until = 0; // після збою відправки чекаємо, а не б'ємо в канал кожні 50 мс
+  SensorPacket *head = pq_peek(&tele_q);
+  if (!head) return;
+  if (pause_until != 0 && (long)(millis() - pause_until) < 0) return;
+  if (!flushing) {
+    DBG.print("[BUFFER] Канал є (");
+    DBG.print(channel_name(active_channel()));
+    DBG.print("). Вивантажую накопичені пакети: ");
+    DBG.println(tele_q.count);
+    flushing = true;
+  }
 
-  int sent = 0;
-  for (int i = 0; i < buffer_count; i++) {
-    uint8_t tx_buf[256];
-    int packed_len = protocol_pack(&buffer[i], tx_buf, sizeof(tx_buf));
-    if (packed_len > 0) {
-      if (node_send(tx_buf, packed_len)) {
-        sent++;
-        delay(50); // пауза між пакетами для стабільності приймача
-      } else {
-        DBG.println("[BUFFER] Помилка відправки, перериваю вивантаження.");
-        break;
-      }
+  // Шлюз міг перепризначити node_id, поки пакет лежав у буфері. Sequence і
+  // timestamp лишаються з моменту створення -- їх не чіпаємо.
+  if (MY_NODE_ID != 0) head->node_id = MY_NODE_ID;
+
+  uint8_t tx_buf[256];
+  int packed_len = protocol_pack(head, tx_buf, sizeof(tx_buf));
+  if (packed_len <= 0 || node_send(tx_buf, packed_len)) {
+    // packed_len <= 0 -- пакет не пакується взагалі, повторювати немає сенсу
+    pq_pop(&tele_q, NULL);
+    pause_until = 0;
+    if (pq_empty(&tele_q)) {
+      DBG.println("[BUFFER] Вивантаження завершено.");
+      flushing = false;
     }
-  }
-  if (sent < buffer_count) {
-    int remaining = buffer_count - sent;
-    for (int i = 0; i < remaining; i++) buffer[i] = buffer[sent + i];
-    buffer_count = remaining;
   } else {
-    buffer_count = 0;
+    DBG.println("[BUFFER] Помилка відправки, повторю за секунду.");
+    flushing = false;
+    pause_until = millis() + FLUSH_RETRY_PAUSE_MS;
+    if (pause_until == 0) pause_until = 1;
   }
-  DBG.print("[BUFFER] Вивантаження завершено. Залишок: ");
-  DBG.println(buffer_count);
+}
+
+// ================== ЧЕРГА ALARM ==================
+void alarm_enqueue(const SensorPacket* pkt) {
+  if (pq_push(&alarm_q, pkt)) {
+    DBG.print("[ALARM] Черга повна -- втрачено найстаріший ALARM. Всього втрачено: ");
+    DBG.println(alarm_q.dropped);
+  }
+}
+
+// Повертає ALARM, що не вдалося доставити, на початок черги (зі збереженням порядку).
+void alarm_requeue_front(const SensorPacket* pkt) {
+  if (pq_push_front(&alarm_q, pkt)) {
+    DBG.print("[ALARM] Черга повна -- втрачено найновіший ALARM. Всього втрачено: ");
+    DBG.println(alarm_q.dropped);
+  }
+}
+
+// Бере наступний ALARM з черги й запускає ACK/retry, коли є канал і reliable вільний.
+void alarm_pump() {
+  // pending_success: ACK уже прийшов, але reliable_tick() ще не видав SUCCESS -- новий старт його б затер
+  if (pq_empty(&alarm_q) || reliable_is_busy(&reliable) || reliable.pending_success || !transport_ready()) return;
+  if (alarm_retry_after != 0 && (long)(millis() - alarm_retry_after) < 0) return;
+
+  SensorPacket pkt = *pq_peek(&alarm_q);
+  if (MY_NODE_ID != 0) pkt.node_id = MY_NODE_ID; // id міг змінитись, поки ALARM чекав у черзі
+  pq_pop(&alarm_q, NULL);
+  if (!reliable_send_critical(&reliable, &pkt, millis())) {
+    DBG.println("[ALARM] Не вдалося запакувати ALARM з черги, пропускаю.");
+    return;
+  }
+  alarm_inflight = pkt;
+  alarm_inflight_valid = true;
+  alarm_retry_after = 0;
+  DBG.print("[ALARM] Відправка sequence=");
+  DBG.print(pkt.sequence);
+  DBG.print(", ще в черзі: ");
+  DBG.println(alarm_q.count);
 }
 
 // ================== ТЕЛЕМЕТРІЯ І ALARM ==================
@@ -520,12 +624,15 @@ void send_telemetry() {
   pkt.sequence = seq_counter++;
   pkt.timestamp_ms = millis();
 
+  // backlog/dropped -- стан буфера на момент створення пакета (для дашборда: скільки
+  // даних чекає на канал і скільки вже втрачено через переповнення).
   snprintf((char*)pkt.payload, MAX_PAYLOAD_SIZE,
-           "{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f}",
-           mpu.getRoll(), mpu.getPitch(), mpu.getYaw());
+           "{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,\"backlog\":%d,\"dropped\":%lu}",
+           mpu.getRoll(), mpu.getPitch(), mpu.getYaw(), tele_q.count, (unsigned long)tele_q.dropped);
   pkt.payload_len = strlen((char*)pkt.payload);
 
-  if (!transport_ready()) {
+  // Поки є непорожній буфер, нова телеметрія йде в його кінець (порядок на шлюзі)
+  if (!transport_ready() || !pq_empty(&tele_q)) {
     buffer_packet(&pkt);
     return;
   }
@@ -553,15 +660,6 @@ void send_alarm() {
     DBG.println("[ALARM] node_id ще не призначено шлюзом.");
     return;
   }
-  if (!transport_ready()) {
-    DBG.println("[ALARM] Немає каналу -- ALARM не відправлено.");
-    return;
-  }
-  if (reliable_is_busy(&reliable)) {
-    DBG.println("[ALARM] Попередня критична відправка ще активна, зачекай.");
-    return;
-  }
-
   SensorPacket pkt = {0};
   pkt.version = PROTOCOL_VERSION;
   pkt.msg_type = MSG_ALARM;
@@ -573,9 +671,13 @@ void send_alarm() {
   pkt.payload_len = strlen(json);
   memcpy(pkt.payload, json, pkt.payload_len);
 
-  DBG.print("[ALARM] Ініціюю надійну відправку sequence=");
-  DBG.println(pkt.sequence);
-  reliable_send_critical(&reliable, &pkt, millis());
+  DBG.print("[ALARM] ALARM sequence=");
+  DBG.print(pkt.sequence);
+  DBG.println(transport_ready() && !reliable_is_busy(&reliable)
+                  ? " -- відправляю"
+                  : " -- поставлено в чергу (немає каналу або зайнято)");
+  alarm_enqueue(&pkt);
+  alarm_pump();
 }
 
 void print_status() {
@@ -593,7 +695,18 @@ void print_status() {
   DBG.print(" | TCP=");
   DBG.print(tcp_client.connected() ? "так" : "ні");
   DBG.print(" | буфер=");
-  DBG.println(buffer_count);
+  DBG.print(tele_q.count);
+  DBG.print(" (втрачено ");
+  DBG.print(tele_q.dropped);
+  DBG.print(") | веб-ALARM=");
+  DBG.print(remote_alarm_active ? "так" : "ні");
+  DBG.print(" | втрати(симуляція)=");
+  DBG.print(sim_loss_percent);
+  DBG.print("% | ALARM у черзі=");
+  DBG.print(alarm_q.count + (alarm_inflight_valid ? 1 : 0));
+  DBG.print(" (втрачено ");
+  DBG.print(alarm_q.dropped);
+  DBG.println(")");
 }
 
 // Команди з Serial Monitor: "alarm" -- критична подія з ACK/retry,
@@ -750,18 +863,27 @@ void loop() {
     DBG.print(reliable.sequence);
     DBG.print(" ДОСТАВЛЕНО, спроб=");
     DBG.println(reliable.attempts);
+    alarm_inflight_valid = false;
   } else if (rst == RELIABLE_EXHAUSTED) {
     DBG.print("[ALARM] seq=");
     DBG.print(reliable.sequence);
     DBG.print(": RETRY ВИЧЕРПАНО, НЕ доставлено, спроб=");
-    DBG.println(reliable.attempts);
+    DBG.print(reliable.attempts);
+    DBG.println(" -- повертаю в чергу, повторю пізніше");
+    if (alarm_inflight_valid) {
+      alarm_requeue_front(&alarm_inflight);
+      alarm_inflight_valid = false;
+    }
+    alarm_retry_after = millis() + ALARM_RETRY_COOLDOWN_MS;
+    if (alarm_retry_after == 0) alarm_retry_after = 1;
   }
+  alarm_pump();
 
-  // Щойно з'явився будь-який канал -- вивантажуємо накопичене (раз на секунду)
-  static unsigned long last_flush_check = 0;
-  if (buffer_count > 0 && transport_ready() && millis() - last_flush_check > 1000) {
-    last_flush_check = millis();
-    flush_buffer();
+  // Щойно з'явився канал -- вивантажуємо накопичене по пакету за прохід loop()
+  static unsigned long last_flush_step = 0;
+  if (!pq_empty(&tele_q) && transport_ready() && millis() - last_flush_step >= FLUSH_INTERVAL_MS) {
+    last_flush_step = millis();
+    flush_buffer_step();
   }
 
   // Поки шлюз не підтвердив id, просимо його (раз на 2 с, коли є канал)
