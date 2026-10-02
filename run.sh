@@ -29,19 +29,11 @@ if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mosquitto
   sudo systemctl stop mosquitto
 fi
 
-start() {
-  local name="$1"; shift
-  "$@" >"$LOGS/$name.log" 2>&1 &
-  PIDS+=("$!")
-  echo "  started $name (pid $!, log: logs/$name.log)"
-}
-
 echo "Starting services..."
-start mosquitto mosquitto -c "$ROOT/mosquitto_open.conf"
-sleep 1
-(cd "$ROOT/gateway" && exec ./gateway) >"$LOGS/gateway.log" 2>&1 &
+mosquitto -c "$ROOT/mosquitto_open.conf" >"$LOGS/mosquitto.log" 2>&1 &
 PIDS+=("$!")
-echo "  started gateway (pid $!, log: logs/gateway.log)"
+echo "  started mosquitto (pid $!, log: logs/mosquitto.log)"
+sleep 1
 (cd "$ROOT/web" && WEB_HOST=0.0.0.0 WEB_PORT="$PORT" exec "$ROOT/.venv/bin/python" app.py 127.0.0.1) >"$LOGS/web.log" 2>&1 &
 PIDS+=("$!")
 echo "  started web (pid $!, log: logs/web.log)"
@@ -62,10 +54,14 @@ echo "  http://localhost:$PORT"
 [ -n "$IP" ] && echo "  http://$IP:$PORT"
 echo "  http://$(hostname -s).local:$PORT"
 echo
-echo "Press Ctrl+C to stop everything. Gateway output: tail -f logs/gateway.log"
+echo "Gateway output follows (events are also saved to gateway/gateway_log.txt). Press Ctrl+C to stop everything."
+echo
 
 if [ "${1:-}" = "--open" ]; then
   (xdg-open "http://localhost:$PORT" || open "http://localhost:$PORT") >/dev/null 2>&1 &
 fi
+
+(cd "$ROOT/gateway" && exec ./gateway) &
+PIDS+=("$!")
 
 wait
