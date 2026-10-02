@@ -68,6 +68,9 @@ void sensor_update();
 // вигадане значення). Дописувати backlog/dropped не треба -- це робить ядро.
 bool sensor_payload(char *buf, size_t n);
 
+// Критична подія вузла з ACK/retry (оголошено тут, бо handle_config_packet викликає її раніше, ніж вона визначена).
+void send_alarm();
+
 // node_id призначає шлюз (0 = ще не призначено). Зберігається в NVS.
 uint16_t MY_NODE_ID = 0;
 char device_mac[18] = "";           // унікальна ідентичність плати (eFuse MAC)
@@ -500,6 +503,11 @@ void handle_config_packet(const SensorPacket *pkt) {
     json_get_int(js, "tcp", &t);
     apply_gw_config(ip, u, t);
     send_ack_to_gateway(pkt->sequence);
+  } else if (strcmp(cmd, "fire_alarm") == 0) {
+    // Запуск справжнього ALARM вузол -> шлюз (з ACK/retry) командою з веба. Потрібен для демо
+    // критерію №2: у режимі USB-кабелю Serial зайнятий каналом, тож консольна команда alarm недоступна.
+    send_ack_to_gateway(pkt->sequence); // ACK самої команди; ALARM піде окремим пакетом зі своїм sequence
+    send_alarm();
   } else if (strcmp(cmd, "ping") == 0) {
     // Вимірювання затримки: шлюз міряє час від свого ping до цього ACK
     send_ack_to_gateway(pkt->sequence);

@@ -334,6 +334,231 @@ void route_reply(const ReplyRoute *route, const uint8_t *data, int len) {
     }
 }
 
+// ==== Імпеймент-шар: керовані перешкоди каналу ====
+// Кейс просить "Impairment Simulator" між вузлом і шлюзом (loss, delay, jitter, duplication,
+// розрив). Робимо його ВСЕРЕДИНІ шлюзу, в єдиних точках входу/виходу кадрів: так він
+// однаково діє на UART, TCP, UDP і MQTT, а зовнішній проксі покрив би лише Wi-Fi (UART-вузли
+// ходять дротом). Керується з веба через CONTROL_TOPIC, відтворюється через seed.
+//   вхід  (вузол -> шлюз): handle_packet() -- втрати, дублі, биті байти, затримка, розрив;
+//   вихід (шлюз -> вузол): downlink_send()  -- втрати (ACK/команди), затримка, розрив.
+// Службовий "пінг дроту" по UART (uart_tick) перешкодам не підлягає, крім розриву для всіх
+// вузлів: інакше плата на дроті ніколи б не побачила розриву й не пішла б у буфер.
+#define CONTROL_TOPIC "case24/gateway/control"
+#define IMP_QUEUE 64 // скільки кадрів може одночасно чекати своєї затримки (решта йде без неї)
+
+typedef struct {
+    char     profile[24]; // назва активного профілю (для відображення)
+    int      loss;        // % втрат, окремо для кожного напрямку
+    int      dup;         // % дублювання вхідних пакетів
+    int      corrupt;     // % вхідних пакетів із зіпсованим байтом (має відсіюватись за CRC)
+    int      delay_ms;    // базова затримка кожного кадру
+    int      jitter_ms;   // + випадково 0..jitter_ms; через нього кадри міняються місцями (reorder)
+    uint16_t node;        // до якого вузла застосовувати (0 = до всіх)
+    uint64_t blackout_until_ms; // до цього моменту каналу "немає" взагалі (повний розрив)
+    uint32_t rng;         // стан xorshift32: той самий seed -> та сама послідовність втрат
+    // лічильники для веба (скидаються при зміні профілю, щоб кожен тест рахувався з нуля)
+    uint32_t dropped_up, dropped_down, duplicated, n_corrupted, delayed;
+} Impair;
+static Impair g_imp = { .profile = "good", .rng = 1 };
+
+typedef struct {
+    bool        used;
+    bool        up;       // true: вхідний (вузол->шлюз), false: вихідний
+    uint64_t    due_ms;   // коли віддати далі
+    uint8_t     buf[FRAME_MAX_SIZE];
+    int         len;
+    ReplyRoute  route;
+    uint16_t    node_id;
+} ImpItem;
+static ImpItem g_imp_q[IMP_QUEUE];
+
+void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *route);
+static bool tcp_fd_active(int fd);
+
+// xorshift32: власний генератор замість rand(), щоб seed робив прогін відтворюваним
+static uint32_t imp_rand(void) {
+    uint32_t x = g_imp.rng ? g_imp.rng : 1;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    g_imp.rng = x;
+    return x;
+}
+static bool imp_chance(int pct) { return pct > 0 && (int)(imp_rand() % 100) < pct; }
+static bool imp_blackout(uint64_t now) { return now < g_imp.blackout_until_ms; }
+static bool imp_enabled(uint64_t now) {
+    return g_imp.loss || g_imp.dup || g_imp.corrupt || g_imp.delay_ms || g_imp.jitter_ms || imp_blackout(now);
+}
+// Перешкоди діють лише на обраний вузол; кадри без id (HELLO, node_id=0) -- лише коли обрано "всі"
+static bool imp_applies(uint16_t node_id) { return g_imp.node == 0 || g_imp.node == node_id; }
+static bool imp_blackout_all(uint64_t now) { return imp_blackout(now) && g_imp.node == 0; }
+static uint64_t imp_delay(void) {
+    return (uint64_t)g_imp.delay_ms + (g_imp.jitter_ms > 0 ? imp_rand() % (uint32_t)(g_imp.jitter_ms + 1) : 0);
+}
+
+// Кладе кадр у чергу затримки. false -- черга повна: тоді викликач віддає кадр без затримки.
+static bool imp_enqueue(bool up, const ReplyRoute *route, uint16_t node_id, const uint8_t *data, int len, uint64_t due) {
+    if (len <= 0 || len > (int)sizeof(g_imp_q[0].buf)) return false;
+    for (int i = 0; i < IMP_QUEUE; i++) {
+        if (g_imp_q[i].used) continue;
+        g_imp_q[i].used = true;
+        g_imp_q[i].up = up;
+        g_imp_q[i].due_ms = due;
+        g_imp_q[i].len = len;
+        g_imp_q[i].route = *route;
+        g_imp_q[i].node_id = node_id;
+        memcpy(g_imp_q[i].buf, data, (size_t)len);
+        return true;
+    }
+    return false;
+}
+
+// Справжня відправка вихідного кадру (після перешкод).
+static void downlink_emit(const ReplyRoute *route, uint16_t node_id, const uint8_t *data, int len) {
+    if (route->kind == ROUTE_MQTT) {
+        // MQTT-вузол слухає свій downlink-топік (потрібен node_id != 0)
+        char topic[64];
+        snprintf(topic, sizeof(topic), DOWNLINK_PREFIX "%u", node_id);
+        mosquitto_publish(mosq_global, NULL, topic, len, data, 0, false);
+    } else {
+        route_reply(route, data, len);
+    }
+}
+
+// ЄДИНА точка виходу кадрів шлюз -> вузол (ACK, команди, відповіді на HELLO, пінги).
+static void downlink_send(const ReplyRoute *route, uint16_t node_id, const uint8_t *data, int len) {
+    uint64_t now = get_monotonic_time_ms();
+    if (imp_enabled(now) && imp_applies(node_id)) {
+        if (imp_blackout(now) || imp_chance(g_imp.loss)) { g_imp.dropped_down++; return; }
+        uint64_t d = imp_delay();
+        if (d > 0 && imp_enqueue(false, route, node_id, data, len, now + d)) { g_imp.delayed++; return; }
+    }
+    downlink_emit(route, node_id, data, len);
+}
+
+// ЄДИНА точка входу кадрів вузол -> шлюз (MQTT, UDP, TCP, UART). Далі -- справжня обробка.
+void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) {
+    uint64_t now = get_monotonic_time_ms();
+    uint16_t nid = 0;
+    // node_id лежить у заголовку зі зміщенням 2 (версія, тип, потім node_id)
+    if (raw_len >= HEADER_SIZE) memcpy(&nid, raw + 2, 2);
+    if (raw_len < HEADER_SIZE || raw_len > FRAME_MAX_SIZE || !imp_enabled(now) || !imp_applies(nid)) {
+        handle_packet_now(raw, raw_len, route);
+        return;
+    }
+    if (imp_blackout(now) || imp_chance(g_imp.loss)) { g_imp.dropped_up++; return; }
+
+    uint8_t copy[FRAME_MAX_SIZE];
+    memcpy(copy, raw, raw_len);
+    if (imp_chance(g_imp.corrupt)) {
+        // Псуємо випадковий байт: CRC32 не збіжиться, шлюз має відхилити й записати в журнал
+        copy[imp_rand() % raw_len] ^= (uint8_t)(1 + imp_rand() % 255);
+        g_imp.n_corrupted++;
+    }
+    int copies = 1;
+    if (imp_chance(g_imp.dup)) { copies = 2; g_imp.duplicated++; }
+    for (int c = 0; c < copies; c++) {
+        // кожна копія має власний jitter, тож дубль може прийти і після наступних пакетів
+        uint64_t d = imp_delay();
+        if (d > 0 && imp_enqueue(true, route, nid, copy, (int)raw_len, now + d)) g_imp.delayed++;
+        else handle_packet_now(copy, raw_len, route);
+    }
+}
+
+// Віддає далі кадри, у яких вийшла затримка. З головного циклу.
+static void impair_tick(uint64_t now) {
+    for (int i = 0; i < IMP_QUEUE; i++) {
+        if (!g_imp_q[i].used || g_imp_q[i].due_ms > now) continue;
+        ImpItem it = g_imp_q[i];
+        g_imp_q[i].used = false; // звільняємо ДО обробки: вона може сама покласти в чергу вихідний кадр
+        // за час затримки дріт міг відключитись, а TCP-клієнт піти -- fd більше не наш
+        if (it.route.kind == ROUTE_TCP && !tcp_fd_active(it.route.fd)) continue;
+        if (it.route.kind == ROUTE_UART && !uart_port_by_fd(it.route.fd)) continue;
+        if (it.up) handle_packet_now(it.buf, (size_t)it.len, &it.route);
+        else downlink_emit(&it.route, it.node_id, it.buf, it.len);
+    }
+}
+
+static void impair_reset(void) {
+    uint32_t seed = g_imp.rng ? g_imp.rng : 1;
+    memset(&g_imp, 0, sizeof(g_imp));
+    snprintf(g_imp.profile, sizeof(g_imp.profile), "good");
+    g_imp.rng = seed;
+    memset(g_imp_q, 0, sizeof(g_imp_q)); // кадри, що чекали затримки, скасовуємо
+}
+
+// Готові профілі для демо. false -- невідома назва.
+static bool impair_set_profile(const char *name) {
+    int loss = 0, dup = 0, corrupt = 0, delay = 0, jitter = 0;
+    if (strcmp(name, "good") == 0) {
+    } else if (strcmp(name, "lossy20") == 0) {  // вимога кейса: 20% втрат
+        loss = 20;
+    } else if (strcmp(name, "delay") == 0) {    // повільний канал: RTT має зрости на ~2x затримки
+        delay = 200; jitter = 100;
+    } else if (strcmp(name, "flaky") == 0) {    // усе разом: втрати, дублі, биті, reorder через jitter
+        loss = 10; dup = 10; corrupt = 5; delay = 100; jitter = 300;
+    } else {
+        return false;
+    }
+    uint32_t seed = g_imp.rng;
+    uint16_t node = g_imp.node;
+    impair_reset();
+    g_imp.rng = seed;
+    g_imp.node = node;
+    snprintf(g_imp.profile, sizeof(g_imp.profile), "%s", name);
+    g_imp.loss = loss; g_imp.dup = dup; g_imp.corrupt = corrupt;
+    g_imp.delay_ms = delay; g_imp.jitter_ms = jitter;
+    return true;
+}
+
+static int imp_json_int(cJSON *j, const char *key, int lo, int hi, int *out) {
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(j, key);
+    if (!cJSON_IsNumber(v)) return 0;
+    double d = v->valuedouble;
+    *out = (int)(d < lo ? lo : d > hi ? hi : d);
+    return 1;
+}
+
+// Команда з веба в CONTROL_TOPIC: {"cmd":"impair", "profile":..., "loss":.., "delay_ms":.., "jitter_ms":..,
+//   "dup":.., "corrupt":.., "node":.., "seed":.., "blackout_s":..}. Усі поля необов'язкові:
+// "profile" спершу скидає все, решта полів уточнюють поточний стан, "blackout_s" не чіпає профіль.
+static void handle_control(const char *payload, int len) {
+    char *js = malloc((size_t)len + 1);
+    if (!js) return;
+    memcpy(js, payload, (size_t)len);
+    js[len] = '\0';
+    cJSON *j = cJSON_Parse(js);
+    free(js);
+    cJSON *cmd = cJSON_IsObject(j) ? cJSON_GetObjectItemCaseSensitive(j, "cmd") : NULL;
+    if (!cJSON_IsString(cmd) || strcmp(cmd->valuestring, "impair") != 0) {
+        cJSON_Delete(j);
+        return;
+    }
+    int v;
+    cJSON *seed = cJSON_GetObjectItemCaseSensitive(j, "seed");
+    if (cJSON_IsNumber(seed)) g_imp.rng = (uint32_t)seed->valuedouble ? (uint32_t)seed->valuedouble : 1;
+    if (imp_json_int(j, "node", 0, 65535, &v)) g_imp.node = (uint16_t)v;
+    cJSON *prof = cJSON_GetObjectItemCaseSensitive(j, "profile");
+    if (cJSON_IsString(prof) && !impair_set_profile(prof->valuestring)) {
+        log_event("[ПЕРЕШКОДИ] Невідомий профіль \"%s\"\n", prof->valuestring);
+        cJSON_Delete(j);
+        return;
+    }
+    bool custom = false;
+    if (imp_json_int(j, "loss", 0, 100, &v))      { g_imp.loss = v; custom = true; }
+    if (imp_json_int(j, "dup", 0, 100, &v))       { g_imp.dup = v; custom = true; }
+    if (imp_json_int(j, "corrupt", 0, 100, &v))   { g_imp.corrupt = v; custom = true; }
+    if (imp_json_int(j, "delay_ms", 0, 5000, &v)) { g_imp.delay_ms = v; custom = true; }
+    if (imp_json_int(j, "jitter_ms", 0, 5000, &v)){ g_imp.jitter_ms = v; custom = true; }
+    if (custom && !cJSON_IsString(prof)) snprintf(g_imp.profile, sizeof(g_imp.profile), "custom");
+    if (imp_json_int(j, "blackout_s", 0, 3600, &v)) {
+        g_imp.blackout_until_ms = v > 0 ? get_monotonic_time_ms() + (uint64_t)v * 1000 : 0;
+        log_event(v > 0 ? "[ПЕРЕШКОДИ] РОЗРИВ каналу на %d с (вузол: %s)\n" : "[ПЕРЕШКОДИ] Розрив скасовано%s\n",
+                   v, g_imp.node ? "обраний" : "усі");
+    }
+    log_event("[ПЕРЕШКОДИ] Профіль=%s втрати=%d%% дублі=%d%% биті=%d%% затримка=%d+0..%d мс вузол=%u\n",
+               g_imp.profile, g_imp.loss, g_imp.dup, g_imp.corrupt, g_imp.delay_ms, g_imp.jitter_ms, g_imp.node);
+    cJSON_Delete(j);
+}
+
 // Формування та відправка ACK -- каналом, яким прийшов оригінальний
 // критичний пакет (route). Для MQTT це, як і раніше, публікація в
 // case24/downlink/<node_id>; для UDP/TCP/UART -- пряма відповідь route_reply().
@@ -351,13 +576,7 @@ void send_ack_via(uint16_t node_id, uint32_t seq, const ReplyRoute *route) {
     int len = protocol_pack(&ack_pkt, tx_buf, sizeof(tx_buf));
     if (len <= 0) return;
 
-    if (route->kind == ROUTE_MQTT) {
-        char topic[64];
-        snprintf(topic, sizeof(topic), "case24/downlink/%u", node_id);
-        mosquitto_publish(mosq_global, NULL, topic, len, tx_buf, 0, false);
-    } else {
-        route_reply(route, tx_buf, len);
-    }
+    downlink_send(route, node_id, tx_buf, len); // через імпеймент-шар: ACK теж може "загубитись"
 }
 
 // ЄДИНА обробка вхідного пакета -- незалежно від того, MQTT це, UDP, TCP
@@ -724,9 +943,11 @@ static void uart_tick(uint64_t now) {
     if (now - last_ping >= UART_PING_MS) {
         last_ping = now;
         uint32_t seq = next_down_seq();
-        // Пінг іде на ВСІ відкриті порти: той, де є наша плата, відповість
-        for (int i = 0; i < MAX_UART_PORTS; i++)
-            uart_write_frame(g_uart_ports[i].fd, MSG_HEARTBEAT, 0, seq, NULL); // node_id 0 = усім
+        // Пінг іде на ВСІ відкриті порти: той, де є наша плата, відповість.
+        // Під час розриву для всіх вузлів пінг мовчить -- інакше плата вважала б дріт живим.
+        if (!imp_blackout_all(now))
+            for (int i = 0; i < MAX_UART_PORTS; i++)
+                uart_write_frame(g_uart_ports[i].fd, MSG_HEARTBEAT, 0, seq, NULL); // node_id 0 = усім
     }
 
     provision_refresh(now);
@@ -826,14 +1047,7 @@ static void send_frame_route(const ReplyRoute *route, uint8_t type, uint16_t nod
     uint8_t tx[256];
     int len = protocol_pack(&pkt, tx, sizeof(tx));
     if (len <= 0) return;
-    if (route->kind == ROUTE_MQTT) {
-        // MQTT-вузол слухає свій downlink-топік (потрібен node_id != 0)
-        char topic[64];
-        snprintf(topic, sizeof(topic), DOWNLINK_PREFIX "%u", node_id);
-        mosquitto_publish(mosq_global, NULL, topic, len, tx, 0, false);
-    } else {
-        route_reply(route, tx, len);
-    }
+    downlink_send(route, node_id, tx, len);
 }
 
 // Скидає облік sequence/дедуплікації вузла (плата перезапустилась і почала
@@ -940,7 +1154,7 @@ static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, 
 
 static void latency_on_ack(const SensorPacket *ack);
 
-void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) {
+void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) {
     SensorPacket pkt = {0};
 
     // Розпакування та строга перевірка CRC32
@@ -1116,7 +1330,7 @@ void forward_downlink(const struct mosquitto_message *msg) {
                        pkt.node_id, route_kind_name(route.kind));
             return;
         }
-        route_reply(&route, (const uint8_t*)msg->payload, msg->payloadlen);
+        downlink_send(&route, pkt.node_id, (const uint8_t*)msg->payload, msg->payloadlen);
         log_event("[DOWNLINK] Команда з веба (тип %u, Seq %u) -> вузол %u через %s\n",
                    pkt.msg_type, pkt.sequence, pkt.node_id, route_kind_name(route.kind));
         return;
@@ -1143,6 +1357,7 @@ static void on_mqtt_connect(struct mosquitto *mosq, void *userdata, int rc) {
     }
     mosquitto_subscribe(mosq, NULL, "case24/uplink", 0);
     mosquitto_subscribe(mosq, NULL, DOWNLINK_PREFIX "+", 0);
+    mosquitto_subscribe(mosq, NULL, CONTROL_TOPIC, 0);
     g_mqtt_connected = true;
     log_event("[MQTT] Підключено до брокера %s:%d\n", MQTT_HOST, MQTT_PORT);
 }
@@ -1215,6 +1430,10 @@ static void latency_on_ack(const SensorPacket *ack) {
 
 void on_mqtt_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg) {
     (void)mosq; (void)userdata;
+    if (strcmp(msg->topic, CONTROL_TOPIC) == 0) {
+        handle_control((const char*)msg->payload, msg->payloadlen);
+        return;
+    }
     if (strncmp(msg->topic, DOWNLINK_PREFIX, strlen(DOWNLINK_PREFIX)) == 0) {
         forward_downlink(msg);
         return;
@@ -1570,6 +1789,10 @@ void print_dashboard() {
                rtt_s, bl_s, n->max_seq_seen, loss_rate);
     }
     printf("Всього битих пакетів з початку роботи: %u\n", corrupted_count);
+    if (imp_enabled(get_monotonic_time_ms()))
+        printf("Перешкоди: %s | втрати %d%% дублі %d%% биті %d%% затримка %d+%d мс | зіпсовано: вх. втрачено %u, вих. втрачено %u, дублів %u, битих %u\n",
+               g_imp.profile, g_imp.loss, g_imp.dup, g_imp.corrupt, g_imp.delay_ms, g_imp.jitter_ms,
+               g_imp.dropped_up, g_imp.dropped_down, g_imp.duplicated, g_imp.n_corrupted);
     printf("======================================================\n");
 }
 
@@ -1622,6 +1845,24 @@ void publish_gateway_state(void) {
 
     cJSON_AddItemToObject(root, "nodes", nodes_json);
     cJSON_AddNumberToObject(root, "corrupted_count", corrupted_count);
+
+    // Поточні перешкоди каналу: веб показує активний профіль і лічильники того, що вони зіпсували
+    cJSON *imp = cJSON_CreateObject();
+    cJSON_AddStringToObject(imp, "profile", g_imp.profile);
+    cJSON_AddBoolToObject(imp, "active", imp_enabled(now));
+    cJSON_AddNumberToObject(imp, "loss", g_imp.loss);
+    cJSON_AddNumberToObject(imp, "dup", g_imp.dup);
+    cJSON_AddNumberToObject(imp, "corrupt", g_imp.corrupt);
+    cJSON_AddNumberToObject(imp, "delay_ms", g_imp.delay_ms);
+    cJSON_AddNumberToObject(imp, "jitter_ms", g_imp.jitter_ms);
+    cJSON_AddNumberToObject(imp, "node", g_imp.node);
+    cJSON_AddNumberToObject(imp, "blackout_left_s", imp_blackout(now) ? (double)(g_imp.blackout_until_ms - now) / 1000.0 : 0);
+    cJSON_AddNumberToObject(imp, "dropped_up", g_imp.dropped_up);
+    cJSON_AddNumberToObject(imp, "dropped_down", g_imp.dropped_down);
+    cJSON_AddNumberToObject(imp, "duplicated", g_imp.duplicated);
+    cJSON_AddNumberToObject(imp, "corrupted", g_imp.n_corrupted);
+    cJSON_AddNumberToObject(imp, "delayed", g_imp.delayed);
+    cJSON_AddItemToObject(root, "impairment", imp);
 
     char *json_str = cJSON_PrintUnformatted(root);
     if (json_str != NULL) {
@@ -1681,6 +1922,7 @@ int main(void) {
         poll_uart();
 
         now = get_monotonic_time_ms();
+        impair_tick(now);
         uart_tick(now);
         ping_tick(now);
         if (now - last_dash_ms >= 2000) {

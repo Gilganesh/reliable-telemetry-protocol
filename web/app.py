@@ -36,6 +36,9 @@ from protocol_codec import MsgType, Packet
 
 STATE_TOPIC = "case24/gateway/state"
 TELEMETRY_TOPIC = "case24/gateway/telemetry"
+# Керування шаром перешкод шлюзу (профілі втрат/затримок/розриву), див. gateway.c, handle_control
+CONTROL_TOPIC = "case24/gateway/control"
+IMPAIR_PROFILES = ("good", "lossy20", "delay", "flaky")
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TELEMETRY_DB", BASE_DIR / "telemetry.db"))
@@ -49,6 +52,7 @@ nodes = {}
 nodes_lock = threading.Lock()
 corrupted_count = 0
 gateway_state_at = 0.0  # wall-clock останнього повідомлення від Gateway
+impairment = {}         # поточні перешкоди каналу з останнього стану Gateway (профіль, лічильники)
 
 mqtt_state = {
     "client": None,
@@ -233,7 +237,7 @@ def get_or_create_node(node_id: int, ip_address: str = "—", name: str = ""):
 
 
 def on_gateway_state(msg):
-    global corrupted_count, gateway_state_at
+    global corrupted_count, gateway_state_at, impairment
     try:
         data = json.loads(msg.payload.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -243,6 +247,8 @@ def on_gateway_state(msg):
     with nodes_lock:
         gateway_state_at = time.time()
         corrupted_count = int(data.get("corrupted_count", corrupted_count) or 0)
+        if isinstance(data.get("impairment"), dict):
+            impairment = data["impairment"]
         for gw in data.get("nodes", []):
             node_id = gw.get("node_id")
             if not isinstance(node_id, int):
@@ -373,6 +379,15 @@ def publish_packet(node_id: int, msg_type: int, payload_dict: dict) -> bool:
     return res.rc == mqtt.MQTT_ERR_SUCCESS
 
 
+def publish_control(cmd: dict) -> bool:
+    """Команда самому шлюзу (не вузлу): JSON у CONTROL_TOPIC."""
+    client = mqtt_state["client"]
+    if client is None or not mqtt_state["connected"]:
+        return False
+    res = client.publish(CONTROL_TOPIC, json.dumps(cmd).encode("utf-8"))
+    return res.rc == mqtt.MQTT_ERR_SUCCESS
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
@@ -400,10 +415,12 @@ def api_state():
             rows.append({**n, "last_seen_s": None if ago is None else round(ago / 1000, 1)})
         gateway_age = round(time.time() - gateway_state_at, 1) if gateway_state_at else None
         corrupted = corrupted_count
+        imp = dict(impairment)
     # якщо Gateway замовк -- його "online" застаріло, дашборд має про це сказати
     return jsonify({
         "nodes": rows,
         "corrupted_count": corrupted,
+        "impairment": imp,
         "gateway_age_s": gateway_age,
         "mqtt_config": {
             "host": mqtt_state["broker_host"],
@@ -486,6 +503,38 @@ def api_simulate_loss(node_id):
         return bad("потрібен loss_percent 0..100")
     return jsonify({"sent": publish_packet(
         node_id, MsgType.CONFIG, {"cmd": "simulate_loss", "loss_percent": percent})})
+
+
+@app.route("/api/impairment", methods=["POST"])
+def api_impairment():
+    """Перешкоди каналу на шлюзі: профіль і/або окремі параметри і/або розрив.
+    Приймаємо лише відомі поля з перевіреними межами -- решту до шлюзу не пускаємо."""
+    data = body()
+    cmd = {"cmd": "impair"}
+    profile = data.get("profile")
+    if profile is not None:
+        if profile not in IMPAIR_PROFILES:
+            return bad("profile має бути одним із: " + ", ".join(IMPAIR_PROFILES))
+        cmd["profile"] = profile
+    limits = {"node": (0, 65535), "blackout_s": (0, 3600), "loss": (0, 100), "dup": (0, 100),
+              "corrupt": (0, 100), "delay_ms": (0, 5000), "jitter_ms": (0, 5000), "seed": (1, 2**31)}
+    for key, (lo, hi) in limits.items():
+        if key not in data:
+            continue
+        val = data[key]
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or not lo <= val <= hi:
+            return bad(f"{key} має бути числом {lo}..{hi}")
+        cmd[key] = int(val)
+    if len(cmd) == 1:
+        return bad("нічого змінювати")
+    return jsonify({"sent": publish_control(cmd)})
+
+
+@app.route("/api/node-alarm/<int:node_id>", methods=["POST"])
+def api_node_alarm(node_id):
+    """Просить ВУЗОЛ згенерувати власний ALARM (з ACK/retry) -- на відміну від /api/alarm,
+    де веб сам шле тривогу вузлу."""
+    return jsonify({"sent": publish_packet(node_id, MsgType.CONFIG, {"cmd": "fire_alarm"}), "node_id": node_id})
 
 
 @app.route("/api/alarm/<int:node_id>", methods=["POST"])
