@@ -4,25 +4,44 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Telemetry Dashboard</title>
+<script>
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("theme"); } catch (e) {}
+  if (t !== "light" && t !== "dark") t = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", t);
+})();
+</script>
 <script src="/static/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #0b1017; --panel: #121b27; --panel2: #1a2636; --line: #25344a;
     --text: #e6edf7; --muted: #8496b0; --accent: #4f9cff; --accent2: #2dd4bf;
     --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+    --glow: #14233a; --header-bg: rgba(11,16,23,.85);
+    --banner-bad: #fecaca; --banner-warn: #fde68a; --grid: rgba(37,52,74,.5);
     --radius: 14px;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f3f6fb; --panel: #ffffff; --panel2: #eef2f8; --line: #d6deea;
+    --text: #172033; --muted: #5b6b85; --accent: #2563eb; --accent2: #0d9488;
+    --ok: #059669; --warn: #b45309; --bad: #dc2626;
+    --glow: #dbe7fb; --header-bg: rgba(243,246,251,.88);
+    --banner-bad: #991b1b; --banner-warn: #92400e; --grid: rgba(120,138,168,.25);
+    color-scheme: light;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
   body {
-    background: radial-gradient(1200px 600px at 10% -10%, #14233a 0%, var(--bg) 60%) fixed;
+    background: radial-gradient(1200px 600px at 10% -10%, var(--glow) 0%, var(--bg) 60%) fixed;
     color: var(--text); min-height: 100vh;
     font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
   }
   button, input, select { font: inherit; color: inherit; }
   header {
     position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 16px;
-    padding: 12px 24px; background: rgba(11,16,23,.85); backdrop-filter: blur(10px);
+    padding: 12px 24px; background: var(--header-bg); backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--line);
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 700; letter-spacing: .2px; }
@@ -43,7 +62,7 @@
     padding: 6px 12px; cursor: pointer; transition: .15s;
   }
   .btn:hover { border-color: var(--accent); }
-  .btn.primary { background: linear-gradient(135deg,#3b82f6,#2563eb); border-color: transparent; font-weight: 600; }
+  .btn.primary { background: linear-gradient(135deg,#3b82f6,#2563eb); border-color: transparent; color: #fff; font-weight: 600; }
   .btn.danger { color: var(--bad); }
   .btn.small { padding: 3px 9px; font-size: 12px; }
   input, select {
@@ -52,9 +71,9 @@
   input:focus, select:focus { outline: none; border-color: var(--accent); }
   .banner {
     padding: 10px 14px; border-radius: 10px; border: 1px solid rgba(248,113,113,.4);
-    background: rgba(248,113,113,.1); color: #fecaca;
+    background: rgba(248,113,113,.1); color: var(--banner-bad);
   }
-  .banner.warn { border-color: rgba(251,191,36,.4); background: rgba(251,191,36,.1); color: #fde68a; }
+  .banner.warn { border-color: rgba(251,191,36,.4); background: rgba(251,191,36,.1); color: var(--banner-warn); }
   .hidden { display: none !important; }
 
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
@@ -112,6 +131,7 @@
   <span class="spacer"></span>
   <span id="gwPill" class="pill"><i class="dot"></i><span>Gateway</span></span>
   <span id="brokerPill" class="pill"><i class="dot"></i><span id="brokerText">MQTT</span></span>
+  <button class="btn small" id="btnTheme" title="Switch between dark and light theme"></button>
   <button class="btn small" id="btnAddNode">+ Node</button>
   <button class="btn small" id="btnBroker">MQTT</button>
 </header>
@@ -193,7 +213,12 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const esc = s => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; };
-const COLORS = ["#4f9cff", "#2dd4bf", "#fbbf24", "#f87171", "#a78bfa", "#f472b6"];
+const PALETTES = {
+  dark: ["#4f9cff", "#2dd4bf", "#fbbf24", "#f87171", "#a78bfa", "#f472b6"],
+  light: ["#2563eb", "#0d9488", "#d97706", "#dc2626", "#7c3aed", "#db2777"],
+};
+const theme = () => document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const RANGES = { "5 min": 300, "30 min": 1800, "1 h": 3600, "6 h": 21600, "24 h": 86400 };
 
 let state = { nodes: [], mqtt_config: {} };
@@ -339,7 +364,7 @@ function renderCharts() {
   $("charts").innerHTML = charts.map(chartHtml).join("");
   charts.forEach(c => {
     const el = document.querySelector(`.chart[data-id="${c.id}"] canvas`);
-    const color = COLORS[(c.id - 1) % COLORS.length];
+    const palette = PALETTES[theme()], color = palette[(c.id - 1) % palette.length];
     instances[c.id] = new Chart(el, {
       type: "line",
       data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: color + "22", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
@@ -347,8 +372,8 @@ function renderCharts() {
         responsive: true, maintainAspectRatio: false, animation: false,
         plugins: { legend: { display: false } },
         scales: {
-          x: { ticks: { color: "#8496b0", maxTicksLimit: 6, maxRotation: 0, font: { size: 10 } }, grid: { color: "rgba(37,52,74,.5)" } },
-          y: { ticks: { color: "#8496b0", font: { size: 10 } }, grid: { color: "rgba(37,52,74,.5)" } },
+          x: { ticks: { color: cssVar("--muted"), maxTicksLimit: 6, maxRotation: 0, font: { size: 10 } }, grid: { color: cssVar("--grid") } },
+          y: { ticks: { color: cssVar("--muted"), font: { size: 10 } }, grid: { color: cssVar("--grid") } },
         },
       },
     });
@@ -447,6 +472,15 @@ async function slowTick() {
   } catch (e) {}
   refreshEvents();
 }
+function applyTheme(t, persist) {
+  document.documentElement.setAttribute("data-theme", t);
+  $("btnTheme").textContent = t === "light" ? "Dark theme" : "Light theme";
+  if (persist) { try { localStorage.setItem("theme", t); } catch (e) {} }
+  if (Object.keys(instances).length) renderCharts();
+}
+$("btnTheme").onclick = () => applyTheme(theme() === "light" ? "dark" : "light", true);
+applyTheme(theme(), false);
+
 loadCharts();
 tick().then(slowTick);
 setInterval(tick, 1000);
