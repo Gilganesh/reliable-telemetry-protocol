@@ -51,12 +51,44 @@ def next_downlink_seq() -> int:
 _db = None
 _db_lock = threading.Lock()
 
+def _drop_sample_uniqueness():
+    has_table = _db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='samples'"
+    ).fetchone()
+    if not has_table:
+        return
+    unique = [r for r in _db.execute("PRAGMA index_list(samples)") if r[2] and r[3] == "u"]
+    if not unique:
+        return
+    _db.execute("ALTER TABLE samples RENAME TO samples_old")
+    _db.execute(
+        """
+        CREATE TABLE samples (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id     INTEGER NOT NULL,
+            sequence    INTEGER NOT NULL,
+            ts_ms       INTEGER NOT NULL,
+            received_at REAL    NOT NULL,
+            metric      TEXT    NOT NULL,
+            value       REAL    NOT NULL
+        )
+        """
+    )
+    _db.execute(
+        "INSERT INTO samples (node_id, sequence, ts_ms, received_at, metric, value) "
+        "SELECT node_id, sequence, ts_ms, received_at, metric, value FROM samples_old ORDER BY id"
+    )
+    _db.execute("DROP TABLE samples_old")
+    _db.commit()
+
+
 def init_db():
     global _db
     _db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     _db.row_factory = sqlite3.Row
     with _db_lock:
         _db.execute("PRAGMA journal_mode=WAL")
+        _drop_sample_uniqueness()
         _db.execute(
             """
             CREATE TABLE IF NOT EXISTS samples (
@@ -66,8 +98,7 @@ def init_db():
                 ts_ms       INTEGER NOT NULL,
                 received_at REAL    NOT NULL,
                 metric      TEXT    NOT NULL,
-                value       REAL    NOT NULL,
-                UNIQUE (node_id, sequence, ts_ms, metric)
+                value       REAL    NOT NULL
             )
             """
         )
@@ -107,7 +138,7 @@ def store_sample(node_id: int, pkt: Packet, payload: dict):
     now = time.time()
     with _db_lock:
         _db.executemany(
-            "INSERT OR IGNORE INTO samples "
+            "INSERT INTO samples "
             "(node_id, sequence, ts_ms, received_at, metric, value) VALUES (?,?,?,?,?,?)",
             [(node_id, pkt.sequence, pkt.timestamp_ms, now, m, v) for m, v in metrics.items()],
         )
