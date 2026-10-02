@@ -96,8 +96,8 @@ make test       # unit tests, Python codec cross-check, firmware copy check
 
 ### Run the stack
 
-One command starts the broker, the gateway and the dashboard, writes their logs to `logs/` and stops everything on
-Ctrl+C:
+One command starts the broker, the gateway and the dashboard and stops everything on Ctrl+C. The gateway's live
+terminal dashboard and event log stay in the terminal; broker and web logs go to `logs/`:
 
 ```bash
 ./run.sh            # add --open to launch the dashboard in a browser
