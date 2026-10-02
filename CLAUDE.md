@@ -18,9 +18,11 @@
    яку тут не можна зібрати в Arduino IDE).
 
 ## Структура
-- `protocol/` — спільний протокол і ACK/retry (C). Копії в `gateway/protocol/` і `node_esp32/` — тримати ідентичними.
+- `protocol/` — спільний протокол і ACK/retry (C). Копії в `gateway/protocol/`, `node_accelerometer/` і `node_sht41/` — тримати ідентичними (`node_common/sync.sh`, перевірка: `--check`).
 - `gateway/gateway.c` — шлюз (UDP 5005, TCP 5006, UART-автопошук, MQTT `127.0.0.1:1883`, автоналаштування плат).
-- `node_esp32/node_esp32.ino` + `packet_queue.h` — прошивка вузла (буфер, черга ALARM, канали UART>TCP>UDP).
+- `node_common/node_common.h` + `packet_queue.h` — спільне ядро прошивки вузла (буфер, черга ALARM, канали UART>TCP>UDP).
+  Скетчі під датчики: `node_accelerometer/` (MPU9250, roll/pitch/yaw) і `node_sht41/` (temperature/humidity) — лише драйвер
+  датчика (хуки `sensor_setup/update/payload`). Правки ядра — в `node_common/`, потім `node_common/sync.sh`. `node_common/raw_tests/` — налагоджувальні скетчі датчиків.
 - `sim_node/` — симульований вузол (MQTT, node_id 99). `web/` — дашборд (`app.py`, `static/index.html`).
 - `tests/` — unit-тести C.
 

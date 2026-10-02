@@ -1,5 +1,11 @@
 /*
- * node_esp32.ino -- Блок B: вузол з УСІМА каналами зв'язку одночасно.
+ * node_common.h -- Блок B: спільне ядро вузла з УСІМА каналами зв'язку одночасно.
+ *
+ * Це НЕ скетч, а спільна частина двох скетчів: node_accelerometer.ino (MPU9250)
+ * і node_sht41.ino (SHT41). Усе, що не залежить від датчика (канали, буфер,
+ * ALARM з ACK/retry, автоналаштування від шлюзу), живе тут один раз. Скетч
+ * датчика лише реалізує три функції-хуки (див. нижче) і викликає
+ * node_setup()/node_loop() зі своїх setup()/loop().
  *
  * Плата не обирає транспорт при прошивці. Вона тримає одночасно:
  *   UART (дріт до Pi через USB-TTL) -- ОСНОВНИЙ, поки дріт живий;
@@ -24,9 +30,6 @@
  * Втрата/дублікати під час перемикання лишаються видимими в лічильниках
  * шлюзу (sequence наскрізний, один на всі канали).
  *
- * ПОТРІБНА БІБЛІОТЕКА (Arduino IDE -> Tools -> Manage Libraries):
- *   "MPU9250" автора hideakitai.
- *
  * node_id ПЛАТА НЕ ПРОПИСУЄ -- його призначає шлюз за старшинством: хто
  * першим з'явився на шлюзі, той отримує менший id (1, 2, 3...). Плата
  * ідентифікує себе MAC-адресою (HELLO), шлюз повертає id, плата зберігає
@@ -37,19 +40,33 @@
  * SERVO_ENABLED true (бібліотека "ESP32Servo"); на решті команда servo
  * просто підтверджується й логується.
  *
- * Поруч з .ino мають лежати protocol.h/.c і reliability.h/.c.
+ * Поруч зі скетчем мають лежати копії node_common.h, packet_queue.h,
+ * protocol.h/.c і reliability.h/.c (оригінали: node_common/ і protocol/;
+ * розкласти їх по скетчах -- node_common/sync.sh).
  */
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Preferences.h>
-#include <MPU9250.h>
 
 extern "C" {
   #include "protocol.h"     /* SensorPacket, protocol_pack/unpack */
   #include "reliability.h"  /* ACK/retry для MSG_ALARM */
   #include "packet_queue.h" /* кільцева черга: буфер телеметрії і черга ALARM */
 }
+
+// ================== ХУКИ ДАТЧИКА (реалізує скетч) ==================
+// Ініціалізація шини й датчика. Викликається один раз із node_setup() після
+// Serial.begin(), тож DBG уже можна використовувати для логів.
+void sensor_setup();
+// Викликається на КОЖНОМУ проході loop() -- для датчиків, яким потрібне
+// безперервне опитування (фільтр орієнтації MPU9250). Повільним датчикам
+// (SHT41) лишити порожнім і міряти в sensor_payload().
+void sensor_update();
+// Записує в buf (не більше n байт) JSON-об'єкт із метриками, напр. {"temperature":23.4}.
+// Повертає false, якщо вимір не вдався: тоді пакет НЕ шлеться (краще пропуск, ніж
+// вигадане значення). Дописувати backlog/dropped не треба -- це робить ядро.
+bool sensor_payload(char *buf, size_t n);
 
 // node_id призначає шлюз (0 = ще не призначено). Зберігається в NVS.
 uint16_t MY_NODE_ID = 0;
@@ -117,7 +134,6 @@ bool udp_started = false;
 
 unsigned long last_wire_rx = 0;     // millis() останнього валідного кадру по UART
 
-MPU9250 mpu;
 uint32_t seq_counter = 0;           // наскрізний sequence для TELEMETRY і ALARM
 // Буфер телеметрії (store-and-forward): при переповненні відкидається найстаріше.
 SensorPacket buffer_storage[BUFFER_CAPACITY];
@@ -132,7 +148,6 @@ unsigned long alarm_retry_after = 0;
 // Керування з веба: симуляція втрат на виході плати і віддалений ALARM
 uint8_t sim_loss_percent = 0;       // 0..100, команда simulate_loss
 bool remote_alarm_active = false;   // команда alarm з веба (MSG_ALARM від шлюзу)
-bool imu_ok = false;
 ReliableCtx reliable;
 String serial_cmd_buffer = "";
 
@@ -650,13 +665,16 @@ void send_telemetry() {
   pkt.version = PROTOCOL_VERSION;
   pkt.msg_type = MSG_TELEMETRY;
   pkt.node_id = MY_NODE_ID;
-  pkt.sequence = seq_counter++;
   pkt.timestamp_ms = millis();
 
-  snprintf((char*)pkt.payload, MAX_PAYLOAD_SIZE,
-           "{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f}",
-           mpu.getRoll(), mpu.getPitch(), mpu.getYaw());
+  // Спершу вимір: якщо датчик не відповів, sequence не витрачаємо -- інакше шлюз
+  // порахував би дірку в нумерації як втрату пакета, якого ніхто й не слав.
+  if (!sensor_payload((char*)pkt.payload, MAX_PAYLOAD_SIZE)) {
+    DBG.println("[SENSOR] Вимір не вдався -- пакет телеметрії пропущено.");
+    return;
+  }
   pkt.payload_len = strlen((char*)pkt.payload);
+  pkt.sequence = seq_counter++;
 
   // Поки є непорожній буфер, нова телеметрія йде в його кінець (порядок на шлюзі)
   if (!transport_ready() || !pq_empty(&tele_q)) {
@@ -784,16 +802,11 @@ void load_saved_config() {
   gw_configured = gw_ip_str[0] != '\0' && gateway_ip.fromString(gw_ip_str);
 }
 
-void setup() {
+void node_setup() {
   Serial.begin(115200);
-  Wire.begin();
-  Wire.setTimeOut(1000);      // без цього завислий I2C блокує весь loop()
   delay(2000);
 
-  DBG.println("\nІніціалізація IMU MPU9250...");
-  imu_ok = mpu.setup(0x68);
-  DBG.println(imu_ok ? "[OK] IMU успішно підключено."
-                        : "[ПОМИЛКА] IMU не знайдено! Телеметрія піде з нульовими roll/pitch/yaw.");
+  sensor_setup();
 
 #if !LINK_VIA_USB_CABLE
   GatewaySerial.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
@@ -826,7 +839,7 @@ void setup() {
   DBG.println(". Команди в Serial Monitor: alarm, status, forget.");
 }
 
-void loop() {
+void node_loop() {
   // --- Wi-Fi у фоні (неблокуюче) ---
   static bool was_wifi = false;
   bool now_wifi = wifi_up();
@@ -881,7 +894,7 @@ void loop() {
 
   poll_downlink();
 
-  if (imu_ok) mpu.update();
+  sensor_update();
 
   check_serial_commands();
 

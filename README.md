@@ -37,15 +37,17 @@
   фінальна перевірка з реальною бібліотекою — на машині виконавця):**
   `sim_node/sim_node.c` (Блок D, Юрій, Рівень 1, реальний MQTT).
 - **Готово, НЕ перевірено компіляцією (немає ESP32-тулчейну в цьому
-  середовищі):** `node_esp32/node_esp32.ino` (Блок B, Кирило, Рівні
+  середовищі):** `node_accelerometer/`, `node_sht41/` (спільне ядро `node_common/node_common.h`) (Блок B, Кирило, Рівні
   1-3) — перша реальна перевірка на живій платі.
 
 ## Структура
 
 ```
-protocol/          — protocol.h / protocol.c (спільний код, копіюється в node_esp32/gateway/sim_node)
+protocol/          — protocol.h / protocol.c (спільний код, копіюється в node_accelerometer/node_sht41/gateway/sim_node)
 tests/             — юніт-тести на C
-node_esp32/        — Arduino-скетч ESP32-вузла
+node_common/       — спільне ядро вузла (node_common.h, packet_queue.h), sync.sh, raw_tests/
+node_accelerometer/ — Arduino-скетч вузла з MPU9250
+node_sht41/        — Arduino-скетч вузла з SHT41
 gateway/           — C-програма шлюзу (MQTT-підписка, dashboard)
 sim_node/          — симульований (3-й) вузол + тести на биті/loss/duplicate пакети
 docs/              — специфікація, план по блоках, кейс
