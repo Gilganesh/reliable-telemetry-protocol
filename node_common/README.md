@@ -1,4 +1,13 @@
-# node_esp32/
+# node_common/ (колишній node_esp32/)
+
+Прошивка розділена на спільне ядро й два скетчі під датчики:
+- `node_common.h` -- усе, що не залежить від датчика (канали, буфер, ALARM, автоналаштування);
+- `../node_accelerometer/` -- MPU9250 (roll/pitch/yaw), потрібна бібліотека "MPU9250" автора hideakitai;
+- `../node_sht41/` -- SHT41 (temperature/humidity), без додаткових бібліотек.
+Скетч датчика реалізує `sensor_setup()`, `sensor_update()`, `sensor_payload()`.
+Arduino IDE бачить лише файли в папці скетча, тому після змін у `node_common/` чи `../protocol/`
+запускай `node_common/sync.sh` (розкладе копії); `sync.sh --check` перевіряє, що копії ідентичні.
+Нижче -- історичні нотатки: `node_esp32.ino` там = тепер `node_common.h` + скетч датчика.
 
 ## Усі канали одночасно (UART + TCP + UDP), автоналаштування від Pi
 
