@@ -1,82 +1,24 @@
-/*
- * node_common.h -- Блок B: спільне ядро вузла з УСІМА каналами зв'язку одночасно.
- *
- * Це НЕ скетч, а спільна частина двох скетчів: node_accelerometer.ino (MPU9250)
- * і node_sht41.ino (SHT41). Усе, що не залежить від датчика (канали, буфер,
- * ALARM з ACK/retry, автоналаштування від шлюзу), живе тут один раз. Скетч
- * датчика лише реалізує три функції-хуки (див. нижче) і викликає
- * node_setup()/node_loop() зі своїх setup()/loop().
- *
- * Плата не обирає транспорт при прошивці. Вона тримає одночасно:
- *   UART (дріт до Pi через USB-TTL) -- ОСНОВНИЙ, поки дріт живий;
- *   TCP  (Wi-Fi, сирий сокет)       -- резервний №1;
- *   UDP  (Wi-Fi, датаграми)         -- резервний №2.
- * Пріоритет: UART > TCP > UDP. Якщо жодного немає -- пакети йдуть у
- * локальний буфер (store-and-forward) і вивантажуються, щойно канал
- * з'явився.
- *
- * Налаштування Wi-Fi плата НЕ питає в людини. Шлюз на Pi, побачивши плату
- * на UART, сам передає їй двома CONFIG-пакетами:
- *   {"cmd":"wifi","s":"<SSID>","p":"<пароль>"}
- *   {"cmd":"gw","ip":"<IP шлюзу>","udp":5005,"tcp":5006}
- * Плата зберігає їх у енергонезалежній пам'яті (NVS), підтверджує кожен
- * пакет через ACK і далі тримає Wi-Fi у фоні. Після перезапуску плата
- * бере збережені налаштування, тож може працювати по Wi-Fi і без дроту.
- * (Пароль лежить у NVS плати відкритим текстом -- для демо це прийнятно.)
- *
- * "Дріт живий" = за останні WIRE_TIMEOUT_MS плата отримала хоча б один
- * валідний кадр від шлюзу по UART (шлюз шле "пінг" щосекунди).
- * Відключили дріт -- за кілька секунд плата сама переходить на Wi-Fi.
- * Втрата/дублікати під час перемикання лишаються видимими в лічильниках
- * шлюзу (sequence наскрізний, один на всі канали).
- *
- * node_id ПЛАТА НЕ ПРОПИСУЄ -- його призначає шлюз за старшинством: хто
- * першим з'явився на шлюзі, той отримує менший id (1, 2, 3...). Плата
- * ідентифікує себе MAC-адресою (HELLO), шлюз повертає id, плата зберігає
- * його в NVS. Реєстр веде шлюз, тож після перезапуску плати id той самий.
- * Поки id не призначено, телеметрія не шлеться (немає від чийого імені).
- *
- * Серво: лише на ОДНІЙ платі, де воно фізично підключене, постав
- * SERVO_ENABLED true (бібліотека "ESP32Servo"); на решті команда servo
- * просто підтверджується й логується.
- *
- * Поруч зі скетчем мають лежати копії node_common.h, packet_queue.h,
- * protocol.h/.c і reliability.h/.c (оригінали: node_common/ і protocol/;
- * розкласти їх по скетчах -- node_common/sync.sh).
- */
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Preferences.h>
 
 extern "C" {
-  #include "protocol.h"     /* SensorPacket, protocol_pack/unpack */
-  #include "reliability.h"  /* ACK/retry для MSG_ALARM */
-  #include "packet_queue.h" /* кільцева черга: буфер телеметрії і черга ALARM */
+  #include "protocol.h"
+  #include "reliability.h"
+  #include "packet_queue.h"
 }
 
-// ================== ХУКИ ДАТЧИКА (реалізує скетч) ==================
-// Ініціалізація шини й датчика. Викликається один раз із node_setup() після
-// Serial.begin(), тож DBG уже можна використовувати для логів.
 void sensor_setup();
-// Викликається на КОЖНОМУ проході loop() -- для датчиків, яким потрібне
-// безперервне опитування (фільтр орієнтації MPU9250). Повільним датчикам
-// (SHT41) лишити порожнім і міряти в sensor_payload().
 void sensor_update();
-// Записує в buf (не більше n байт) JSON-об'єкт із метриками, напр. {"temperature":23.4}.
-// Повертає false, якщо вимір не вдався: тоді пакет НЕ шлеться (краще пропуск, ніж
-// вигадане значення). Дописувати backlog/dropped не треба -- це робить ядро.
 bool sensor_payload(char *buf, size_t n);
 
-// Критична подія вузла з ACK/retry (оголошено тут, бо handle_config_packet викликає її раніше, ніж вона визначена).
 void send_alarm();
 
-// node_id призначає шлюз (0 = ще не призначено). Зберігається в NVS.
 uint16_t MY_NODE_ID = 0;
-char device_mac[18] = "";           // унікальна ідентичність плати (eFuse MAC)
-bool id_confirmed = false;          // шлюз підтвердив id у цій сесії
+char device_mac[18] = "";
+bool id_confirmed = false;
 
-// ---- Серво (лише на одній платі в мережі) ----
 #define SERVO_ENABLED false
 #define SERVO_PIN     18
 #if SERVO_ENABLED
@@ -84,22 +26,13 @@ bool id_confirmed = false;          // шлюз підтвердив id у ці�
   Servo servo;
 #endif
 
-// ---- UART до шлюзу ----
-// LINK_VIA_USB_CABLE 1: зв'язок зі шлюзом іде прямо через USB-кабель плати
-//   (вбудований USB-UART адаптер = UART0 = Serial). Кабель з'єднує плату з
-//   Pi, жодних пінів і перехідників. УВАГА: Serial тоді зайнятий каналом, тож
-//   текстові логи й команди (alarm/status) у Serial Monitor недоступні
-//   (логи гасяться). Для налагодження поставте 0 і підключіть кабель до ПК.
-// LINK_VIA_USB_CABLE 0: окремий UART2 на пінах GPIO16/17 (через USB-TTL
-//   перехідник до Pi); Serial лишається вільним для логів і команд.
 #define LINK_VIA_USB_CABLE 1
-#define UART_RX_PIN 3              // лише для режиму 0
-#define UART_TX_PIN 1              // лише для режиму 0
-#define UART_BAUD   115200          // має збігатися з UART_BAUD у gateway.c
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
+#define UART_BAUD   115200
 
-#if LINK_VIA_USB_CABLE 
+#if LINK_VIA_USB_CABLE
   #define GatewaySerial Serial
-  // Приймач логів, що нічого не друкує (інакше текст псував би кадри протоколу)
   class NullPrint : public Print {
    public:
     size_t write(uint8_t) override { return 1; }
@@ -111,21 +44,17 @@ bool id_confirmed = false;          // шлюз підтвердив id у ці�
   #define DBG Serial
 #endif
 
-#define WIRE_TIMEOUT_MS   3000      // стільки без кадрів від шлюзу = дріт мертвий
-#define UDP_LOCAL_PORT    12345     // з нього плата і шле UDP, і слухає ACK
+#define WIRE_TIMEOUT_MS   3000
+#define UDP_LOCAL_PORT    12345
 #define BUFFER_CAPACITY   50
-#define FLUSH_INTERVAL_MS 50        // пауза між пакетами при вивантаженні буфера
-#define FLUSH_RETRY_PAUSE_MS 1000   // пауза після невдалої відправки з буфера (щоб не спамити)
-#define ALARM_QUEUE_CAP   8         // критичні повідомлення, що чекають на канал
-#define ALARM_RETRY_COOLDOWN_MS 5000 // пауза після "retry вичерпано", перш ніж пробувати знову
-#define TCP_KEEPALIVE_MS  5000      // щоб шлюз не закрив "тихе" резервне TCP
-// Wi-Fi-канал вважається живим лише поки шлюз ВІДПОВІДАЄ на ньому. Сам факт "є Wi-Fi" /
-// "сокет connected" нічого не гарантує: за мертвого шлюзу UDP-пакет мовчки зникає, а
-// запис у TCP з обривом без FIN "успішний" ще хвилини. Тож пакети не йшли в буфер.
-#define WIFI_PROBE_MS        2000   // як часто питати шлюз "ти там?" (HELLO-проба по TCP і UDP)
-#define WIFI_LINK_TIMEOUT_MS 7000   // стільки без жодного кадру від шлюзу по каналу = канал мертвий (~3 проби)
+#define FLUSH_INTERVAL_MS 50
+#define FLUSH_RETRY_PAUSE_MS 1000
+#define ALARM_QUEUE_CAP   8
+#define ALARM_RETRY_COOLDOWN_MS 5000
+#define TCP_KEEPALIVE_MS  5000
+#define WIFI_PROBE_MS        2000
+#define WIFI_LINK_TIMEOUT_MS 7000
 
-// ---- Налаштування, що приходять від шлюзу (зберігаються в NVS) ----
 Preferences prefs;
 char wifi_ssid[64] = "";
 char wifi_pass[96] = "";
@@ -140,31 +69,23 @@ WiFiUDP udp;
 WiFiClient tcp_client;
 bool udp_started = false;
 
-unsigned long last_wire_rx = 0;     // millis() останнього валідного кадру по UART
-// Те саме для Wi-Fi, окремо по транспортах: TCP може бути "мертвим" (обрив без FIN),
-// коли UDP ще працює, тож свіжість міряємо для кожного.
+unsigned long last_wire_rx = 0;
 unsigned long last_tcp_rx = 0;
 unsigned long last_udp_rx = 0;
 
-uint32_t seq_counter = 0;           // наскрізний sequence для TELEMETRY і ALARM
-// Буфер телеметрії (store-and-forward): при переповненні відкидається найстаріше.
+uint32_t seq_counter = 0;
 SensorPacket buffer_storage[BUFFER_CAPACITY];
 PacketQueue tele_q = { buffer_storage, BUFFER_CAPACITY, 0, 0, 0 };
-// Черга ALARM: критичне ніколи не відкидаємо заради телеметрії, лишається в черзі,
-// доки reliable_* не отримає ACK.
 SensorPacket alarm_storage[ALARM_QUEUE_CAP];
 PacketQueue alarm_q = { alarm_storage, ALARM_QUEUE_CAP, 0, 0, 0 };
-SensorPacket alarm_inflight;        // копія пакета, що зараз іде через ACK/retry
+SensorPacket alarm_inflight;
 bool alarm_inflight_valid = false;
 unsigned long alarm_retry_after = 0;
-// Керування з веба: симуляція втрат на виході плати і віддалений ALARM
-uint8_t sim_loss_percent = 0;       // 0..100, команда simulate_loss
-bool remote_alarm_active = false;   // команда alarm з веба (MSG_ALARM від шлюзу)
+uint8_t sim_loss_percent = 0;
+bool remote_alarm_active = false;
 ReliableCtx reliable;
 String serial_cmd_buffer = "";
 
-// Складання кадру з байтового потоку (UART/TCP): спершу HEADER_SIZE байт,
-// з них payload_len, тоді повний розмір. UDP зберігає межі датаграм сам.
 struct FrameAssembler {
   uint8_t buf[HEADER_SIZE + MAX_PAYLOAD_SIZE + CRC_SIZE];
   size_t have = 0;
@@ -175,7 +96,6 @@ struct FrameAssembler {
 
   unsigned long last_byte_ms = 0;
 
-  // Чи може buf[0..have) бути початком справжнього кадру (версія, тип, довжина).
   bool plausible() {
     if (have >= 1 && buf[0] != PROTOCOL_VERSION) return false;
     if (have >= 2 && buf[1] > MSG_ACK) return false;
@@ -189,11 +109,11 @@ struct FrameAssembler {
 
   bool feed(uint8_t b) {
     unsigned long now = millis();
-    if (have > 0 && now - last_byte_ms > 100) reset(); // пауза всередині кадру = сміття
+    if (have > 0 && now - last_byte_ms > 100) reset();
     last_byte_ms = now;
     if (have >= sizeof(buf)) reset();
     buf[have++] = b;
-    while (have > 0 && !plausible()) { // самосинхронізація: відкидаємо сміття побайтово
+    while (have > 0 && !plausible()) {
       memmove(buf, buf + 1, have - 1);
       have--;
     }
@@ -212,15 +132,12 @@ struct FrameAssembler {
 FrameAssembler uart_assembler;
 FrameAssembler tcp_assembler;
 
-// ================== КАНАЛИ ==================
 enum Channel { CH_NONE, CH_UART, CH_TCP, CH_UDP };
 
 bool wire_alive() {
   return last_wire_rx != 0 && (millis() - last_wire_rx) < WIRE_TIMEOUT_MS;
 }
 bool wifi_up() { return wifi_configured && WiFi.status() == WL_CONNECTED; }
-// Канал "живий" = є з'єднання І шлюз щойно відповідав на ньому (кадр у downlink).
-// Без другої умови плата не помічає недосяжного шлюзу й не вмикає буфер.
 bool tcp_up()  { return wifi_up() && gw_configured && tcp_client.connected() &&
                         last_tcp_rx != 0 && (millis() - last_tcp_rx) < WIFI_LINK_TIMEOUT_MS; }
 bool udp_up()  { return wifi_up() && gw_configured && udp_started &&
@@ -238,7 +155,7 @@ const char* channel_name(Channel c) {
     case CH_UART: return "UART";
     case CH_TCP:  return "TCP";
     case CH_UDP:  return "UDP";
-    default:      return "немає каналу";
+    default:      return "none";
   }
 }
 
@@ -249,15 +166,11 @@ bool udp_send(const uint8_t *buf, int len) {
   return udp.endPacket() == 1;
 }
 
-// Єдине місце, де транспорт торкається протокольного коду. Обирає
-// найкращий доступний канал; якщо TCP-запис не вдався -- пробує UDP.
 bool node_send(const uint8_t *buf, int len) {
-  // Симуляція поганого каналу (веб -> simulate_loss): частину пакетів "губимо"
-  // на виході, для решти коду вони виглядають відправленими.
   if (sim_loss_percent > 0 && random(100) < sim_loss_percent) {
-    DBG.print("[LOSS-SIM] пакет НЕ відправлено (симуляція ");
+    DBG.print("[LOSS-SIM] packet dropped (simulated loss ");
     DBG.print(sim_loss_percent);
-    DBG.println("% втрат)");
+    DBG.println("%)");
     return true;
   }
   switch (active_channel()) {
@@ -276,15 +189,11 @@ bool node_send(const uint8_t *buf, int len) {
 
 bool transport_ready() { return active_channel() != CH_NONE; }
 
-// Сигнатура, якої вимагає reliability.c (і перша спроба, і кожен retry).
 void esp32_reliable_send(void *userdata, const uint8_t *buf, int len) {
   (void)userdata;
   node_send(buf, len);
 }
 
-// ================== ПРИЙОМ НАЛАШТУВАНЬ ВІД ШЛЮЗУ ==================
-// Мінімальний розбір JSON для наших двох CONFIG-пакетів. Знаходить
-// "key":"значення" з екрануванням \" \\ \/ і \u00XX (ASCII).
 bool json_find_value(const char *js, const char *key, const char **val_start) {
   char pat[24];
   snprintf(pat, sizeof(pat), "\"%s\"", key);
@@ -298,7 +207,7 @@ bool json_find_value(const char *js, const char *key, const char **val_start) {
       *val_start = q;
       return true;
     }
-    p += 1; // це було значення, а не ключ -- шукаємо далі
+    p += 1;
   }
   return false;
 }
@@ -318,7 +227,7 @@ bool json_get_string(const char *js, const char *key, char *out, size_t n) {
         v += 4;
         c = (code < 0x80) ? (char)code : '?';
       } else {
-        c = e; // \" \\ \/
+        c = e;
       }
     }
     if (o + 1 < n) out[o++] = c;
@@ -347,7 +256,7 @@ void wifi_start() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   WiFi.begin(wifi_ssid, wifi_pass);
-  DBG.print("[WIFI] Підключаюсь до \"");
+  DBG.print("[WIFI] Connecting to \"");
   DBG.print(wifi_ssid);
   DBG.println("\"...");
 }
@@ -360,7 +269,7 @@ void apply_wifi_config(const char *ssid, const char *pass) {
   if (changed) {
     prefs.putString("ssid", wifi_ssid);
     prefs.putString("pass", wifi_pass);
-    DBG.println("[CONFIG] Отримано нові налаштування Wi-Fi від шлюзу, збережено.");
+    DBG.println("[CONFIG] New Wi-Fi settings received from gateway and saved.");
     wifi_start();
   }
 }
@@ -368,7 +277,7 @@ void apply_wifi_config(const char *ssid, const char *pass) {
 void apply_gw_config(const char *ip, long udp_p, long tcp_p) {
   IPAddress parsed;
   if (!parsed.fromString(ip)) {
-    DBG.println("[CONFIG] Шлюз надіслав некоректний IP, ігнорую.");
+    DBG.println("[CONFIG] Gateway sent an invalid IP, ignoring.");
     return;
   }
   bool changed = !gw_configured || strcmp(ip, gw_ip_str) != 0 ||
@@ -382,20 +291,19 @@ void apply_gw_config(const char *ip, long udp_p, long tcp_p) {
     prefs.putString("gw", gw_ip_str);
     prefs.putUShort("udp", udp_port);
     prefs.putUShort("tcp", tcp_port);
-    tcp_client.stop(); // перепідключиться вже за новою адресою
-    DBG.print("[CONFIG] Адреса шлюзу від Pi: ");
+    tcp_client.stop();
+    DBG.print("[CONFIG] Gateway address: ");
     DBG.print(gw_ip_str);
     DBG.print(" (UDP ");
     DBG.print(udp_port);
     DBG.print(", TCP ");
     DBG.print(tcp_port);
-    DBG.println("), збережено.");
+    DBG.println("), saved.");
   }
 }
 
-// Підтвердження CONFIG-пакета шлюзу: ACK з тим самим sequence.
 void send_ack_to_gateway(uint32_t seq) {
-  SensorPacket ack = {0};
+  SensorPacket ack = {};
   ack.version = PROTOCOL_VERSION;
   ack.msg_type = MSG_ACK;
   ack.node_id = MY_NODE_ID;
@@ -406,9 +314,8 @@ void send_ack_to_gateway(uint32_t seq) {
   if (len > 0) node_send(tx, len);
 }
 
-// Запит id у шлюзу: HEARTBEAT з node_id=0 і нашим MAC (+ збережений id, якщо був).
 void send_hello() {
-  SensorPacket h = {0};
+  SensorPacket h = {};
   h.version = PROTOCOL_VERSION;
   h.msg_type = MSG_HEARTBEAT;
   h.node_id = 0;
@@ -421,15 +328,9 @@ void send_hello() {
   if (len > 0) node_send(tx, len);
 }
 
-// Проба Wi-Fi-каналів: HELLO, що шлеться НАПРЯМУ і по TCP, і по UDP (в обхід вибору
-// каналу -- інакше мертвий канал ніколи б не ожив). Шлюз відповідає на кожен HELLO
-// кадром CONFIG{"cmd":"id"} тим самим транспортом, і ця відповідь оновлює
-// last_tcp_rx/last_udp_rx. Прапорець "probe" каже шлюзу, що це не перезавантаження
-// плати (інакше він щоразу скидав би облік sequence). Поки id не підтверджено, шлемо
-// звичайний HELLO без прапорця -- це і є справжній запит id після старту.
 void send_wifi_probe() {
   if (!wifi_up() || !gw_configured) return;
-  SensorPacket h = {0};
+  SensorPacket h = {};
   h.version = PROTOCOL_VERSION;
   h.msg_type = MSG_HEARTBEAT;
   h.node_id = 0;
@@ -456,19 +357,19 @@ void handle_config_packet(const SensorPacket *pkt) {
 
   char cmd[16];
   if (!json_get_string(js, "cmd", cmd, sizeof(cmd))) {
-    DBG.println("[CONFIG] CONFIG без поля cmd, ігнорую.");
+    DBG.println("[CONFIG] CONFIG without cmd field, ignoring.");
     return;
   }
   if (strcmp(cmd, "id") == 0) {
     char mac[18];
     long id = 0;
-    if (!json_get_string(js, "mac", mac, sizeof(mac)) || strcmp(mac, device_mac) != 0) return; // не нам
+    if (!json_get_string(js, "mac", mac, sizeof(mac)) || strcmp(mac, device_mac) != 0) return;
     if (!json_get_int(js, "id", &id) || id <= 0 || id > 65535) return;
     if (MY_NODE_ID != (uint16_t)id) {
-      DBG.print("[ID] Шлюз призначив node_id=");
+      DBG.print("[ID] Gateway assigned node_id=");
       DBG.print(id);
-      DBG.print(MY_NODE_ID ? " (було " : " (нова плата");
-      if (MY_NODE_ID) { DBG.print(MY_NODE_ID); DBG.print(", переписано)"); } else DBG.print(")");
+      DBG.print(MY_NODE_ID ? " (was " : " (new board");
+      if (MY_NODE_ID) { DBG.print(MY_NODE_ID); DBG.print(", reassigned)"); } else DBG.print(")");
       DBG.println();
       MY_NODE_ID = (uint16_t)id;
       prefs.putUShort("nid", MY_NODE_ID);
@@ -481,12 +382,12 @@ void handle_config_packet(const SensorPacket *pkt) {
     if (angle > 180) angle = 180;
 #if SERVO_ENABLED
     servo.write((int)angle);
-    DBG.print("[SERVO] Кут: ");
+    DBG.print("[SERVO] Angle: ");
     DBG.println(angle);
 #else
-    DBG.print("[SERVO] Команда отримана (angle=");
+    DBG.print("[SERVO] Command received (angle=");
     DBG.print(angle);
-    DBG.println("), але SERVO_ENABLED=false на цій платі");
+    DBG.println("), but SERVO_ENABLED is false on this board");
 #endif
     send_ack_to_gateway(pkt->sequence);
   } else if (strcmp(cmd, "wifi") == 0) {
@@ -504,31 +405,26 @@ void handle_config_packet(const SensorPacket *pkt) {
     apply_gw_config(ip, u, t);
     send_ack_to_gateway(pkt->sequence);
   } else if (strcmp(cmd, "fire_alarm") == 0) {
-    // Запуск справжнього ALARM вузол -> шлюз (з ACK/retry) командою з веба. Потрібен для демо
-    // критерію №2: у режимі USB-кабелю Serial зайнятий каналом, тож консольна команда alarm недоступна.
-    send_ack_to_gateway(pkt->sequence); // ACK самої команди; ALARM піде окремим пакетом зі своїм sequence
+    send_ack_to_gateway(pkt->sequence);
     send_alarm();
   } else if (strcmp(cmd, "ping") == 0) {
-    // Вимірювання затримки: шлюз міряє час від свого ping до цього ACK
     send_ack_to_gateway(pkt->sequence);
   } else if (strcmp(cmd, "simulate_loss") == 0) {
     long pct = 0;
     json_get_int(js, "loss_percent", &pct);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    send_ack_to_gateway(pkt->sequence); // ACK ДО увімкнення втрат, інакше він сам міг би загубитись
+    send_ack_to_gateway(pkt->sequence);
     sim_loss_percent = (uint8_t)pct;
-    DBG.print("[CONFIG] Симуляція втрат на виході: ");
+    DBG.print("[CONFIG] Simulated outbound loss: ");
     DBG.print(pct);
     DBG.println("%");
   } else {
-    DBG.print("[CONFIG] Невідома команда: ");
+    DBG.print("[CONFIG] Unknown command: ");
     DBG.println(cmd);
   }
 }
 
-// ALARM з веб-інтерфейсу: {"cmd":"alarm","active":true|false}. Плата підтверджує
-// командою ACK, запам'ятовує стан і вмикає/вимикає вбудований світлодіод.
 void handle_remote_alarm(const SensorPacket *pkt) {
   char js[MAX_PAYLOAD_SIZE + 1];
   memcpy(js, pkt->payload, pkt->payload_len);
@@ -542,37 +438,33 @@ void handle_remote_alarm(const SensorPacket *pkt) {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, active ? HIGH : LOW);
 #endif
-  DBG.print("[ALARM] Команда з веба: ");
-  DBG.println(active ? "УВІМКНЕНО" : "вимкнено");
+  DBG.print("[ALARM] Remote alarm: ");
+  DBG.println(active ? "ON" : "off");
 }
 
-// ================== ПРИЙОМ ВІД ШЛЮЗУ ==================
 void handle_downlink_bytes(const uint8_t *raw, size_t len, Channel src) {
   SensorPacket pkt;
   int rc = protocol_unpack(raw, len, &pkt);
   if (rc != PROTO_OK) {
-    DBG.print("[WARN] Пошкоджений кадр від шлюзу, код=");
+    DBG.print("[WARN] Corrupted frame from gateway, code=");
     DBG.println(rc);
     return;
   }
-  // Будь-який валідний кадр від шлюзу = цей канал живий (до фільтра за node_id:
-  // відповідь на пробу приходить з node_id=0 або з пінгом, усе це ознака життя).
   if (src == CH_UART) last_wire_rx = millis();
   else if (src == CH_TCP) last_tcp_rx = millis();
   else if (src == CH_UDP) last_udp_rx = millis();
 
-  if (pkt.node_id != 0 && pkt.node_id != MY_NODE_ID) return; // чужий вузол; 0 = усім
+  if (pkt.node_id != 0 && pkt.node_id != MY_NODE_ID) return;
 
   if (pkt.msg_type == MSG_ACK) {
-    DBG.print("[ACK] Підтвердження sequence=");
+    DBG.print("[ACK] Acknowledged sequence=");
     DBG.println(pkt.sequence);
     reliable_on_ack_received(&reliable, pkt.sequence);
   } else if (pkt.msg_type == MSG_CONFIG) {
     handle_config_packet(&pkt);
   } else if (pkt.msg_type == MSG_ALARM) {
-    handle_remote_alarm(&pkt); // ALARM від шлюзу = команда з веба
+    handle_remote_alarm(&pkt);
   }
-  // MSG_HEARTBEAT від шлюзу ("пінг" дроту) -- потрібен лише заради last_wire_rx
 }
 
 void poll_downlink() {
@@ -600,16 +492,11 @@ void poll_downlink() {
   }
 }
 
-// ================== БУФЕР STORE-AND-FORWARD ==================
-// Дописує в JSON телеметрії поточний стан буфера: "backlog" (скільки пакетів ще чекає
-// ПІСЛЯ цього) і "dropped" (скільки втрачено через переповнення). Викликається в момент
-// відправки, а не створення, тож під час вивантаження шлюз бачить backlog, що спадає
-// до нуля. Ідемпотентна: повторний виклик замінює попередні значення.
 void stamp_buffer_stats(SensorPacket *pkt, int backlog) {
   if (pkt->msg_type != MSG_TELEMETRY || pkt->payload_len == 0 || pkt->payload_len >= MAX_PAYLOAD_SIZE) return;
   pkt->payload[pkt->payload_len] = '\0';
   char *old = strstr((char*)pkt->payload, ",\"backlog\":");
-  if (old) { // відрізаємо раніше дописане
+  if (old) {
     *old = '}';
     pkt->payload[old - (char*)pkt->payload + 1] = '\0';
     pkt->payload_len = (uint16_t)(old - (char*)pkt->payload + 1);
@@ -620,7 +507,7 @@ void stamp_buffer_stats(SensorPacket *pkt, int backlog) {
                    ",\"backlog\":%d,\"dropped\":%lu}", backlog, (unsigned long)tele_q.dropped);
   if (n > 0 && base + n < MAX_PAYLOAD_SIZE) {
     pkt->payload_len = (uint16_t)(base + n);
-  } else { // не влізло -- лишаємо JSON як був
+  } else {
     pkt->payload[base] = '}';
     pkt->payload[base + 1] = '\0';
   }
@@ -628,114 +515,101 @@ void stamp_buffer_stats(SensorPacket *pkt, int backlog) {
 
 void buffer_packet(const SensorPacket* pkt) {
   if (pq_push(&tele_q, pkt)) {
-    DBG.print("[BUFFER] Переповнення -- втрачено найстаріший пакет. Всього втрачено: ");
+    DBG.print("[BUFFER] Overflow, oldest packet dropped. Dropped total: ");
     DBG.println(tele_q.dropped);
   }
-  DBG.print("[BUFFER] Пакет збережено локально. У буфері: ");
+  DBG.print("[BUFFER] Packet stored locally. Buffered: ");
   DBG.println(tele_q.count);
 }
 
-// Неблокуючий flush: за один виклик відправляє один пакет з голови буфера.
-// Викликається з loop() не частіше за FLUSH_INTERVAL_MS.
 void flush_buffer_step() {
   static bool flushing = false;
-  static unsigned long pause_until = 0; // після збою відправки чекаємо, а не б'ємо в канал кожні 50 мс
+  static unsigned long pause_until = 0;
   SensorPacket *head = pq_peek(&tele_q);
   if (!head) return;
   if (pause_until != 0 && (long)(millis() - pause_until) < 0) return;
   if (!flushing) {
-    DBG.print("[BUFFER] Канал є (");
+    DBG.print("[BUFFER] Link is up (");
     DBG.print(channel_name(active_channel()));
-    DBG.print("). Вивантажую накопичені пакети: ");
+    DBG.print("), flushing buffered packets: ");
     DBG.println(tele_q.count);
     flushing = true;
   }
 
-  // Шлюз міг перепризначити node_id, поки пакет лежав у буфері. Sequence і
-  // timestamp лишаються з моменту створення -- їх не чіпаємо.
   if (MY_NODE_ID != 0) head->node_id = MY_NODE_ID;
-  stamp_buffer_stats(head, tele_q.count - 1); // скільки лишиться після цього пакета
+  stamp_buffer_stats(head, tele_q.count - 1);
 
   uint8_t tx_buf[256];
   int packed_len = protocol_pack(head, tx_buf, sizeof(tx_buf));
   if (packed_len <= 0 || node_send(tx_buf, packed_len)) {
-    // packed_len <= 0 -- пакет не пакується взагалі, повторювати немає сенсу
     pq_pop(&tele_q, NULL);
     pause_until = 0;
     if (pq_empty(&tele_q)) {
-      DBG.println("[BUFFER] Вивантаження завершено.");
+      DBG.println("[BUFFER] Flush complete.");
       flushing = false;
     }
   } else {
-    DBG.println("[BUFFER] Помилка відправки, повторю за секунду.");
+    DBG.println("[BUFFER] Send failed, retrying in 1 s.");
     flushing = false;
     pause_until = millis() + FLUSH_RETRY_PAUSE_MS;
     if (pause_until == 0) pause_until = 1;
   }
 }
 
-// ================== ЧЕРГА ALARM ==================
 void alarm_enqueue(const SensorPacket* pkt) {
   if (pq_push(&alarm_q, pkt)) {
-    DBG.print("[ALARM] Черга повна -- втрачено найстаріший ALARM. Всього втрачено: ");
+    DBG.print("[ALARM] Queue full, oldest ALARM dropped. Dropped total: ");
     DBG.println(alarm_q.dropped);
   }
 }
 
-// Повертає ALARM, що не вдалося доставити, на початок черги (зі збереженням порядку).
 void alarm_requeue_front(const SensorPacket* pkt) {
   if (pq_push_front(&alarm_q, pkt)) {
-    DBG.print("[ALARM] Черга повна -- втрачено найновіший ALARM. Всього втрачено: ");
+    DBG.print("[ALARM] Queue full, newest ALARM dropped. Dropped total: ");
     DBG.println(alarm_q.dropped);
   }
 }
 
-// Бере наступний ALARM з черги й запускає ACK/retry, коли є канал і reliable вільний.
 void alarm_pump() {
-  // pending_success: ACK уже прийшов, але reliable_tick() ще не видав SUCCESS -- новий старт його б затер
   if (pq_empty(&alarm_q) || reliable_is_busy(&reliable) || reliable.pending_success || !transport_ready()) return;
   if (alarm_retry_after != 0 && (long)(millis() - alarm_retry_after) < 0) return;
 
   SensorPacket pkt = *pq_peek(&alarm_q);
-  if (MY_NODE_ID != 0) pkt.node_id = MY_NODE_ID; // id міг змінитись, поки ALARM чекав у черзі
+  if (MY_NODE_ID != 0) pkt.node_id = MY_NODE_ID;
   pq_pop(&alarm_q, NULL);
   if (!reliable_send_critical(&reliable, &pkt, millis())) {
-    DBG.println("[ALARM] Не вдалося запакувати ALARM з черги, пропускаю.");
+    DBG.println("[ALARM] Failed to pack queued ALARM, skipping.");
     return;
   }
   alarm_inflight = pkt;
   alarm_inflight_valid = true;
   alarm_retry_after = 0;
-  DBG.print("[ALARM] Відправка sequence=");
+  DBG.print("[ALARM] Sending sequence=");
   DBG.print(pkt.sequence);
-  DBG.print(", ще в черзі: ");
+  DBG.print(", still queued: ");
   DBG.println(alarm_q.count);
 }
 
-// ================== ТЕЛЕМЕТРІЯ І ALARM ==================
 void send_telemetry() {
-  SensorPacket pkt = {0};
+  SensorPacket pkt = {};
   pkt.version = PROTOCOL_VERSION;
   pkt.msg_type = MSG_TELEMETRY;
   pkt.node_id = MY_NODE_ID;
   pkt.timestamp_ms = millis();
 
-  // Спершу вимір: якщо датчик не відповів, sequence не витрачаємо -- інакше шлюз
-  // порахував би дірку в нумерації як втрату пакета, якого ніхто й не слав.
   if (!sensor_payload((char*)pkt.payload, MAX_PAYLOAD_SIZE)) {
-    DBG.println("[SENSOR] Вимір не вдався -- пакет телеметрії пропущено.");
+    DBG.println("[SENSOR] Measurement failed, telemetry packet skipped.");
     return;
   }
   pkt.payload_len = strlen((char*)pkt.payload);
   pkt.sequence = seq_counter++;
 
-  // Поки є непорожній буфер, нова телеметрія йде в його кінець (порядок на шлюзі)
   if (!transport_ready() || !pq_empty(&tele_q)) {
     buffer_packet(&pkt);
     return;
   }
 
-  stamp_buffer_stats(&pkt, 0); // буфер порожній, інакше пакет пішов би в нього
+  stamp_buffer_stats(&pkt, 0);
   uint8_t tx_buf[256];
   int packed_len = protocol_pack(&pkt, tx_buf, sizeof(tx_buf));
   if (packed_len > 0) {
@@ -747,7 +621,7 @@ void send_telemetry() {
       DBG.print(channel_name(ch));
       DBG.print(" (");
       DBG.print(packed_len);
-      DBG.println(" байт)");
+      DBG.println(" bytes)");
     } else {
       buffer_packet(&pkt);
     }
@@ -756,10 +630,10 @@ void send_telemetry() {
 
 void send_alarm() {
   if (MY_NODE_ID == 0) {
-    DBG.println("[ALARM] node_id ще не призначено шлюзом.");
+    DBG.println("[ALARM] node_id not assigned by gateway yet.");
     return;
   }
-  SensorPacket pkt = {0};
+  SensorPacket pkt = {};
   pkt.version = PROTOCOL_VERSION;
   pkt.msg_type = MSG_ALARM;
   pkt.node_id = MY_NODE_ID;
@@ -773,8 +647,8 @@ void send_alarm() {
   DBG.print("[ALARM] ALARM sequence=");
   DBG.print(pkt.sequence);
   DBG.println(transport_ready() && !reliable_is_busy(&reliable)
-                  ? " -- відправляю"
-                  : " -- поставлено в чергу (немає каналу або зайнято)");
+                  ? " -- sending"
+                  : " -- queued (no link or busy)");
   alarm_enqueue(&pkt);
   alarm_pump();
 }
@@ -782,40 +656,36 @@ void send_alarm() {
 void print_status() {
   DBG.print("[STATUS] node_id=");
   DBG.print(MY_NODE_ID);
-  DBG.print(id_confirmed ? " (підтверджено)" : " (не підтверджено)");
-  DBG.print(" | канал=");
+  DBG.print(id_confirmed ? " (confirmed)" : " (unconfirmed)");
+  DBG.print(" | link=");
   DBG.print(channel_name(active_channel()));
-  DBG.print(" | дріт=");
-  DBG.print(wire_alive() ? "живий" : "немає");
+  DBG.print(" | wire=");
+  DBG.print(wire_alive() ? "up" : "down");
   DBG.print(" | Wi-Fi=");
-  DBG.print(wifi_configured ? (WiFi.status() == WL_CONNECTED ? "підключено" : "підключаюсь") : "не налаштовано");
-  DBG.print(" | шлюз=");
-  DBG.print(gw_configured ? gw_ip_str : "не налаштовано");
+  DBG.print(wifi_configured ? (WiFi.status() == WL_CONNECTED ? "connected" : "connecting") : "not configured");
+  DBG.print(" | gateway=");
+  DBG.print(gw_configured ? gw_ip_str : "not configured");
   DBG.print(" | TCP=");
-  DBG.print(tcp_client.connected() ? (tcp_up() ? "так" : "є, шлюз мовчить") : "ні");
+  DBG.print(tcp_client.connected() ? (tcp_up() ? "up" : "connected, no reply") : "down");
   DBG.print(" | UDP=");
-  DBG.print(udp_up() ? "живий" : "шлюз мовчить");
-  DBG.print(" | буфер=");
+  DBG.print(udp_up() ? "up" : "no reply");
+  DBG.print(" | buffer=");
   DBG.print(tele_q.count);
-  DBG.print(" (втрачено ");
+  DBG.print(" (dropped ");
   DBG.print(tele_q.dropped);
-  DBG.print(") | веб-ALARM=");
-  DBG.print(remote_alarm_active ? "так" : "ні");
-  DBG.print(" | втрати(симуляція)=");
+  DBG.print(") | remote ALARM=");
+  DBG.print(remote_alarm_active ? "on" : "off");
+  DBG.print(" | simulated loss=");
   DBG.print(sim_loss_percent);
-  DBG.print("% | ALARM у черзі=");
+  DBG.print("% | queued ALARMs=");
   DBG.print(alarm_q.count + (alarm_inflight_valid ? 1 : 0));
-  DBG.print(" (втрачено ");
+  DBG.print(" (dropped ");
   DBG.print(alarm_q.dropped);
   DBG.println(")");
 }
 
-// Команди з Serial Monitor: "alarm" -- критична подія з ACK/retry,
-// "status" -- поточний стан каналів, "forget" -- стерти збережені налаштування.
 void check_serial_commands() {
-#if LINK_VIA_USB_CABLE
-  return; // Serial зайнятий каналом зі шлюзом -- команди з консолі недоступні
-#endif
+#if !LINK_VIA_USB_CABLE
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
@@ -828,9 +698,9 @@ void check_serial_commands() {
           print_status();
         } else if (serial_cmd_buffer == "forget") {
           prefs.clear();
-          DBG.println("[CONFIG] Налаштування стерто. Перезавантаж плату і підключи дріт до Pi.");
+          DBG.println("[CONFIG] Settings erased. Reboot the board and connect it to the gateway over UART.");
         } else {
-          DBG.print("[SERIAL] Невідома команда: ");
+          DBG.print("[SERIAL] Unknown command: ");
           DBG.println(serial_cmd_buffer);
         }
         serial_cmd_buffer = "";
@@ -839,9 +709,9 @@ void check_serial_commands() {
       serial_cmd_buffer += c;
     }
   }
+#endif
 }
 
-// ================== SETUP / LOOP ==================
 void load_saved_config() {
   prefs.begin("node", false);
   String s = prefs.getString("ssid", "");
@@ -879,23 +749,22 @@ void node_setup() {
   load_saved_config();
   WiFi.mode(WIFI_STA);
   if (wifi_configured) {
-    DBG.println("[CONFIG] Знайдено збережені налаштування -- Wi-Fi стартує у фоні.");
+    DBG.println("[CONFIG] Saved settings found, starting Wi-Fi in background.");
     wifi_start();
   } else {
-    DBG.println("[CONFIG] Налаштувань Wi-Fi ще немає: підключи дріт до Pi (UART), шлюз передасть їх сам.");
+    DBG.println("[CONFIG] No Wi-Fi settings yet: connect the board to the gateway over UART to provision it.");
   }
 
   reliable_init(&reliable, esp32_reliable_send, NULL);
 
-  DBG.print("Готово. MAC=");
+  DBG.print("Ready. MAC=");
   DBG.print(device_mac);
   DBG.print(", node_id=");
-  DBG.print(MY_NODE_ID ? String(MY_NODE_ID) : String("очікую від шлюзу"));
-  DBG.println(". Команди в Serial Monitor: alarm, status, forget.");
+  DBG.print(MY_NODE_ID ? String(MY_NODE_ID) : String("waiting for gateway"));
+  DBG.println(". Serial commands: alarm, status, forget.");
 }
 
 void node_loop() {
-  // --- Wi-Fi у фоні (неблокуюче) ---
   static bool was_wifi = false;
   bool now_wifi = wifi_up();
   if (wifi_configured && !now_wifi) {
@@ -907,38 +776,35 @@ void node_loop() {
     }
   }
   if (now_wifi && !was_wifi) {
-    DBG.print("[WIFI] Підключено, IP плати: ");
+    DBG.print("[WIFI] Connected, IP: ");
     DBG.println(WiFi.localIP());
     if (!udp_started) udp_started = udp.begin(UDP_LOCAL_PORT);
   }
   if (!now_wifi && was_wifi) {
-    DBG.println("[WIFI] Зв'язок втрачено.");
+    DBG.println("[WIFI] Connection lost.");
     tcp_client.stop();
-    last_tcp_rx = 0;  // після повернення Wi-Fi канали знову мають довести, що шлюз відповідає
+    last_tcp_rx = 0;
     last_udp_rx = 0;
   }
   was_wifi = now_wifi;
 
-  // --- TCP-з'єднання з шлюзом (резервний канал) ---
   if (wifi_up() && gw_configured && !tcp_client.connected()) {
     static unsigned long last_tcp_attempt = 0;
     if (millis() - last_tcp_attempt > 3000) {
       last_tcp_attempt = millis();
       tcp_assembler.reset();
       if (tcp_client.connect(gateway_ip, tcp_port, 1500)) {
-        last_tcp_rx = 0;  // нове з'єднання: стара відмітка життя до нього не стосується
-        DBG.println("[TCP] Підключено до шлюзу (резервний канал).");
+        last_tcp_rx = 0;
+        DBG.println("[TCP] Connected to gateway (backup link).");
       }
     }
   }
 
-  // Поки TCP не основний, шлемо по ньому службовий ACK з невикористаним
-  // sequence -- шлюз бачить трафік і не закриває "тихе" з'єднання.
   if (tcp_client.connected() && active_channel() != CH_TCP) {
     static unsigned long last_keepalive = 0;
     if (millis() - last_keepalive >= TCP_KEEPALIVE_MS) {
       last_keepalive = millis();
-      SensorPacket ka = {0};
+      SensorPacket ka = {};
       ka.version = PROTOCOL_VERSION;
       ka.msg_type = MSG_ACK;
       ka.node_id = MY_NODE_ID;
@@ -950,7 +816,6 @@ void node_loop() {
     }
   }
 
-  // Проба Wi-Fi-каналів: без неї плата не дізнається, що шлюз зник (або повернувся)
   static unsigned long last_probe = 0;
   if (millis() - last_probe >= WIFI_PROBE_MS) {
     last_probe = millis();
@@ -967,15 +832,15 @@ void node_loop() {
   if (rst == RELIABLE_SUCCESS) {
     DBG.print("[ALARM] seq=");
     DBG.print(reliable.sequence);
-    DBG.print(" ДОСТАВЛЕНО, спроб=");
+    DBG.print(" delivered, attempts=");
     DBG.println(reliable.attempts);
     alarm_inflight_valid = false;
   } else if (rst == RELIABLE_EXHAUSTED) {
     DBG.print("[ALARM] seq=");
     DBG.print(reliable.sequence);
-    DBG.print(": RETRY ВИЧЕРПАНО, НЕ доставлено, спроб=");
+    DBG.print(": retries exhausted, NOT delivered, attempts=");
     DBG.print(reliable.attempts);
-    DBG.println(" -- повертаю в чергу, повторю пізніше");
+    DBG.println(" -- requeued, will retry later");
     if (alarm_inflight_valid) {
       alarm_requeue_front(&alarm_inflight);
       alarm_inflight_valid = false;
@@ -985,32 +850,28 @@ void node_loop() {
   }
   alarm_pump();
 
-  // Щойно з'явився канал -- вивантажуємо накопичене по пакету за прохід loop()
   static unsigned long last_flush_step = 0;
   if (!pq_empty(&tele_q) && transport_ready() && millis() - last_flush_step >= FLUSH_INTERVAL_MS) {
     last_flush_step = millis();
     flush_buffer_step();
   }
 
-  // Поки шлюз не підтвердив id, просимо його (раз на 2 с, коли є канал)
   static unsigned long last_hello = 0;
   if (!id_confirmed && transport_ready() && millis() - last_hello >= 2000) {
     last_hello = millis();
     send_hello();
   }
 
-  // Телеметрія кожні 5 секунд (лише коли є node_id)
   static unsigned long last_send = 0;
   if (millis() - last_send >= 5000) {
     last_send = millis();
     if (MY_NODE_ID != 0) send_telemetry();
   }
 
-  // Перемикання каналу -- видно в Serial
   static Channel last_channel = CH_NONE;
   Channel ch = active_channel();
   if (ch != last_channel) {
-    DBG.print("[КАНАЛ] ");
+    DBG.print("[LINK] ");
     DBG.print(channel_name(last_channel));
     DBG.print(" -> ");
     DBG.println(channel_name(ch));

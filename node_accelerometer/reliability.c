@@ -20,10 +20,10 @@ bool reliable_send_critical(ReliableCtx *ctx, const SensorPacket *pkt, uint64_t 
         return false;
     }
     if (pkt->msg_type != MSG_ALARM && pkt->msg_type != MSG_CONFIG) {
-        return false; /* best-effort типи сюди не заходять */
+        return false;
     }
     if (ctx->status == RELIABLE_WAITING) {
-        return false; /* попередня критична відправка ще не завершилась */
+        return false;
     }
 
     int len = protocol_pack(pkt, ctx->tx_buf, sizeof(ctx->tx_buf));
@@ -50,9 +50,6 @@ void reliable_on_ack_received(ReliableCtx *ctx, uint32_t ack_sequence) {
         ctx->status = RELIABLE_IDLE;
         ctx->pending_success = true;
     }
-    /* ACK на "старий", вже завершений sequence -- просто ігноруємо
-     * (наприклад, ACK на попередній ALARM дійшов із запізненням вже
-     * після того, як ми самі визнали retry вичерпаним). */
 }
 
 ReliableStatus reliable_tick(ReliableCtx *ctx, uint64_t now_ms) {
@@ -70,17 +67,14 @@ ReliableStatus reliable_tick(ReliableCtx *ctx, uint64_t now_ms) {
     }
 
     if (now_ms < ctx->deadline_ms) {
-        return RELIABLE_WAITING; /* ще чекаємо, дедлайн не настав */
+        return RELIABLE_WAITING;
     }
 
-    /* Дедлайн минув, ACK не прийшов. */
     if (ctx->attempts >= MAX_RETRIES + 1) {
-        ctx->status = RELIABLE_IDLE; /* звільняємо слот для наступної критичної відправки */
+        ctx->status = RELIABLE_IDLE;
         return RELIABLE_EXHAUSTED;
     }
 
-    /* Повторна спроба: ТОЙ САМИЙ tx_buf (ті самі байти, той самий
-     * sequence) -- нічого не перепаковуємо, просто шлемо ще раз. */
     ctx->attempts++;
     ctx->deadline_ms = now_ms + ACK_TIMEOUT_MS;
     ctx->send_fn(ctx->userdata, ctx->tx_buf, ctx->tx_len);

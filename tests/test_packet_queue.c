@@ -32,17 +32,17 @@ static void test_fifo_order(void) {
     SensorPacket st[CAP];
     PacketQueue q;
     pq_init(&q, st, CAP);
-    CHECK(pq_empty(&q) && pq_peek(&q) == NULL, "нова черга порожня, peek == NULL");
+    CHECK(pq_empty(&q) && pq_peek(&q) == NULL, "new queue is empty, peek returns NULL");
 
     for (uint32_t i = 1; i <= 3; i++) { SensorPacket p = mk(i); pq_push(&q, &p); }
-    CHECK(q.count == 3, "після 3 push у черзі 3 елементи");
-    CHECK(pq_peek(&q)->sequence == 1, "peek дає найстаріший, не видаляючи");
+    CHECK(q.count == 3, "3 pushes -> count is 3");
+    CHECK(pq_peek(&q)->sequence == 1, "peek returns the oldest without removing it");
 
     SensorPacket out;
     int ok = 1;
     for (uint32_t i = 1; i <= 3; i++) ok = ok && pq_pop(&q, &out) && out.sequence == i;
-    CHECK(ok, "pop повертає елементи в порядку додавання");
-    CHECK(!pq_pop(&q, &out) && !pq_pop(&q, NULL), "pop порожньої черги -> false");
+    CHECK(ok, "pop returns items in FIFO order");
+    CHECK(!pq_pop(&q, &out) && !pq_pop(&q, NULL), "pop on an empty queue returns false");
 }
 
 static void test_overflow_drops_oldest(void) {
@@ -52,19 +52,19 @@ static void test_overflow_drops_oldest(void) {
     pq_init(&q, st, CAP);
     bool any_overflow = false;
     for (uint32_t i = 1; i <= CAP; i++) { SensorPacket p = mk(i); any_overflow |= pq_push(&q, &p); }
-    CHECK(!any_overflow && q.dropped == 0, "до заповнення нічого не відкидається");
+    CHECK(!any_overflow && q.dropped == 0, "nothing is dropped before the queue is full");
 
     SensorPacket p = mk(100);
-    CHECK(pq_push(&q, &p), "push у повну чергу повідомляє про переповнення");
-    CHECK(q.count == CAP && q.dropped == 1, "ємність не перевищена, dropped = 1");
+    CHECK(pq_push(&q, &p), "push into a full queue reports overflow");
+    CHECK(q.count == CAP && q.dropped == 1, "capacity is respected, dropped = 1");
 
     SensorPacket out;
     pq_pop(&q, &out);
-    CHECK(out.sequence == 2, "відкинуто найстаріший (1), першим тепер 2");
+    CHECK(out.sequence == 2, "oldest (1) was dropped, head is now 2");
     int last_ok = 1;
     uint32_t expect[] = {3, 4, 100};
     for (int i = 0; i < 3; i++) last_ok = last_ok && pq_pop(&q, &out) && out.sequence == expect[i];
-    CHECK(last_ok, "решта в порядку, новий пакет в кінці");
+    CHECK(last_ok, "remaining order intact, newest at the tail");
 }
 
 static void test_wraparound(void) {
@@ -75,12 +75,11 @@ static void test_wraparound(void) {
     SensorPacket out;
     int ok = 1;
     uint32_t next_in = 0, next_out = 0;
-    /* багато циклів push/pop, щоб head кілька разів обійшов масив */
     for (int round = 0; round < 50; round++) {
         for (int k = 0; k < 3; k++) { SensorPacket p = mk(next_in++); pq_push(&q, &p); }
         for (int k = 0; k < 3; k++) ok = ok && pq_pop(&q, &out) && out.sequence == next_out++;
     }
-    CHECK(ok && pq_empty(&q) && q.dropped == 0, "порядок зберігається після багатьох обертань кільця");
+    CHECK(ok && pq_empty(&q) && q.dropped == 0, "order is preserved across many wrap-arounds");
 }
 
 static void test_push_front(void) {
@@ -91,22 +90,21 @@ static void test_push_front(void) {
     SensorPacket a = mk(10), b = mk(11), c = mk(5);
     pq_push(&q, &a);
     pq_push(&q, &b);
-    CHECK(!pq_push_front(&q, &c), "push_front у неповну чергу без втрат");
+    CHECK(!pq_push_front(&q, &c), "push_front into a non-full queue drops nothing");
     SensorPacket out;
     pq_pop(&q, &out);
-    CHECK(out.sequence == 5, "push_front ставить пакет на початок");
+    CHECK(out.sequence == 5, "push_front puts the packet at the head");
     pq_pop(&q, &out);
-    CHECK(out.sequence == 10, "далі йде те, що було першим");
+    CHECK(out.sequence == 10, "previous head follows");
 
-    /* повна черга: push_front відкидає НАЙНОВІШИЙ */
     pq_init(&q, st, CAP);
     for (uint32_t i = 1; i <= CAP; i++) { SensorPacket p = mk(i); pq_push(&q, &p); }
     SensorPacket f = mk(0);
-    CHECK(pq_push_front(&q, &f), "push_front у повну чергу повідомляє про переповнення");
+    CHECK(pq_push_front(&q, &f), "push_front into a full queue reports overflow");
     int ok = 1;
     uint32_t expect[] = {0, 1, 2, 3};
     for (int i = 0; i < CAP; i++) ok = ok && pq_pop(&q, &out) && out.sequence == expect[i];
-    CHECK(ok && q.dropped == 1, "відкинуто найновіший (4), порядок 0,1,2,3");
+    CHECK(ok && q.dropped == 1, "newest (4) was dropped, order is 0,1,2,3");
 }
 
 static void test_payload_preserved(void) {
@@ -122,7 +120,7 @@ static void test_payload_preserved(void) {
     SensorPacket out;
     pq_pop(&q, &out);
     CHECK(out.timestamp_ms == 123456789ULL && out.payload_len == 5 && memcmp(out.payload, "hello", 5) == 0,
-          "timestamp і payload (час створення пакета) не змінюються в черзі");
+          "timestamp and payload are preserved in the queue");
 }
 
 int main(void) {
@@ -132,7 +130,7 @@ int main(void) {
     test_push_front();
     test_payload_preserved();
     printf("\n----------------------------------------\n");
-    printf("Тестів: %d, провалено: %d\n", tests_run, tests_failed);
-    if (tests_failed == 0) printf("УСІ ТЕСТИ ПРОЙШЛИ\n");
+    printf("Tests: %d, failed: %d\n", tests_run, tests_failed);
+    if (tests_failed == 0) printf("ALL TESTS PASSED\n");
     return tests_failed == 0 ? 0 : 1;
 }

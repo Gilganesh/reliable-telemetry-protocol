@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="uk">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Телеметрія вузлів</title>
+<title>Telemetry Dashboard</title>
 <script src="/static/chart.umd.min.js"></script>
 <style>
   :root {
@@ -108,11 +108,11 @@
 </head>
 <body>
 <header>
-  <h1><span>●</span> Телеметрія вузлів</h1>
+  <h1><span>●</span> Telemetry Dashboard</h1>
   <span class="spacer"></span>
   <span id="gwPill" class="pill"><i class="dot"></i><span>Gateway</span></span>
   <span id="brokerPill" class="pill"><i class="dot"></i><span id="brokerText">MQTT</span></span>
-  <button class="btn small" id="btnAddNode">+ Вузол</button>
+  <button class="btn small" id="btnAddNode">+ Node</button>
   <button class="btn small" id="btnBroker">MQTT</button>
 </header>
 
@@ -120,83 +120,73 @@
   <div id="banner" class="banner hidden"></div>
 
   <section class="kpis">
-    <div class="kpi"><div class="label">Вузли online</div><div class="value" id="kOnline">–</div><div class="sub" id="kOnlineSub"></div></div>
-    <div class="kpi"><div class="label">Втрати пакетів</div><div class="value" id="kLoss">–</div><div class="sub">за всіма вузлами</div></div>
-    <div class="kpi"><div class="label">Дублікати</div><div class="value" id="kDup">–</div><div class="sub">відкинуто Gateway</div></div>
-    <div class="kpi"><div class="label">Пошкоджені</div><div class="value" id="kBad">–</div><div class="sub">відхилено за CRC</div></div>
-    <div class="kpi"><div class="label">Затримка (RTT)</div><div class="value" id="kLat">–</div><div class="sub">середня по online-вузлах</div></div>
-    <div class="kpi"><div class="label">Backlog</div><div class="value" id="kBacklog">–</div><div class="sub">пакетів чекає в буферах плат</div></div>
+    <div class="kpi"><div class="label">Nodes online</div><div class="value" id="kOnline">–</div><div class="sub">of known nodes</div></div>
+    <div class="kpi"><div class="label">Packet loss</div><div class="value" id="kLoss">–</div><div class="sub">across all nodes</div></div>
+    <div class="kpi"><div class="label">Duplicates</div><div class="value" id="kDup">–</div><div class="sub">discarded by gateway</div></div>
+    <div class="kpi"><div class="label">Corrupted</div><div class="value" id="kBad">–</div><div class="sub">rejected by CRC</div></div>
+    <div class="kpi"><div class="label">Latency (RTT)</div><div class="value" id="kLat">–</div><div class="sub">mean over online nodes</div></div>
+    <div class="kpi"><div class="label">Backlog</div><div class="value" id="kBacklog">–</div><div class="sub">packets queued on nodes</div></div>
   </section>
 
   <section>
-    <h2>Вузли</h2>
+    <h2>Nodes</h2>
     <div id="nodes" class="nodes"></div>
   </section>
 
   <section>
     <div class="row" style="justify-content: space-between">
-      <h2 style="margin:0">Графіки</h2>
-      <button class="btn small" id="btnAddChart">+ Графік</button>
+      <h2 style="margin:0">Charts</h2>
+      <button class="btn small" id="btnAddChart">+ Chart</button>
     </div>
     <div id="charts" class="charts"></div>
   </section>
 
   <section class="grid2">
     <div class="panel">
-      <h2>Журнал тривог</h2>
-      <div id="events" class="log"><div class="empty">Тривог ще не було</div></div>
+      <h2>Alarm log</h2>
+      <div id="events" class="log"><div class="empty">No alarms yet</div></div>
     </div>
     <div class="ctrl">
       <div class="panel">
-        <h2>Сервопривід</h2>
-        <div class="row"><label>Вузол</label><select id="servoNode"></select></div>
-        <div class="row"><label>Кут <b id="servoVal">90</b>°</label><input type="range" id="servoRange" min="0" max="180" value="90"></div>
-        <button class="btn primary" id="btnServo" style="width:100%">Повернути</button>
+        <h2>Servo</h2>
+        <div class="row"><label>Node</label><select id="servoNode"></select></div>
+        <div class="row"><label>Angle <b id="servoVal">90</b>°</label><input type="range" id="servoRange" min="0" max="180" value="90"></div>
+        <button class="btn primary" id="btnServo" style="width:100%">Set angle</button>
       </div>
       <div class="panel">
-        <h2>Перешкоди каналу</h2>
-        <div class="sub" id="impStatus" style="color:var(--muted);font-size:12px;margin-bottom:8px">Перешкод немає</div>
-        <div class="row"><label>Профіль</label>
+        <h2>Link impairment</h2>
+        <div class="sub" id="impStatus" style="color:var(--muted);font-size:12px;margin-bottom:8px">No impairment</div>
+        <div class="row"><label>Profile</label>
           <select id="impProfile">
-            <option value="good">good: без перешкод</option>
-            <option value="lossy20">lossy20: 20% втрат</option>
-            <option value="delay">delay: 200 мс + jitter</option>
-            <option value="flaky">flaky: втрати, дублі, биті, reorder</option>
+            <option value="good">good: clean link</option>
+            <option value="lossy20">lossy20: 20% loss</option>
+            <option value="delay">delay: 200 ms + jitter</option>
+            <option value="flaky">flaky: loss, duplicates, corruption, reorder</option>
           </select></div>
-        <div class="row"><label>Вузол</label><select id="impNode"></select></div>
-        <button class="btn primary" id="btnImpApply" style="width:100%">Застосувати профіль</button>
+        <div class="row"><label>Node</label><select id="impNode"></select></div>
+        <button class="btn primary" id="btnImpApply" style="width:100%">Apply profile</button>
         <div class="row" style="margin-top:8px">
-          <button class="btn danger" id="btnBlackout" style="flex:1">Розрив 30 с</button>
-          <button class="btn" id="btnBlackoutOff" style="flex:1">Скасувати розрив</button>
+          <button class="btn danger" id="btnBlackout" style="flex:1">Blackout 30 s</button>
+          <button class="btn" id="btnBlackoutOff" style="flex:1">Cancel blackout</button>
         </div>
-        <div class="sub" style="color:var(--muted);font-size:12px">Перешкоди вмикаються на шлюзі й діють на всі канали (UART/TCP/UDP) в обидва боки; лічильники скидаються при зміні профілю.</div>
-      </div>
-      <div class="panel">
-        <h2>Симуляція втрат</h2>
-        <div class="row"><label>Вузол</label><select id="lossNode"></select></div>
-        <div class="row"><label>Втрати %</label><input type="number" id="lossPct" min="0" max="100" value="20" style="width:80px"></div>
-        <div class="row">
-          <button class="btn primary" id="btnLossOn" style="flex:1">Увімкнути</button>
-          <button class="btn" id="btnLossOff" style="flex:1">Вимкнути</button>
-        </div>
-        <div class="sub" style="color:var(--muted);font-size:12px">Команди йдуть як CONFIG; чи виконує їх прошивка — залежить від вузла.</div>
+        <div class="sub" style="color:var(--muted);font-size:12px">Impairment is applied inside the gateway to every link (UART/TCP/UDP/MQTT) in both directions. Counters reset when the profile changes.</div>
       </div>
     </div>
   </section>
 </main>
 
 <dialog id="dlgNode">
-  <h3>Новий вузол</h3>
+  <h3>Add node</h3>
   <div class="row"><label>Node ID</label><input type="number" id="nId" min="1" max="65535" value="1"></div>
-  <div class="row"><label>Назва</label><input type="text" id="nName" maxlength="40"></div>
-  <div class="row"><label>IP</label><input type="text" id="nIp" maxlength="45" placeholder="необов'язково"></div>
-  <div class="row"><button class="btn primary" id="nSave" style="flex:1">Додати</button><button class="btn" data-close>Скасувати</button></div>
+  <div class="row"><label>Name</label><input type="text" id="nName" maxlength="40"></div>
+  <div class="row"><label>IP</label><input type="text" id="nIp" maxlength="45" placeholder="optional"></div>
+  <div class="row"><button class="btn primary" id="nSave" style="flex:1">Add</button><button class="btn" data-close>Cancel</button></div>
 </dialog>
 <dialog id="dlgBroker">
-  <h3>MQTT брокер</h3>
+  <h3>MQTT broker</h3>
   <div class="row"><label>Host</label><input type="text" id="bHost"></div>
-  <div class="row"><label>Порт</label><input type="number" id="bPort"></div>
-  <div class="row"><button class="btn primary" id="bSave" style="flex:1">Зберегти</button><button class="btn" data-close>Скасувати</button></div>
+  <div class="row"><label>Port</label><input type="number" id="bPort"></div>
+  <div class="row"><button class="btn primary" id="bSave" style="flex:1">Save</button><button class="btn" data-close>Cancel</button></div>
 </dialog>
 
 <script>
@@ -204,16 +194,15 @@
 const $ = id => document.getElementById(id);
 const esc = s => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; };
 const COLORS = ["#4f9cff", "#2dd4bf", "#fbbf24", "#f87171", "#a78bfa", "#f472b6"];
-const RANGES = { "5 хв": 300, "30 хв": 1800, "1 год": 3600, "6 год": 21600, "24 год": 86400 };
+const RANGES = { "5 min": 300, "30 min": 1800, "1 h": 3600, "6 h": 21600, "24 h": 86400 };
 
 let state = { nodes: [], mqtt_config: {} };
-let metrics = {};           // {node_id: [metric,...]}
-let charts = [];            // конфіги графіків
-let instances = {};         // id -> Chart
+let metrics = {};
+let charts = [];
+let instances = {};
 let nextId = 1;
 let lastSelectKey = "";
 
-/* ---------- збереження налаштувань графіків (лише зручність, не дані) ---------- */
 function loadCharts() {
   try {
     const raw = JSON.parse(localStorage.getItem("charts_v4") || "null");
@@ -234,13 +223,12 @@ async function api(path, method = "GET", data) {
 }
 function toast(msg) { const b = $("banner"); b.textContent = msg; b.className = "banner warn"; setTimeout(() => b.classList.add("hidden"), 4000); }
 
-/* ---------- вузли ---------- */
-function fmtMs(v) { return v == null ? "–" : (v < 10 ? v.toFixed(1) : Math.round(v)) + " мс"; }
+function fmtMs(v) { return v == null ? "–" : (v < 10 ? v.toFixed(1) : Math.round(v)) + " ms"; }
 
 function nodeCard(n) {
   const loss = Math.min(100, n.loss_rate || 0);
   const lossCls = loss > 10 ? "var(--bad)" : loss > 2 ? "var(--warn)" : "var(--ok)";
-  const seen = n.last_seen_s == null ? "ще не було пакетів" : n.last_seen_s + " с тому";
+  const seen = n.last_seen_s == null ? "no packets yet" : n.last_seen_s + " s ago";
   return `<div class="node ${n.online ? "" : "offline"} ${n.alarm_active ? "alarm" : ""}">
     <div class="node-head">
       <div><div class="title">#${n.node_id} ${esc(n.name)}</div><div class="sub mono">${esc(n.ip_address)}</div></div>
@@ -249,21 +237,21 @@ function nodeCard(n) {
       <span class="pill ${n.online ? "ok" : ""}"><i class="dot"></i>${n.online ? "online" : "offline"}</span>
     </div>
     <div class="stats">
-      <div><b style="color:var(--ok)">${n.received_count}</b><span>отримано</span></div>
-      <div><b style="color:var(--bad)">${n.lost_count}</b><span>втрачено</span></div>
-      <div><b style="color:var(--warn)">${n.duplicate_count}</b><span>дублікатів</span></div>
+      <div><b style="color:var(--ok)">${n.received_count}</b><span>received</span></div>
+      <div><b style="color:var(--bad)">${n.lost_count}</b><span>lost</span></div>
+      <div><b style="color:var(--warn)">${n.duplicate_count}</b><span>duplicates</span></div>
     </div>
     <div class="stats" style="margin-top:0">
-      <div><b>${fmtMs(n.latency_ms)}</b><span>затримка (RTT)</span></div>
+      <div><b>${fmtMs(n.latency_ms)}</b><span>latency (RTT)</span></div>
       <div><b style="color:${n.backlog > 0 ? "var(--warn)" : "inherit"}">${n.backlog == null ? "–" : n.backlog}</b><span>backlog</span></div>
-      <div><b style="color:${n.buffer_dropped > 0 ? "var(--bad)" : "inherit"}">${n.buffer_dropped || 0}</b><span>втрачено в буфері</span></div>
+      <div><b style="color:${n.buffer_dropped > 0 ? "var(--bad)" : "inherit"}">${n.buffer_dropped || 0}</b><span>dropped in buffer</span></div>
     </div>
     <div class="bar" title="loss rate"><i style="width:${Math.max(loss, 0.5)}%;background:${lossCls}"></i></div>
     <div class="node-foot">
       <span>loss ${loss.toFixed(1)}% · seq ${n.max_seq_seen} · ${seen}</span><span class="spacer"></span>
-      <button class="btn small" data-fire="${n.node_id}" title="Вузол сам створює ALARM з ACK/retry">ALARM з вузла</button>
-      ${n.alarm_active ? `<span class="pill bad">тривога</span><button class="btn small" data-alarm="${n.node_id}" data-state="0">Скинути</button>`
-                       : `<button class="btn small danger" data-alarm="${n.node_id}" data-state="1">Аларм</button>`}
+      <button class="btn small" data-fire="${n.node_id}" title="Ask the node to raise its own ALARM (ACK/retry)">Node ALARM</button>
+      ${n.alarm_active ? `<span class="pill bad">alarm</span><button class="btn small" data-alarm="${n.node_id}" data-state="0">Clear</button>`
+                       : `<button class="btn small danger" data-alarm="${n.node_id}" data-state="1">Alarm</button>`}
     </div>
   </div>`;
 }
@@ -286,12 +274,12 @@ function renderState() {
   const imp = state.impairment || {};
   if (imp.blackout_left_s > 0 || imp.active) {
     const parts = [];
-    if (imp.blackout_left_s > 0) parts.push(`<b style="color:var(--bad)">РОЗРИВ: ще ${imp.blackout_left_s.toFixed(0)} с</b>`);
-    parts.push(`профіль <b>${esc(imp.profile)}</b>${imp.node ? " · вузол #" + imp.node : " · всі вузли"}`);
-    parts.push(`втрати ${imp.loss}% · дублі ${imp.dup}% · биті ${imp.corrupt}% · затримка ${imp.delay_ms}+0..${imp.jitter_ms} мс`);
-    parts.push(`зіпсовано: вх. втрачено ${imp.dropped_up}, вих. втрачено ${imp.dropped_down}, дублів ${imp.duplicated}, битих ${imp.corrupted}, відкладено ${imp.delayed}`);
+    if (imp.blackout_left_s > 0) parts.push(`<b style="color:var(--bad)">BLACKOUT: ${imp.blackout_left_s.toFixed(0)} s left</b>`);
+    parts.push(`profile <b>${esc(imp.profile)}</b>${imp.node ? " · node #" + imp.node : " · all nodes"}`);
+    parts.push(`loss ${imp.loss}% · dup ${imp.dup}% · corrupt ${imp.corrupt}% · delay ${imp.delay_ms}+0..${imp.jitter_ms} ms`);
+    parts.push(`dropped up ${imp.dropped_up}, dropped down ${imp.dropped_down}, duplicated ${imp.duplicated}, corrupted ${imp.corrupted}, delayed ${imp.delayed}`);
     $("impStatus").innerHTML = parts.join("<br>");
-  } else $("impStatus").textContent = "Перешкод немає";
+  } else $("impStatus").textContent = "No impairment";
 
   const bp = $("brokerPill");
   bp.className = "pill " + (cfg.connected ? "ok" : "bad");
@@ -299,33 +287,29 @@ function renderState() {
   const gw = $("gwPill"), age = state.gateway_age_s;
   const gwAlive = age != null && age < 6;
   gw.className = "pill " + (gwAlive ? "ok" : cfg.connected ? "warn" : "");
-  gw.lastElementChild.textContent = gwAlive ? "Gateway активний" : "Gateway мовчить";
+  gw.lastElementChild.textContent = gwAlive ? "Gateway online" : "Gateway silent";
 
   const banner = $("banner");
   if (!cfg.connected) { banner.className = "banner"; banner.textContent = "MQTT: " + cfg.last_error; }
-  else if (!gwAlive) { banner.className = "banner warn"; banner.textContent = "Gateway не надсилає стан — статуси online/loss можуть бути застарілими."; }
+  else if (!gwAlive) { banner.className = "banner warn"; banner.textContent = "Gateway is not publishing state; online/loss figures may be stale."; }
   else banner.className = "banner hidden";
 
   $("nodes").innerHTML = nodes.length ? nodes.map(nodeCard).join("")
-    : `<div class="empty panel" style="grid-column:1/-1">Вузлів ще немає. Запустіть Gateway і вузол або додайте вузол вручну.</div>`;
+    : `<div class="empty panel" style="grid-column:1/-1">No nodes yet. Start the gateway and a node, or add a node manually.</div>`;
 
-  // селекти керування перемальовуємо лише коли змінився набір вузлів
   const key = nodes.map(n => n.node_id).join(",");
   if (key !== lastSelectKey) {
     lastSelectKey = key;
     const isel = $("impNode"), iprev = isel.value;
-    isel.innerHTML = `<option value="0">Усі вузли</option>` + nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
+    isel.innerHTML = `<option value="0">All nodes</option>` + nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
     if (iprev) isel.value = iprev;
-    for (const id of ["servoNode", "lossNode"]) {
-      const sel = $(id), prev = sel.value;
-      sel.innerHTML = nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
-      if (prev) sel.value = prev;
-    }
+    const ssel = $("servoNode"), sprev = ssel.value;
+    ssel.innerHTML = nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
+    if (sprev) ssel.value = sprev;
     renderCharts();
   }
 }
 
-/* ---------- графіки ---------- */
 function pickDefaults(c) {
   const ids = Object.keys(metrics);
   if (c.node == null || !metrics[c.node]) c.node = ids.length ? +ids[0] : (state.nodes[0] ? state.nodes[0].node_id : null);
@@ -338,13 +322,13 @@ function chartHtml(c) {
   const mlist = metrics[c.node] || [];
   return `<div class="chart" data-id="${c.id}">
     <div class="chart-bar">
-      <select data-f="node">${nodeIds.map(i => `<option value="${i}" ${i == c.node ? "selected" : ""}>Вузол #${i}</option>`).join("")}</select>
+      <select data-f="node">${nodeIds.map(i => `<option value="${i}" ${i == c.node ? "selected" : ""}>Node #${i}</option>`).join("")}</select>
       <select data-f="metric">${mlist.length ? mlist.map(m => `<option ${m == c.metric ? "selected" : ""}>${esc(m)}</option>`).join("") : "<option>—</option>"}</select>
       <select data-f="range">${Object.entries(RANGES).map(([l, s]) => `<option value="${s}" ${s == c.range ? "selected" : ""}>${l}</option>`).join("")}</select>
       <span class="spacer"></span>
-      <button class="btn small" data-rm="${c.id}" title="Видалити">✕</button>
+      <button class="btn small" data-rm="${c.id}" title="Remove">✕</button>
     </div>
-    <div class="chart-wrap"><canvas></canvas><div class="chart-empty">Даних поки немає</div></div>
+    <div class="chart-wrap"><canvas></canvas><div class="chart-empty">No data yet</div></div>
   </div>`;
 }
 
@@ -380,12 +364,12 @@ async function refreshCharts() {
     try {
       const d = await api(`/api/history?node_id=${c.node}&metric=${encodeURIComponent(c.metric)}&since_s=${c.range}`);
       const fmt = c.range > 3600 ? { hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit", second: "2-digit" };
-      inst.data.labels = d.points.map(p => new Date(p.t).toLocaleTimeString("uk-UA", fmt));
+      inst.data.labels = d.points.map(p => new Date(p.t).toLocaleTimeString("en-GB", fmt));
       inst.data.datasets[0].data = d.points.map(p => p.v);
       inst.data.datasets[0].label = c.metric;
       inst.update("none");
       box.classList.toggle("hidden", d.points.length > 0);
-    } catch (e) { /* наступна ітерація спробує знову */ }
+    } catch (e) {}
   }));
 }
 
@@ -403,20 +387,19 @@ $("charts").addEventListener("click", e => {
 });
 $("btnAddChart").onclick = () => { charts.push({ id: nextId++, node: null, metric: null, range: 300 }); saveCharts(); renderCharts(); };
 
-/* ---------- події, керування ---------- */
 async function refreshEvents() {
   try {
     const ev = await api("/api/events");
     $("events").innerHTML = ev.length
-      ? ev.map(e => `<div><time>${new Date(e.t).toLocaleTimeString("uk-UA")}</time><b>#${e.node_id}</b> <span class="mono">${esc(e.text)}</span></div>`).join("")
-      : `<div class="empty">Тривог ще не було</div>`;
+      ? ev.map(e => `<div><time>${new Date(e.t).toLocaleTimeString("en-GB")}</time><b>#${e.node_id}</b> <span class="mono">${esc(e.text)}</span></div>`).join("")
+      : `<div class="empty">No alarms yet</div>`;
   } catch (e) {}
 }
 
 $("nodes").addEventListener("click", async e => {
   const fire = e.target.dataset.fire;
   if (fire) {
-    try { const r = await api(`/api/node-alarm/${fire}`, "POST", {}); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); }
+    try { const r = await api(`/api/node-alarm/${fire}`, "POST", {}); if (!r.sent) toast("Not sent: no MQTT connection"); }
     catch (err) { toast(err.message); }
     return;
   }
@@ -426,25 +409,18 @@ $("nodes").addEventListener("click", async e => {
 });
 $("servoRange").oninput = e => $("servoVal").textContent = e.target.value;
 $("btnServo").onclick = async () => {
-  try { const r = await api(`/api/servo/${$("servoNode").value}`, "POST", { angle: +$("servoRange").value }); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); }
+  try { const r = await api(`/api/servo/${$("servoNode").value}`, "POST", { angle: +$("servoRange").value }); if (!r.sent) toast("Not sent: no MQTT connection"); }
   catch (e) { toast(e.message); }
 };
-async function sendLoss(on) {
-  try { const r = await api(`/api/simulate-loss/${$("lossNode").value}`, "POST", { loss_percent: on ? +$("lossPct").value : 0 }); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); }
-  catch (e) { toast(e.message); }
-}
-$("btnLossOn").onclick = () => sendLoss(true);
-$("btnLossOff").onclick = () => sendLoss(false);
 
 async function sendImpair(body) {
-  try { const r = await api("/api/impairment", "POST", body); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); tick(); }
+  try { const r = await api("/api/impairment", "POST", body); if (!r.sent) toast("Not sent: no MQTT connection"); tick(); }
   catch (e) { toast(e.message); }
 }
 $("btnImpApply").onclick = () => sendImpair({ profile: $("impProfile").value, node: +$("impNode").value });
 $("btnBlackout").onclick = () => sendImpair({ blackout_s: 30, node: +$("impNode").value });
 $("btnBlackoutOff").onclick = () => sendImpair({ blackout_s: 0 });
 
-/* ---------- діалоги ---------- */
 document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest("dialog").close());
 $("btnAddNode").onclick = () => $("dlgNode").showModal();
 $("nSave").onclick = async () => {
@@ -457,10 +433,9 @@ $("bSave").onclick = async () => {
   catch (e) { toast(e.message); }
 };
 
-/* ---------- цикл оновлення ---------- */
 async function tick() {
   try { state = await api("/api/state"); renderState(); }
-  catch (e) { $("banner").className = "banner"; $("banner").textContent = "Немає зв'язку з веб-сервером"; }
+  catch (e) { $("banner").className = "banner"; $("banner").textContent = "Cannot reach the web server"; }
 }
 let n = 0;
 async function slowTick() {

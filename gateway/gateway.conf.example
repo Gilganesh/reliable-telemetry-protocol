@@ -1,17 +1,17 @@
-# Скопіюйте в gateway.conf (він у .gitignore -- паролі Wi-Fi не потрапляють у git).
+# Copy to gateway.conf (ignored by git, so Wi-Fi passwords never get committed).
 #
-# Список відомих мереж: кожен рядок wifi_ssid починає новий запис, wifi_pass
-# одразу після нього -- пароль цієї мережі. Шлюз бере запис, що збігається з
-# Wi-Fi, до якої Pi підключена ЗАРАЗ; змінили мережу Pi -- плати
-# перенастроюються на нову самі. Якщо мережі в списку нема, пароль шукається
-# в NetworkManager (nmcli, у т.ч. через sudo -n).
-wifi_ssid = НазваМережі1
-wifi_pass = Пароль1
+# Known networks: every wifi_ssid line starts a new entry and the wifi_pass line
+# right after it is that network's password. The gateway picks the entry that
+# matches the Wi-Fi the host is currently connected to and re-provisions nodes
+# when the host switches networks. If the current network is not listed, the
+# password is looked up in NetworkManager (nmcli, also via sudo -n).
+wifi_ssid = MyNetwork1
+wifi_pass = Password1
 
-wifi_ssid = НазваМережі2
-wifi_pass = Пароль2
+wifi_ssid = MyNetwork2
+wifi_pass = Password2
 
-# Необов'язково (за замовчуванням IP шлюз визначає сам):
+# Optional overrides (by default the gateway detects its own IP):
 # gateway_ip = 192.168.2.2
 # udp_port = 5005
 # tcp_port = 5006

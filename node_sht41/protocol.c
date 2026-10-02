@@ -28,10 +28,6 @@ int protocol_pack(const SensorPacket *pkt, uint8_t *out_buf, size_t out_buf_size
 
     uint8_t *p = out_buf;
 
-    /* Пишемо заголовок ПОЛЕ ЗА ПОЛЕМ, у чіткому, домовленому порядку.
-     * memcpy, а не пряме присвоєння через вказівник -- бо `p` посередині
-     * буфера не гарантовано вирівняний під 2/4/8-байтові типи, а memcpy
-     * коректно копіює байти незалежно від вирівнювання. */
     memcpy(p, &pkt->version,      1); p += 1;
     memcpy(p, &pkt->msg_type,     1); p += 1;
     memcpy(p, &pkt->node_id,      2); p += 2;
@@ -39,11 +35,9 @@ int protocol_pack(const SensorPacket *pkt, uint8_t *out_buf, size_t out_buf_size
     memcpy(p, &pkt->timestamp_ms, 8); p += 8;
     memcpy(p, &pkt->payload_len,  2); p += 2;
 
-    /* Лише payload_len байт payload -- НЕ весь 128-байтовий буфер */
     memcpy(p, pkt->payload, pkt->payload_len);
     p += pkt->payload_len;
 
-    /* CRC рахуємо від УСЬОГО, що вже записали в out_buf (заголовок + payload) */
     uint32_t crc = crc32(out_buf, (size_t)(p - out_buf));
     memcpy(p, &crc, 4);
     p += 4;

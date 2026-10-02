@@ -6,25 +6,24 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
 
-  // Классическая ESP32: SDA = GPIO 21, SCL = GPIO 22
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
   delay(1000);
-  Serial.println("Инициализация MPU9250...");
+  Serial.println("Initializing MPU9250...");
 
-  if (!mpu.setup(0x68)) { // Wire используется по умолчанию
-    Serial.println("MPU9250 не найден! Проверь подключение и адрес.");
+  if (!mpu.setup(0x68)) {
+    Serial.println("MPU9250 not found, check wiring and I2C address.");
     while (1) delay(10);
   }
-  Serial.println("MPU9250 найден ✔");
+  Serial.println("MPU9250 found");
 
-  Serial.println("Калибровка акселерометра и гироскопа...");
-  Serial.println("НЕ ДВИГАЙ ДАТЧИК!");
+  Serial.println("Calibrating accelerometer and gyroscope...");
+  Serial.println("Keep the sensor still.");
   delay(2000);
 
   mpu.calibrateAccelGyro();
-  Serial.println("Калибровка завершена. Начинаем вывод данных.\n");
+  Serial.println("Calibration complete, streaming data.\n");
 }
 
 void loop() {

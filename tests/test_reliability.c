@@ -16,9 +16,6 @@ static int tests_failed = 0;
     } \
 } while (0)
 
-/* ---- Фейковий "передавач": замість реального MQTT просто записує
- * кожен відправлений пакет у масив, щоб тест міг перевірити скільки
- * разів і що саме було "відправлено". ---- */
 #define MAX_RECORDED_SENDS 16
 
 static uint8_t sent_bufs[MAX_RECORDED_SENDS][RELIABLE_MAX_PACKET];
@@ -61,19 +58,18 @@ static void test_success_on_first_ack(void) {
 
     SensorPacket pkt = make_alarm(10);
     bool started = reliable_send_critical(&ctx, &pkt, 0);
-    CHECK(started, "reliable_send_critical стартує успішно для MSG_ALARM");
-    CHECK(sent_count == 1, "перша спроба відправлена одразу, без чекання");
-    CHECK(reliable_is_busy(&ctx), "після старту є активна критична відправка");
+    CHECK(started, "reliable_send_critical starts for MSG_ALARM");
+    CHECK(sent_count == 1, "first attempt is sent immediately");
+    CHECK(reliable_is_busy(&ctx), "context is busy after start");
 
-    /* ACK приходить швидко, задовго до дедлайну (2000мс). */
     reliable_on_ack_received(&ctx, 10);
     ReliableStatus st = reliable_tick(&ctx, 100);
-    CHECK(st == RELIABLE_SUCCESS, "tick() повертає SUCCESS одразу після ACK");
-    CHECK(!reliable_is_busy(&ctx), "після SUCCESS слот знову вільний");
+    CHECK(st == RELIABLE_SUCCESS, "tick() returns SUCCESS right after ACK");
+    CHECK(!reliable_is_busy(&ctx), "context is free after SUCCESS");
 
     ReliableStatus st2 = reliable_tick(&ctx, 200);
-    CHECK(st2 == RELIABLE_IDLE, "SUCCESS -- одноразовий сигнал, вдруге вже IDLE");
-    CHECK(sent_count == 1, "жодної повторної відправки не було потрібно");
+    CHECK(st2 == RELIABLE_IDLE, "SUCCESS is reported once, then IDLE");
+    CHECK(sent_count == 1, "no retransmission was needed");
 }
 
 static void test_retry_then_success(void) {
@@ -84,18 +80,16 @@ static void test_retry_then_success(void) {
 
     SensorPacket pkt = make_alarm(20);
     reliable_send_critical(&ctx, &pkt, 0);
-    CHECK(sent_count == 1, "1-ша спроба відправлена одразу");
+    CHECK(sent_count == 1, "first attempt is sent immediately");
 
-    /* ACK не приходить до дедлайну -- tick рівно на дедлайні має повторити. */
     ReliableStatus st = reliable_tick(&ctx, ACK_TIMEOUT_MS);
-    CHECK(st == RELIABLE_WAITING, "після retry статус все ще WAITING (не EXHAUSTED)");
-    CHECK(sent_count == 2, "дедлайн вийшов -> 2-га спроба відправлена");
-    CHECK(ctx.attempts == 2, "лічильник спроб піднявся до 2");
+    CHECK(st == RELIABLE_WAITING, "status stays WAITING after a retry");
+    CHECK(sent_count == 2, "deadline passed -> second attempt sent");
+    CHECK(ctx.attempts == 2, "attempt counter is 2");
 
-    /* Тепер ACK нарешті приходить. */
     reliable_on_ack_received(&ctx, 20);
     st = reliable_tick(&ctx, ACK_TIMEOUT_MS + 50);
-    CHECK(st == RELIABLE_SUCCESS, "після 2-ї спроби ACK таки підтверджує доставку");
+    CHECK(st == RELIABLE_SUCCESS, "ACK after the second attempt confirms delivery");
 }
 
 static void test_exhausted_after_max_retries(void) {
@@ -109,25 +103,23 @@ static void test_exhausted_after_max_retries(void) {
 
     uint64_t now = 0;
     ReliableStatus st = RELIABLE_WAITING;
-    /* ACK ніколи не приходить. Псевдокод: attempts від 0 до MAX_RETRIES
-     * включно (це MAX_RETRIES+1 спроб усього), потім RETRY ВИЧЕРПАНО. */
     for (int i = 0; i < MAX_RETRIES; i++) {
         now += ACK_TIMEOUT_MS;
         st = reliable_tick(&ctx, now);
-        CHECK(st == RELIABLE_WAITING, "проміжні дедлайни -> ще WAITING, ще є спроби");
+        CHECK(st == RELIABLE_WAITING, "intermediate deadlines -> still WAITING");
     }
     CHECK(sent_count == MAX_RETRIES + 1,
-          "усього відправлено рівно MAX_RETRIES+1 копій пакета");
+          "exactly MAX_RETRIES+1 copies were sent");
 
     now += ACK_TIMEOUT_MS;
     st = reliable_tick(&ctx, now);
-    CHECK(st == RELIABLE_EXHAUSTED, "після останнього дедлайну -> RETRY ВИЧЕРПАНО");
-    CHECK(!reliable_is_busy(&ctx), "після EXHAUSTED слот знову вільний");
+    CHECK(st == RELIABLE_EXHAUSTED, "last deadline -> EXHAUSTED");
+    CHECK(!reliable_is_busy(&ctx), "context is free after EXHAUSTED");
 
     st = reliable_tick(&ctx, now + 10);
-    CHECK(st == RELIABLE_IDLE, "EXHAUSTED -- теж одноразовий сигнал, вдруге вже IDLE");
+    CHECK(st == RELIABLE_IDLE, "EXHAUSTED is reported once, then IDLE");
     CHECK(sent_count == MAX_RETRIES + 1,
-          "після EXHAUSTED жодної зайвої відправки більше не було");
+          "no sends after EXHAUSTED");
 }
 
 static void test_same_bytes_resent(void) {
@@ -138,16 +130,16 @@ static void test_same_bytes_resent(void) {
 
     SensorPacket pkt = make_alarm(40);
     reliable_send_critical(&ctx, &pkt, 0);
-    reliable_tick(&ctx, ACK_TIMEOUT_MS);      /* retry #1 */
-    reliable_tick(&ctx, 2 * ACK_TIMEOUT_MS);  /* retry #2 */
+    reliable_tick(&ctx, ACK_TIMEOUT_MS);
+    reliable_tick(&ctx, 2 * ACK_TIMEOUT_MS);
 
-    CHECK(sent_count == 3, "3 копії відправлено (1 оригінал + 2 retry)");
+    CHECK(sent_count == 3, "3 copies sent (1 original + 2 retries)");
     CHECK(sent_lens[0] == sent_lens[1] && sent_lens[1] == sent_lens[2],
-          "довжина пакета однакова на всіх спробах");
+          "packet length is identical across attempts");
     CHECK(memcmp(sent_bufs[0], sent_bufs[1], (size_t)sent_lens[0]) == 0,
-          "байти 1-ї та 2-ї спроби побайтово ідентичні (sequence НЕ змінився)");
+          "attempts 1 and 2 are byte-identical (same sequence)");
     CHECK(memcmp(sent_bufs[1], sent_bufs[2], (size_t)sent_lens[1]) == 0,
-          "байти 2-ї та 3-ї спроби побайтово ідентичні");
+          "attempts 2 and 3 are byte-identical");
 }
 
 static void test_busy_blocks_new_send(void) {
@@ -159,10 +151,10 @@ static void test_busy_blocks_new_send(void) {
     SensorPacket first = make_alarm(50);
     SensorPacket second = make_alarm(51);
     CHECK(reliable_send_critical(&ctx, &first, 0),
-          "перша критична відправка стартує");
+          "first critical send starts");
     CHECK(!reliable_send_critical(&ctx, &second, 10),
-          "друга відправка відхиляється, поки перша ще активна (немає черги)");
-    CHECK(sent_count == 1, "друга спроба не спричинила зайвої відправки");
+          "second send is rejected while the first is in flight");
+    CHECK(sent_count == 1, "rejected send does not transmit");
 }
 
 static void test_ack_wrong_sequence_ignored(void) {
@@ -174,10 +166,10 @@ static void test_ack_wrong_sequence_ignored(void) {
     SensorPacket pkt = make_alarm(60);
     reliable_send_critical(&ctx, &pkt, 0);
 
-    reliable_on_ack_received(&ctx, 9999); /* ACK на зовсім інший sequence */
+    reliable_on_ack_received(&ctx, 9999);
     ReliableStatus st = reliable_tick(&ctx, 100);
     CHECK(st == RELIABLE_WAITING,
-          "ACK з чужим sequence ігнорується, відправка й далі активна");
+          "ACK with a different sequence is ignored");
 }
 
 static void test_non_critical_rejected(void) {
@@ -187,10 +179,10 @@ static void test_non_critical_rejected(void) {
     reliable_init(&ctx, fake_send, NULL);
 
     SensorPacket pkt = make_alarm(70);
-    pkt.msg_type = MSG_TELEMETRY; /* не критичний тип */
+    pkt.msg_type = MSG_TELEMETRY;
     bool started = reliable_send_critical(&ctx, &pkt, 0);
-    CHECK(!started, "MSG_TELEMETRY відхиляється -- цей механізм тільки для ALARM/CONFIG");
-    CHECK(sent_count == 0, "нічого не відправлено для не-критичного типу");
+    CHECK(!started, "MSG_TELEMETRY is rejected (ALARM/CONFIG only)");
+    CHECK(sent_count == 0, "nothing is sent for a non-critical type");
 }
 
 int main(void) {
@@ -203,11 +195,11 @@ int main(void) {
     test_non_critical_rejected();
 
     printf("\n----------------------------------------\n");
-    printf("Тестів: %d, провалено: %d\n", tests_run, tests_failed);
+    printf("Tests: %d, failed: %d\n", tests_run, tests_failed);
     if (tests_failed == 0) {
-        printf("УСІ ТЕСТИ ПРОЙШЛИ\n");
+        printf("ALL TESTS PASSED\n");
         return 0;
     }
-    printf("Є ПРОВАЛЕНІ ТЕСТИ\n");
+    printf("SOME TESTS FAILED\n");
     return 1;
 }

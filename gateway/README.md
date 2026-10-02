@@ -1,89 +1,92 @@
-# gateway/
+# Gateway
 
-Сюди йде C-програма шлюзу (Блок C): підписка на MQTT, розбір пакетів,
-трекінг вузлів, dashboard.
-Інструкція: `docs/team-blocks/block-C-gateway.md`.
+Single-process C daemon that receives frames from every node, validates and tracks them, acknowledges critical
+messages and publishes its state over MQTT.
 
-## 30.09 — публікує свій стан для веб-дашборду (Блок E)
+## Build and run
 
-Раз на 2с (разом з термінальним дашбордом) `gateway.c` публікує оброблений
-стан кожного вузла (received/lost/duplicate/online/loss_rate) як JSON у
-топік `case24/gateway/state` (`publish_gateway_state()`). Це зроблено,
-щоб `web/app.py` НЕ парсив сирий `case24/uplink` сам і не рахував
-loss/duplicate/online другою, незалежною реалізацією — контракт
-(`00-overview-shared-contract.md`) віддає цю роботу винятково Gateway.
-Веб лише підписується на `case24/gateway/state` і відображає готове.
+```bash
+make            # needs libmosquitto and libcjson
+./gateway
+```
 
-Не змінюй формат цього JSON без узгодження з тим, хто веде Блок E
-(`web/app.py` парсить його поля за іменами).
+Run it from this directory: it reads `gateway.conf`, appends events to `gateway_log.txt` and keeps the MAC → node id
+registry in `node_registry.txt` in the working directory. A terminal dashboard is printed every 2 seconds.
 
-## 30.09 (3) — MQTT більше не єдиний вхід: додано UDP/TCP/UART
+## Inputs
 
-Кейс вимагає, щоб транспортний рівень був замінним без переписування
-логіки протоколу (`00-overview-shared-contract.md`, розділ "Чому все ще
-потрібен Transport-адаптер"). Раніше це було лише документом-наміром —
-`mosquitto_publish`/підписка викликались напряму. Тепер `gateway.c`
-слухає ОДНОЧАСНО чотири канали, всі — через один спільний
-`handle_packet()`:
+| Link | Details |
+|---|---|
+| UDP | port 5005, one frame per datagram |
+| TCP | port 5006, up to 4 clients, connections idle for 20 s are closed |
+| UART | scans `/dev/ttyUSB*` and `/dev/ttyACM*` every 2 s (override with `GATEWAY_UART`), up to 4 ports, 115200 8N1. A port becomes active once a valid frame arrives; unplugged ports are closed automatically |
+| MQTT | subscribes to `telemetry/uplink` on `127.0.0.1:1883`, reconnects automatically; the gateway keeps working without a broker |
 
-| Канал | Як підняти | Порт/пристрій |
-|---|---|---|
-| MQTT | як і раніше, `mosquitto_connect` | `case24/uplink`, брокер localhost:1883 |
-| UDP | `setup_udp()` / `poll_udp()` | `UDP_PORT = 5005` |
-| TCP | `setup_tcp()` / `poll_tcp()` | `TCP_PORT = 5006`, приймає 1 з'єднання |
-| UART | `setup_uart()` / `poll_uart()` | `UART_DEVICE = "/dev/ttyUSB0"` (USB-TTL перехідник), 115200 8N1 |
+Every link feeds the same `handle_packet()` path, and replies (ACKs, commands, pings) go back over the link the
+node was last heard on.
 
-**MQTT лишився** — не для фізичних плат (ті йдуть через UDP/TCP/UART),
-а для `sim_node`/сумісності зі старими скриптами. Прибирати не треба.
+## Node tracking
 
-**Як це працює:** кожен канал у своєму `poll_*()` збирає сирі байти
-(UDP — датаграма вже ціла; TCP/UART — байтовий потік, тому є
-`FrameReader`, що складає кадр по одному байту, дивлячись на
-`payload_len` у заголовку), і передає їх у `handle_packet()` — ту саму
-функцію, що робить `protocol_unpack`, дедуп, лічильники, дашборд, ACK.
-Жодна з цих функцій не знає і не питає, яким каналом прийшли байти.
-**ACK на критичне повідомлення йде НАЗАД тим самим каналом**, яким
-прийшов оригінал (`ReplyRoute` + `route_reply()`), а не завжди в MQTT.
+- **Sequence window**: the last 64 sequence numbers per node distinguish duplicates from late packets. Gaps count as
+  loss and are credited back if the packet arrives later.
+- **Critical messages**: ALARM/CONFIG sequence numbers are remembered separately, so a retry that arrives long after
+  newer traffic is still deduplicated rather than mistaken for a node restart.
+- **Restarts**: a HELLO from a known MAC (or a sharp drop in the node's uptime timestamp) resets sequence tracking.
+- **Online state**: a node goes offline after 15 s without traffic.
+- **Latency**: every 5 s each online node receives `CONFIG {"cmd":"ping"}`; the ACK gives a round-trip time measured on
+  the gateway clock (exponential moving average, α = 0.3).
+- **Backlog**: nodes append `backlog` and `dropped` to their telemetry; the gateway reports the values from the newest
+  packet.
 
-**Якщо UART не піднявся** (`setup_uart()` не знайшов
-`/dev/ttyUSB0`) — гейтвей просто друкує попередження і продовжує
-працювати з рештою каналів; перевір `ls /dev/ttyUSB*` після підключення
-перехідника і, якщо шлях інший, зміни `UART_DEVICE` вгорі `gateway.c`.
+## Node id assignment and provisioning
 
-**Дашборд і `case24/gateway/state`** тепер показують колонку/поле
-`transport` (MQTT/UDP/TCP/UART) — яким каналом прийшов ОСТАННІЙ пакет
-цього вузла. `web/app.py` вже показує це кольоровим бейджем у таблиці.
+A booting node sends a HELLO (`HEARTBEAT` with `node_id = 0` and `{"mac": ..., "id": ...}`). The gateway answers with
+`CONFIG {"cmd":"id","mac":...,"id":N}`, assigning the lowest free id and persisting it per MAC address.
 
-Відповідний `node_esp32.ino` (Блок B) вибирає режим через
-`NODE_TRANSPORT` на початку файлу — дивись `node_esp32/README.md`.
+When a node is seen on UART, the gateway sends two `CONFIG` frames until both are acknowledged:
 
-## Автоналаштування плат по UART, кілька TCP-клієнтів
+```json
+{"cmd":"wifi","s":"<ssid>","p":"<password>"}
+{"cmd":"gw","ip":"<gateway ip>","udp":5005,"tcp":5006}
+```
 
-- Шлюз щосекунди шле по UART "пінг" (HEARTBEAT, node_id=0): за ним плата
-  розуміє, що дріт живий.
-- Коли вузол з'являється на UART, шлюз двома CONFIG-пакетами передає йому
-  Wi-Fi (SSID/пароль) і власну IP з портами UDP/TCP; повторює кожні 3 с до
-  ACK. Джерела налаштувань: `gateway.conf` (див. `gateway.conf.example`,
-  не в git) -> автовизначення (IP з інтерфейсів, SSID/пароль через `nmcli`).
-- TCP приймає до 4 клієнтів одночасно; "тихе" з'єднання без даних 20 с
-  закривається.
-- UART: шлюз сам знаходить усі `/dev/ttyUSB*` і `/dev/ttyACM*` (до 4 портів), шле на кожен
-  пробний пінг і визнає "своїм" порт, звідки прийшов валідний кадр протоколу
-  (`[UART] ...: пристрій відповів`). Порт без відповіді 15 с лишається відкритим, у лог іде
-  попередження. Номер `ttyUSBx` скаче при перепідключенні, тому порти розрізняються за
-  `realpath`, а нові шукаються кожні 2 с. Зниклий порт закривається сам.
-  Обмежити пошук можна: `GATEWAY_UART='/dev/serial/by-id/usb-FTDI*' ./gateway`.
-- Перезапуск плати визначається і за timestamp (millis() різко впав), а не
-  лише за sequence.
+The IP is taken from the active network interface. The SSID and password come from the active NetworkManager
+connection (`nmcli`, also tried via `sudo -n`) or from `gateway.conf`, which may list several networks
+(see `gateway.conf.example`). Network detection runs in a background thread every 10 s, and nodes are re-provisioned
+when the host changes networks.
 
-## node_id призначає шлюз (за старшинством)
+## Published state
 
-Плата шле HELLO (HEARTBEAT з node_id=0 і `{"mac":..,"id":..}`), шлюз повертає
-CONFIG `{"cmd":"id","mac":..,"id":N}`. Хто перший з'явився на шлюзі, той
-отримує найменший вільний id (1, 2, 3...). Реєстр MAC -> id лежить у
-`node_registry.txt` (не в git), тож id стабільні між перезапусками шлюзу.
-Плата, що мала прописаний id, який не збігається з реєстром, перезаписує його.
-Скинути нумерацію: зупинити шлюз і видалити `node_registry.txt`.
-Вузли без HELLO (наприклад, `sim_node` з id 99 по MQTT) працюють як раніше,
-шлюз лише не віддає їхні id іншим платам, поки вони на зв'язку.
+`telemetry/gateway/state` (every 2 s):
 
+```json
+{
+  "nodes": [{"node_id": 1, "online": true, "transport": "UART", "received_count": 120, "lost_count": 2,
+             "duplicate_count": 1, "max_seq_seen": 121, "loss_rate": 1.6, "last_seen_ms_ago": 830,
+             "latency_ms": 14.2, "backlog": 0, "buffer_dropped": 0}],
+  "corrupted_count": 0,
+  "impairment": {"profile": "good", "active": false, "loss": 0, "dup": 0, "corrupt": 0, "delay_ms": 0,
+                 "jitter_ms": 0, "node": 0, "blackout_left_s": 0, "dropped_up": 0, "dropped_down": 0,
+                 "duplicated": 0, "corrupted": 0, "delayed": 0}
+}
+```
+
+`telemetry/gateway/telemetry` (every accepted, non-duplicate packet):
+
+```json
+{"node_id": 1, "sequence": 121, "ts_ms": 605123, "type": 1, "transport": "UART",
+ "payload": {"temperature": 23.4, "humidity": 41.2, "backlog": 0, "dropped": 0}}
+```
+
+## Impairment control
+
+Publish to `telemetry/gateway/control`:
+
+```json
+{"cmd": "impair", "profile": "lossy20", "node": 0, "seed": 42}
+{"cmd": "impair", "loss": 5, "delay_ms": 50, "jitter_ms": 20}
+{"cmd": "impair", "blackout_s": 30}
+```
+
+`profile` resets all parameters first; individual fields then adjust the current state; `blackout_s` leaves the
+profile untouched (`0` cancels a blackout). `node = 0` applies to all nodes. Counters reset when the profile changes.
