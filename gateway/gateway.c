@@ -863,6 +863,10 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
     }
     cJSON *had_j = cJSON_GetObjectItemCaseSensitive(j, "id");
     unsigned had = cJSON_IsNumber(had_j) ? (unsigned)had_j->valuedouble : 0;
+    // "probe":1 -- плата вже має підтверджений id і лише перевіряє, що шлюз на зв'язку
+    // (раз на кілька секунд по Wi-Fi). Це не перезавантаження, тож облік sequence не скидаємо.
+    cJSON *probe_j = cJSON_GetObjectItemCaseSensitive(j, "probe");
+    bool is_probe = cJSON_IsNumber(probe_j) && probe_j->valuedouble != 0;
 
     bool is_new;
     uint16_t id = registry_assign(mac_j->valuestring, &is_new);
@@ -879,7 +883,7 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
     // HELLO шле лише плата, що щойно завантажилась (id ще не підтверджено в цій
     // сесії). Це надійніша ознака перезапуску, ніж евристика за sequence/timestamp:
     // та плутає запізнілий ALARM із перезапуском.
-    for (int i = 0; i < node_count; i++) {
+    for (int i = 0; !is_probe && i < node_count; i++) {
         if (nodes[i].node_id == id && nodes[i].max_seq_seen != -1) {
             log_event("[СТАТУС] Вузол %u перезапустився (HELLO від %s). Скидаю відстеження sequence\n",
                        id, mac_j->valuestring);

@@ -116,6 +116,11 @@ bool id_confirmed = false;          // шлюз підтвердив id у ці�
 #define ALARM_QUEUE_CAP   8         // критичні повідомлення, що чекають на канал
 #define ALARM_RETRY_COOLDOWN_MS 5000 // пауза після "retry вичерпано", перш ніж пробувати знову
 #define TCP_KEEPALIVE_MS  5000      // щоб шлюз не закрив "тихе" резервне TCP
+// Wi-Fi-канал вважається живим лише поки шлюз ВІДПОВІДАЄ на ньому. Сам факт "є Wi-Fi" /
+// "сокет connected" нічого не гарантує: за мертвого шлюзу UDP-пакет мовчки зникає, а
+// запис у TCP з обривом без FIN "успішний" ще хвилини. Тож пакети не йшли в буфер.
+#define WIFI_PROBE_MS        2000   // як часто питати шлюз "ти там?" (HELLO-проба по TCP і UDP)
+#define WIFI_LINK_TIMEOUT_MS 7000   // стільки без жодного кадру від шлюзу по каналу = канал мертвий (~3 проби)
 
 // ---- Налаштування, що приходять від шлюзу (зберігаються в NVS) ----
 Preferences prefs;
@@ -133,6 +138,10 @@ WiFiClient tcp_client;
 bool udp_started = false;
 
 unsigned long last_wire_rx = 0;     // millis() останнього валідного кадру по UART
+// Те саме для Wi-Fi, окремо по транспортах: TCP може бути "мертвим" (обрив без FIN),
+// коли UDP ще працює, тож свіжість міряємо для кожного.
+unsigned long last_tcp_rx = 0;
+unsigned long last_udp_rx = 0;
 
 uint32_t seq_counter = 0;           // наскрізний sequence для TELEMETRY і ALARM
 // Буфер телеметрії (store-and-forward): при переповненні відкидається найстаріше.
@@ -207,8 +216,12 @@ bool wire_alive() {
   return last_wire_rx != 0 && (millis() - last_wire_rx) < WIRE_TIMEOUT_MS;
 }
 bool wifi_up() { return wifi_configured && WiFi.status() == WL_CONNECTED; }
-bool tcp_up()  { return wifi_up() && gw_configured && tcp_client.connected(); }
-bool udp_up()  { return wifi_up() && gw_configured && udp_started; }
+// Канал "живий" = є з'єднання І шлюз щойно відповідав на ньому (кадр у downlink).
+// Без другої умови плата не помічає недосяжного шлюзу й не вмикає буфер.
+bool tcp_up()  { return wifi_up() && gw_configured && tcp_client.connected() &&
+                        last_tcp_rx != 0 && (millis() - last_tcp_rx) < WIFI_LINK_TIMEOUT_MS; }
+bool udp_up()  { return wifi_up() && gw_configured && udp_started &&
+                        last_udp_rx != 0 && (millis() - last_udp_rx) < WIFI_LINK_TIMEOUT_MS; }
 
 Channel active_channel() {
   if (wire_alive()) return CH_UART;
@@ -405,6 +418,34 @@ void send_hello() {
   if (len > 0) node_send(tx, len);
 }
 
+// Проба Wi-Fi-каналів: HELLO, що шлеться НАПРЯМУ і по TCP, і по UDP (в обхід вибору
+// каналу -- інакше мертвий канал ніколи б не ожив). Шлюз відповідає на кожен HELLO
+// кадром CONFIG{"cmd":"id"} тим самим транспортом, і ця відповідь оновлює
+// last_tcp_rx/last_udp_rx. Прапорець "probe" каже шлюзу, що це не перезавантаження
+// плати (інакше він щоразу скидав би облік sequence). Поки id не підтверджено, шлемо
+// звичайний HELLO без прапорця -- це і є справжній запит id після старту.
+void send_wifi_probe() {
+  if (!wifi_up() || !gw_configured) return;
+  SensorPacket h = {0};
+  h.version = PROTOCOL_VERSION;
+  h.msg_type = MSG_HEARTBEAT;
+  h.node_id = 0;
+  h.sequence = 0;
+  h.timestamp_ms = millis();
+  snprintf((char*)h.payload, MAX_PAYLOAD_SIZE, "{\"mac\":\"%s\",\"id\":%u%s}",
+           device_mac, MY_NODE_ID, id_confirmed ? ",\"probe\":1" : "");
+  h.payload_len = strlen((char*)h.payload);
+  uint8_t tx[128];
+  int len = protocol_pack(&h, tx, sizeof(tx));
+  if (len <= 0) return;
+  if (tcp_client.connected()) tcp_client.write(tx, len);
+  if (udp_started) {
+    udp.beginPacket(gateway_ip, udp_port);
+    udp.write(tx, len);
+    udp.endPacket();
+  }
+}
+
 void handle_config_packet(const SensorPacket *pkt) {
   char js[MAX_PAYLOAD_SIZE + 1];
   memcpy(js, pkt->payload, pkt->payload_len);
@@ -498,7 +539,7 @@ void handle_remote_alarm(const SensorPacket *pkt) {
 }
 
 // ================== ПРИЙОМ ВІД ШЛЮЗУ ==================
-void handle_downlink_bytes(const uint8_t *raw, size_t len, bool from_wire) {
+void handle_downlink_bytes(const uint8_t *raw, size_t len, Channel src) {
   SensorPacket pkt;
   int rc = protocol_unpack(raw, len, &pkt);
   if (rc != PROTO_OK) {
@@ -506,7 +547,11 @@ void handle_downlink_bytes(const uint8_t *raw, size_t len, bool from_wire) {
     DBG.println(rc);
     return;
   }
-  if (from_wire) last_wire_rx = millis(); // будь-який валідний кадр = дріт живий
+  // Будь-який валідний кадр від шлюзу = цей канал живий (до фільтра за node_id:
+  // відповідь на пробу приходить з node_id=0 або з пінгом, усе це ознака життя).
+  if (src == CH_UART) last_wire_rx = millis();
+  else if (src == CH_TCP) last_tcp_rx = millis();
+  else if (src == CH_UDP) last_udp_rx = millis();
 
   if (pkt.node_id != 0 && pkt.node_id != MY_NODE_ID) return; // чужий вузол; 0 = усім
 
@@ -525,7 +570,7 @@ void handle_downlink_bytes(const uint8_t *raw, size_t len, bool from_wire) {
 void poll_downlink() {
   while (GatewaySerial.available()) {
     if (uart_assembler.feed((uint8_t)GatewaySerial.read())) {
-      handle_downlink_bytes(uart_assembler.buf, uart_assembler.have, true);
+      handle_downlink_bytes(uart_assembler.buf, uart_assembler.have, CH_UART);
       uart_assembler.reset();
     }
   }
@@ -534,13 +579,13 @@ void poll_downlink() {
     if (packet_size > 0) {
       uint8_t buf[HEADER_SIZE + MAX_PAYLOAD_SIZE + CRC_SIZE];
       int len = udp.read(buf, sizeof(buf));
-      if (len > 0) handle_downlink_bytes(buf, (size_t)len, false);
+      if (len > 0) handle_downlink_bytes(buf, (size_t)len, CH_UDP);
     }
   }
   if (tcp_client.connected()) {
     while (tcp_client.available()) {
       if (tcp_assembler.feed((uint8_t)tcp_client.read())) {
-        handle_downlink_bytes(tcp_assembler.buf, tcp_assembler.have, false);
+        handle_downlink_bytes(tcp_assembler.buf, tcp_assembler.have, CH_TCP);
         tcp_assembler.reset();
       }
     }
@@ -739,7 +784,9 @@ void print_status() {
   DBG.print(" | шлюз=");
   DBG.print(gw_configured ? gw_ip_str : "не налаштовано");
   DBG.print(" | TCP=");
-  DBG.print(tcp_client.connected() ? "так" : "ні");
+  DBG.print(tcp_client.connected() ? (tcp_up() ? "так" : "є, шлюз мовчить") : "ні");
+  DBG.print(" | UDP=");
+  DBG.print(udp_up() ? "живий" : "шлюз мовчить");
   DBG.print(" | буфер=");
   DBG.print(tele_q.count);
   DBG.print(" (втрачено ");
@@ -859,6 +906,8 @@ void node_loop() {
   if (!now_wifi && was_wifi) {
     DBG.println("[WIFI] Зв'язок втрачено.");
     tcp_client.stop();
+    last_tcp_rx = 0;  // після повернення Wi-Fi канали знову мають довести, що шлюз відповідає
+    last_udp_rx = 0;
   }
   was_wifi = now_wifi;
 
@@ -869,6 +918,7 @@ void node_loop() {
       last_tcp_attempt = millis();
       tcp_assembler.reset();
       if (tcp_client.connect(gateway_ip, tcp_port, 1500)) {
+        last_tcp_rx = 0;  // нове з'єднання: стара відмітка життя до нього не стосується
         DBG.println("[TCP] Підключено до шлюзу (резервний канал).");
       }
     }
@@ -890,6 +940,13 @@ void node_loop() {
       int len = protocol_pack(&ka, tx, sizeof(tx));
       if (len > 0) tcp_client.write(tx, len);
     }
+  }
+
+  // Проба Wi-Fi-каналів: без неї плата не дізнається, що шлюз зник (або повернувся)
+  static unsigned long last_probe = 0;
+  if (millis() - last_probe >= WIFI_PROBE_MS) {
+    last_probe = millis();
+    send_wifi_probe();
   }
 
   poll_downlink();
