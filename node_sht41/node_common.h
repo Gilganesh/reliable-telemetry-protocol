@@ -9,6 +9,21 @@ extern "C" {
   #include "packet_queue.h"
 }
 
+#ifdef NODE_LCD
+  #ifndef NODE_I2C_SDA
+    #define NODE_I2C_SDA 21
+  #endif
+  #ifndef NODE_I2C_SCL
+    #define NODE_I2C_SCL 18
+  #endif
+  #include "node_lcd.h"
+  bool sensor_display(char *line, size_t n);
+  void lcd_flash(const char *msg);
+  #define LCD_FLASH(msg) lcd_flash(msg)
+#else
+  #define LCD_FLASH(msg) ((void)0)
+#endif
+
 void sensor_setup();
 void sensor_update();
 bool sensor_payload(char *buf, size_t n);
@@ -440,6 +455,7 @@ void handle_remote_alarm(const SensorPacket *pkt) {
 #endif
   DBG.print("[ALARM] Remote alarm: ");
   DBG.println(active ? "ON" : "off");
+  LCD_FLASH(active ? "WEB ALARM ON" : "Web alarm off");
 }
 
 void handle_downlink_bytes(const uint8_t *raw, size_t len, Channel src) {
@@ -727,6 +743,97 @@ void load_saved_config() {
   gw_configured = gw_ip_str[0] != '\0' && gateway_ip.fromString(gw_ip_str);
 }
 
+#ifdef NODE_LCD
+Lcd1602 lcd;
+char lcd_shown[LCD_ROWS][LCD_COLS + 1] = {"", ""};
+char lcd_flash_text[LCD_COLS + 1] = "";
+unsigned long lcd_flash_until = 0;
+unsigned long lcd_next_refresh = 0;
+unsigned long lcd_next_probe = 0;
+
+#define LCD_REFRESH_MS 250
+#define LCD_PROBE_MS   5000
+#define LCD_FLASH_MS   3000
+#define LCD_PAGE_MS    3000
+
+void lcd_message(const char *line1, const char *line2) {
+  if (!lcd.ready()) return;
+  lcd.printLine(0, line1);
+  lcd.printLine(1, line2);
+  snprintf(lcd_shown[0], sizeof(lcd_shown[0]), "%s", line1);
+  snprintf(lcd_shown[1], sizeof(lcd_shown[1]), "%s", line2);
+  lcd_next_refresh = millis() + 1500;
+}
+
+void lcd_init() {
+  if (lcd.ready()) return;
+  if (!lcd.begin()) {
+    DBG.println("[LCD] Display not found on I2C (0x27 / 0x3F), continuing without it.");
+    lcd_next_probe = millis() + LCD_PROBE_MS;
+    return;
+  }
+  char msg[40];
+  snprintf(msg, sizeof(msg), "[LCD] Display found at 0x%02X.", lcd.address());
+  DBG.println(msg);
+  lcd_message("Telemetry node", "Starting...");
+}
+
+void lcd_flash(const char *msg) {
+  snprintf(lcd_flash_text, sizeof(lcd_flash_text), "%s", msg);
+  lcd_flash_until = millis() + LCD_FLASH_MS;
+  if (lcd_flash_until == 0) lcd_flash_until = 1;
+}
+
+void lcd_compose(char *line1, char *line2) {
+  Channel ch = active_channel();
+  const char *link = ch == CH_NONE ? "NO LINK" : channel_name(ch);
+  char id[8];
+  if (MY_NODE_ID != 0) snprintf(id, sizeof(id), "%u", MY_NODE_ID);
+  else snprintf(id, sizeof(id), "---");
+  snprintf(line1, LCD_COLS + 1, "%-7s Node %-3s", link, id);
+
+  if (lcd_flash_until != 0 && (long)(millis() - lcd_flash_until) < 0) {
+    snprintf(line2, LCD_COLS + 1, "%s", lcd_flash_text);
+    return;
+  }
+
+  char info[LCD_COLS + 1];
+  if (!sensor_display(info, sizeof(info)))
+    snprintf(info, sizeof(info), "Buf:%d Drop:%lu", tele_q.count, (unsigned long)tele_q.dropped);
+
+  int queued_alarms = alarm_q.count + (alarm_inflight_valid ? 1 : 0);
+  bool backlog = tele_q.count > 0 || queued_alarms > 0;
+  if (backlog && ((millis() / LCD_PAGE_MS) & 1))
+    snprintf(line2, LCD_COLS + 1, "BUF %d ALM %d", tele_q.count, queued_alarms);
+  else
+    snprintf(line2, LCD_COLS + 1, "%s", info);
+}
+
+void lcd_service() {
+  unsigned long now = millis();
+  if (!lcd.ready()) {
+    if ((long)(now - lcd_next_probe) < 0) return;
+    lcd_next_probe = now + LCD_PROBE_MS;
+    if (lcd.begin()) {
+      lcd_shown[0][0] = '\0';
+      lcd_shown[1][0] = '\0';
+    }
+    return;
+  }
+  if ((long)(now - lcd_next_refresh) < 0) return;
+  lcd_next_refresh = now + LCD_REFRESH_MS;
+
+  char lines[LCD_ROWS][LCD_COLS + 1];
+  lcd_compose(lines[0], lines[1]);
+  for (uint8_t row = 0; row < LCD_ROWS; row++) {
+    if (strcmp(lines[row], lcd_shown[row]) == 0) continue;
+    lcd.printLine(row, lines[row]);
+    if (lcd.ready()) snprintf(lcd_shown[row], sizeof(lcd_shown[row]), "%s", lines[row]);
+    return;
+  }
+}
+#endif
+
 void node_setup() {
   Serial.begin(115200);
   delay(2000);
@@ -834,6 +941,7 @@ void node_loop() {
     DBG.print(reliable.sequence);
     DBG.print(" delivered, attempts=");
     DBG.println(reliable.attempts);
+    LCD_FLASH("ALARM delivered");
     alarm_inflight_valid = false;
   } else if (rst == RELIABLE_EXHAUSTED) {
     DBG.print("[ALARM] seq=");
@@ -841,6 +949,7 @@ void node_loop() {
     DBG.print(": retries exhausted, NOT delivered, attempts=");
     DBG.print(reliable.attempts);
     DBG.println(" -- requeued, will retry later");
+    LCD_FLASH("ALARM FAILED");
     if (alarm_inflight_valid) {
       alarm_requeue_front(&alarm_inflight);
       alarm_inflight_valid = false;
@@ -877,4 +986,8 @@ void node_loop() {
     DBG.println(channel_name(ch));
     last_channel = ch;
   }
+
+#ifdef NODE_LCD
+  lcd_service();
+#endif
 }

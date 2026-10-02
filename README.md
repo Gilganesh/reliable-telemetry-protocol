@@ -64,6 +64,7 @@ sensor samples; it never recomputes delivery statistics on its own.
 | `node_common/` | Shared ESP32 firmware core (`node_common.h`), packet queue, sketch sync script, sensor bring-up sketches |
 | `node_accelerometer/` | Arduino sketch for an MPU9250 node (roll/pitch/yaw) |
 | `node_sht41/` | Arduino sketch for an SHT41 node (temperature/humidity) |
+| `node_default_lcd/`, `node_accelerometer_lcd/`, `node_sht41_lcd/` | The same node firmware with a 16x2 LCD: a sensorless node (uptime, free heap, RSSI), an MPU9250 node and an SHT41 node |
 | `sim_node/` | Simulated node over MQTT with configurable loss and duplication |
 | `web/` | Flask dashboard, REST API and Python protocol codec |
 | `tests/` | Unit tests for the codec, the reliability state machine and the packet queue |
@@ -134,6 +135,29 @@ sim_node/sim_node --node-id 102 --loss-percent 20 --send-alarm
 2. With the gateway running, connect the board to the gateway host with a USB cable. The gateway detects the port,
    assigns a node id (lowest free id, stable per MAC address) and sends the Wi-Fi credentials and its own address.
 3. The board stores the settings in NVS. From then on it keeps Wi-Fi as a backup link and can run without the cable.
+
+### Nodes with an LCD (1602 + I2C backpack)
+
+Three sketches add a 16x2 character display that shows the active link and live node state. Pick one per board:
+
+| Sketch | Sensor | Telemetry sent | Second LCD line |
+|---|---|---|---|
+| `node_default_lcd` | none | `uptime_s`, `free_heap_kb`, `rssi` | `Buf:0 Drop:0` |
+| `node_accelerometer_lcd` | MPU9250 | `roll`, `pitch`, `yaw` | `R-1 P-24 Y-11` |
+| `node_sht41_lcd` | SHT41 | `temperature`, `humidity` | `T21.3C H49.8%` |
+
+The first line is always `<link> Node <id>`, where the link is `UART`, `TCP`, `UDP` or `NO LINK`. While telemetry or alarms
+are waiting in the node's buffer the second line alternates with `BUF 6 ALM 1`, and for three seconds after an alarm event it
+shows `ALARM delivered`, `ALARM FAILED` or `WEB ALARM ON`.
+
+Wiring (the display shares the sensor's I2C bus, no extra pins): `GND` to GND, `VCC` to the 5 V pin, `SDA` to GPIO21, `SCL`
+to GPIO18. These two GPIOs exist and are free on both an ESP32-WROOM DevKit and an ESP32-S3 DevKitC-1 (the S3 has no GPIO22),
+so the same wiring works on either board. Connect the sensor to the same two pins. The exception is `node_sht41_lcd`, which
+is meant for an ESP32-WROOM and uses the classic hardware pair SDA GPIO21 / SCL GPIO22 (the pins the SHT41 was tuned on). To use other pins, define `NODE_I2C_SDA` /
+`NODE_I2C_SCL` before including `node_common.h`. On an S3 board use the USB port wired to the UART bridge (labelled UART/COM)
+and keep *USB CDC On Boot* disabled in the Arduino IDE, because the gateway talks to the board over that serial port. The driver is built in (no extra library), finds the backpack at `0x27` or `0x3F` and keeps running without a
+display. If the screen lights up but shows only blocks or nothing, turn the contrast trimmer on the backpack. The existing
+`node_accelerometer` and `node_sht41` sketches are unchanged and work without a display.
 
 If you edit `node_common/` or `protocol/`, run `node_common/sync.sh` to refresh the copies inside the sketch folders
 (Arduino IDE only compiles files that live next to the sketch).

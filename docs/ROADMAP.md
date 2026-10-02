@@ -1,297 +1,92 @@
-# ROADMAP / що ще треба зробити
+# Roadmap
 
-Живий список справ, щоб нічого не загубилось. Оновлюй: став `[x]`, коли зроблено.
-Пов'язані документи: `case-brief.md` (кейс, критерії приймання), `team-blocks/`.
+Status as of 2026-10-03. Background documents: [`case-brief.md`](case-brief.md) (requirements and acceptance
+criteria), [`case-2.4-requirements.md`](case-2.4-requirements.md), [`team-blocks/`](team-blocks/).
 
-Стан на 02.10.2026.
+## Where the project stands
 
----
+The system is functionally complete: sensor nodes, gateway, impairment simulator, dashboard and a one-command launcher
+all work together. What remains is evidence (recorded test runs on hardware), two documents and a few improvements.
 
-## ★ СТАТУС ПРОЕКТУ (для переходу в новий чат, 02.10.2026)
+| Area | State |
+|---|---|
+| Protocol (frame, CRC-32, ACK/retry, sequence tracking) | Done, unit-tested |
+| Node firmware: UART > TCP > UDP failover, store-and-forward, alarm queue, zero-touch provisioning | Done, verified on 4 boards |
+| Sensors: MPU9250, SHT41, sensorless node | Done |
+| LCD 1602 variants of all three sketches | Done, reported working on boards |
+| Gateway: tracking, dedup, latency, backlog, impairment layer, MQTT state | Done |
+| Dashboard: KPIs, node cards, charts on a true time axis, alarm log, impairment panel, light/dark theme | Done |
+| Launcher: `run.sh`, desktop shortcut for the Raspberry Pi | Done |
 
-**Загалом:** код і функціонал по суті готові, лишились прогони на реальних платах, документи й демо-репетиція.
-Критерій №1 (3+ вузли) і №4 (розрив → буфер → вивантаження) виконані й перевірені на живому залізі; №2, №3, №5 реалізовані,
-але прогін на реальних платах із зафіксованим результатом ще не зроблений.
+## Acceptance criteria
 
-**Зібране й працює (перевірено на живих платах, Raspberry Pi + 4 ESP32):**
-- 4 реальні ESP32 одночасно; датчики MPU9250 (roll/pitch/yaw) і SHT41 (temperature/humidity), графіки у вебі працюють; окремі скетчі `node_accelerometer`,
-  `node_sht41` над спільним ядром `node_common/node_common.h` (канали UART>TCP>UDP, буфер, ALARM з ACK/retry, автоналаштування).
-- Шлюз (C, UDP 5005 / TCP 5006 / UART-автопошук / MQTT), веб-дашборд з графіками метрик, RTT, backlog, loss rate, журналом тривог.
-- Store-and-forward: плата вважає Wi-Fi-канал живим лише якщо шлюз відповів (проба HELLO `probe:1`, `WIFI_LINK_TIMEOUT_MS`).
-  Без цього пакети губились, а не буферизувались (знайдено тестом, виправлено, перевірено).
-
-**Щойно додано, перевірено лише локально (скрипт-емулятор вузла на macOS), НА ПЛАТАХ ЩЕ НІ:**
-- Імпеймент-шар у шлюзі: профілі `good`/`lossy20`/`delay`/`flaky`, розрив N с, сид, цільовий вузол; панель «Перешкоди каналу» у вебі.
-- `fire_alarm`: кнопка «ALARM з вузла» (плата сама створює ALARM з ACK/retry). У прошивці перевірено лише синтаксис.
-
-**Коміти:** `8f28e21` (поділ прошивки на ядро + 2 скетчі), `2214759` (фікс буферизації), `7b66e44` (імпеймент-шар).
-**Не закомічено:** видалення старої панелі «Симуляція втрат» у вебі (`web/static/index.html`) і це оновлення ROADMAP.
-Ендпоінт `/api/simulate-loss` і підтримка `simulate_loss` у прошивці лишились (веб-панелі більше немає).
-
-**Що лишилось (за пріоритетом):**
-1. Прогони на платах із записом результатів: `lossy20` + «ALARM з вузла» (крит. №2), `flaky` — биті пакети (крит. №5), розрив 30 с, переповнення буфера (>250 с).
-2. Документи (deliverables №1, 7, 8, 10, 11): специфікація протоколу з діаграмою станів, threat model, звіт про тестування за профілями,
-   єдина інструкція запуску (`run.sh`), перелік обмежень і техборгу.
-3. 5–10 вузлів (кілька `sim_node`), демо-сценарій із 10 кроків і шпаргалка.
-4. Питання до ментора: CRC32 чи HMAC, що таке «критичне повідомлення», розмір буфера (`case-brief.md`, розділ 9).
-Повний чекліст за вимогами кейса — розділ 0.1.
-
-**Відомі нюанси для наступної сесії:**
-- Шлюз на Pi треба перезбирати й перезапускати після `git pull`; веб теж перезапускати, якщо змінився `app.py`; плати — перепрошивати.
-- `LINK_VIA_USB_CABLE 1`: Serial зайнятий каналом, консольні команди і логи плати недоступні (для налагодження поставити 0).
-- «Loss» на картці вузла накопичений за весь час, а не віконний: короткий тест на 20% розмитий (є ідея додати «loss за останні N пакетів»).
-- Перешкоди діють на шлюзі; плата на UART про втрати не знає й не буферизує (як на реальному дроті). Буфер вмикається в режимі «Розрив».
-
----
-
-## 0. Журнал сесії 02.10.2026: що зроблено і результати тестів
-
-Блок для переходу в новий чат: тут стан, а не плани. Плани — розділи 1–5 нижче.
-
-### Зроблено (коміти в `main`)
-- `065fa50` — `.venv` прибрано з git, додано в `.gitignore`.
-- `53142d9` — **буфер на платі**: черга ALARM (`alarm_q`, повтор після відновлення каналу, ніколи не
-  відкидається заради телеметрії), неблокуючий flush (1 пакет / 50 мс), порядок (нова телеметрія іде в
-  кінець буфера), лічильники втрат; **шлюз** сам перепідключається до MQTT; запізнілий ALARM більше не
-  вважається перезапуском вузла (перезапуск ловиться по HELLO); плата обробляє `alarm` і `simulate_loss`
-  з веба. Кільцева черга винесена в `packet_queue.h` (зараз `node_common/`, раніше `node_esp32/`) (+ `tests/test_packet_queue.c`).
-- `7236214` — **latency** (ping/ACK, RTT за годинником шлюзу) і **backlog** буфера плати на дашборді.
-- `b478a90` — шлюз закриває «повислі» послідовні порти (poll `POLLHUP` + `stat`), тож replug USB не
-  вичерпує слоти `MAX_UART_PORTS`; `LINK_VIA_USB_CABLE 1`.
-- `2214759` — **(перевірено на платі користувачем 02.10)** Тест 02.10: після вимкнення Wi-Fi/шлюзу плата не
-  буферизувала, а губила пакети (вузол 2: seq 19→27, втрат 7), бо вважала UDP/TCP живими за самим
-  фактом з'єднання. Тепер Wi-Fi-канал живий, лише якщо шлюз відповів на ньому за `WIFI_LINK_TIMEOUT_MS`;
-  плата раз на `WIFI_PROBE_MS` шле HELLO з `"probe":1` по TCP і UDP (`send_wifi_probe`), шлюз відповідає й
-  для проби не скидає облік sequence (`handle_hello`). Після фіксу буферизація на платі працює: розрив
-  (павербанк + вимкнений Wi-Fi) -> накопичений буфер вивантажується після відновлення (**критерій №4**).
-  Не перевірено лише переповнення (>250 с розриву: `dropped` > 0 і така сама кількість «втрат» на шлюзі).
-
-### Імпеймент-шар у шлюзі (02.10, коміт `7b66e44`)
-- Де: `gateway.c`, блок «Імпеймент-шар»; єдині точки: вхід `handle_packet()` (вузол→шлюз) і вихід `downlink_send()`
-  (шлюз→вузол: ACK, команди, відповіді на HELLO, пінги). Діє на UART/TCP/UDP/MQTT однаково.
-- Керування: MQTT `case24/gateway/control`, JSON `{"cmd":"impair","profile":..,"node":..,"blackout_s":..}`
-  (веб: панель «Перешкоди каналу», `POST /api/impairment`). Профілі: `good`, `lossy20`, `delay` (200+0..100 мс),
-  `flaky` (10% втрат, 10% дублів, 5% битих, 100+0..300 мс). Окремі поля: `loss/dup/corrupt/delay_ms/jitter_ms/seed`.
-- Стан і лічильники (вх./вих. втрачено, дублів, битих, відкладено) йдуть у `case24/gateway/state` -> веб.
-- Розрив для всіх вузлів зупиняє і службовий пінг UART, щоб плата на дроті теж пішла в буфер.
-- `fire_alarm` (CONFIG від веба, кнопка «ALARM з вузла»): плата сама створює ALARM з ACK/retry — Serial у USB-режимі недоступний.
-- Перевірено локально (шлюз+брокер+веб на macOS, скрипт-емулятор вузла): `lossy20` на 300 пакетах → втрачено 65 (21,7%)
-  і шлюз порахував рівно стільки ж; `flaky` → биті відхилені за CRC, лічильник збігається; `delay` → RTT 400–600 мс;
-  розрив 3 с → відповіді немає, після нього є. **Не перевірено**: на реальних ESP32 (і `fire_alarm` у прошивці — лише синтаксис).
-- Обмеження: перешкоди застосовуються на шлюзі, тож плата на UART не знає про втрати й не буферизує (як на реальному
-  дроті); буферизує вона лише коли розрив зупиняє пінги/проби (режим «Розрив»).
-
-### Результати тестів
-| Що | Як | Результат |
-|---|---|---|
-| Unit-тести C | `test_protocol` / `test_reliability` / `test_packet_queue` | 19 / 30 / 17 пройдено |
-| Шлюз + брокер | без брокера → з'явився → вимкнули → перезапустили | шлюз і `sim_node` перепідключаються, стан знову публікується |
-| Запізнілий ALARM | скрипт по UDP: 100 пакетів + ALARM, що відстає на 89 пакетів і 445 с | ACK є, дубль-повтор відкинуто, `lost_count` = 0, хибного «перезапуску» нема |
-| Перезапуск плати | HELLO того ж MAC | sequence скинуто, нові пакети 0..2 прийняті |
-| Latency / backlog | шлюз + `sim_node` + емульована UDP-плата (затримка 40 мс) | RTT 48–49 мс (UDP-плата), ~12 мс (MQTT), `backlog`/`dropped` дійшли до `/api/state` |
-| **3 реальні ESP32 на Raspberry Pi** | 2 плати на старті + 3-тя підключена на ходу | усі три ONLINE на UART, id 1/2/3 за MAC, RTT 10–30 мс (**критерій №1 виконано**) |
-| Replug USB-кабелю вузла | висмикнули ~34 с, вставили | `порт відключено -- порт закрито` → `Знайдено порт` → вузол знову на UART за ~4 с; 1 пакет втрачено при перемиканні UART→TCP, шлюз коректно врахував |
-
-### Знахідки під час тестів (щоб не наступати знову)
-- Шлюз мав **витік слотів UART**: після hangup USB `read()` повертає 0, а не помилку, мертвий порт не
-  закривався. Виправлено в `b478a90`. Перед тестом на малинці **перезбирати** шлюз (`git pull && make -C gateway`).
-- `localhost` для асинхронного MQTT на macOS дає IPv6 (`::1`) → у шлюзі `MQTT_HOST` = `127.0.0.1`.
-- macOS: порт **5000 займає AirPlay Receiver** — веб запускати на 8080; Firefox потребує дозволу
-  *System Settings → Privacy & Security → Local Network*.
-- `dmesg`: `cp210x ... failed set request 0x12 status: -110` — мосток CP2102 «завис» (живлення USB / кабель).
-  Перевірити `vcgencmd get_throttled`; три ESP32 з Wi-Fi краще живити через USB-хаб із живленням.
-- Старт шлюзу посеред кадру плати дає 1 `BAD_CRC` (лічильник «пошкоджені» = 1 ще до тестів).
-- Спалах RTT під час перемикання каналу розтягується ковзним середнім (α=0,3) на ~25 с.
-
-### Як підняти стенд на Raspberry Pi (репозиторій: `~/Desktop/reliable-telemetry-protocol`)
-```bash
-# термінал 1: брокер (з кореня репозиторію)
-sudo systemctl stop mosquitto; mosquitto -c mosquitto_open.conf
-# термінал 2: шлюз
-cd gateway && make && ./gateway
-# термінал 3: веб (8080, доступний у локальній мережі)
-cd web && WEB_HOST=0.0.0.0 WEB_PORT=8080 ../.venv/bin/python app.py 127.0.0.1
-```
-Дашборд: `http://<IP з hostname -I>:8080`. Unit-тести: `clang -Iprotocol tests/test_X.c protocol/protocol.c protocol/reliability.c`.
-
-### НЕ перевірено (зробити першим)
-- **Імпеймент-шар і `fire_alarm` на реальних платах** (локально перевірено скриптом): `lossy20` + ALARM, `flaky`, розрив 30 с, переповнення буфера (>250 с).
-- Критерій №5 (битий пакет) як окремий прогін із записаним результатом.
-- Дашборд: нова панель «Перешкоди каналу» працює (користувач підтвердив після оновлення сторінки), але детально не досліджена.
-- Вузли 5–10 (кілька `sim_node`) не запускались.
-
-### Рекомендований наступний крок
-1. Прогони на платах (див. вище) і запис результатів у цей файл → з них звіт про тестування.
-2. Специфікація протоколу зі схемою станів, threat model (розділ 3).
-3. Єдина інструкція запуску, перелік обмежень, репетиція демо із 10 кроків.
-
----
-
-## 0.1 Відповідність вимогам кейса (`case-brief.md`): що зроблено, що ні
-
-Позначки: ✅ зроблено і перевірено · ⚠️ зроблено частково / не перевірено на демо-сценарії · ❌ не зроблено.
-
-### Критерії приймання (розділ 7 кейса)
-| # | Критерій | Стан | Докази / що лишилось |
+| # | Criterion | State | Evidence / what is missing |
 |---|---|---|---|
-| 1 | ≥3 вузли одночасно | ✅ | 3 реальні ESP32 на Pi, окремо в дашборді, id за MAC. Лишилось: прогін із 5–10 симульованих вузлів (вимога «3–10») |
-| 2 | 20% втрат: критичні доставлені або «retry вичерпано» | ⚠️ | Є профіль `lossy20` у шлюзі + кнопка «ALARM з вузла» (див. нижче). Перевірено скриптом-емулятором вузла: 150 ALARM при 20% у кожен бік → 146 доставлено, 4 «retry вичерпано», 25 повторів без дубля події. **На реальній платі ще не прогнано** |
-| 3 | Дублікат не створює дубль-подію | ✅ | Дедуплікація за node_id+sequence; перевірено (повтор ALARM відкинуто, `lost_count`=0). `sim_node --duplicate-percent` |
-| 4 | Розрив → буфер → вивантаження | ✅ | Перевірено на платі 02.10 після фіксу `WIFI_LINK_TIMEOUT_MS`. Не перевірено: переповнення буфера (>250 с); точний розрив 30 с не зафіксований як результат |
-| 5 | Пошкоджений пакет відхилено, шлюз не падає | ⚠️ | `PROTO_ERR_BAD_CRC` → відхилення + запис у журнал + лічильник «битих» у дашборді; unit-тест і `sim_node_smoke_test`. Немає цілеспрямованого прогону на живому шлюзі з відкладеним результатом |
+| 1 | At least 3 nodes at once | Done | 4 real ESP32 boards on a Raspberry Pi, ids assigned by MAC; more can be added with `sim_node --node-id` |
+| 2 | 20% loss: critical events delivered or reported as "retries exhausted" | Emulated only | `lossy20` profile + node ALARM; an emulated node delivered 146 of 150 alarms, reported 4 exhausted, no duplicate events. Not yet recorded on a real board |
+| 3 | A duplicate does not create a second event | Done | Dedup by node id and sequence; repeated ALARM is acknowledged but logged once |
+| 4 | Outage, buffering, flush | Done | Verified on a board after the Wi-Fi/gateway outage fix. Not tested: buffer overflow (outage longer than about 250 s); a recorded 30 s run |
+| 5 | A corrupted frame is rejected and the gateway keeps running | Emulated only | CRC rejection is counted and shown on the dashboard; the `flaky` profile was run against an emulated node, not against a board |
 
-### Функціональні вимоги (розділ 3) і сценарій демо (розділ 8)
-- ✅ `node_id` + версія протоколу; формат пакета з `type`/`sequence`/`timestamp`/`payload length`/CRC32.
-- ✅ Heartbeat/пінг, online/offline, виявлення втрат/дублікатів/порушення порядку на шлюзі.
-- ✅ Конфігурація окремим типом повідомлення (`MSG_CONFIG`: wifi, gw, servo, ping, simulate_loss).
-- ✅ Буферизація й store-and-forward (черга ALARM, буфер телеметрії, порядок, неблокуючий flush).
-- ✅ Замінний транспорт: UART / TCP / UDP / MQTT над однаковою логікою протоколу; автоперемикання UART>TCP>UDP.
-- ✅ Dashboard: online/offline, loss rate, latency (RTT), backlog, графіки метрик, журнал тривог.
-- ⚠️ Контроль цілісності: є CRC32; **MAC/HMAC немає** (питання до ментора).
-- ⚠️ Вимірювання характеристик каналу: RTT і loss є, jitter/одностороння затримка немає.
-- ⚠️ Демо-кроки 4–5: профілі нестабільного каналу з веба є; кроки 10: результати за профілями ще не зібрані.
+## Verification so far
 
-### Deliverables (розділ 6)
-| # | Deliverable | Стан | Примітка |
-|---|---|---|---|
-| 1 | Специфікація протоколу | ❌ | `protocol-spec-v1-python.md` застаріла; немає діаграми станів, CONFIG/HELLO/реєстр id не описані |
-| 2 | Сенсорний вузол | ✅ | `node_accelerometer`, `node_sht41` + спільне `node_common`; перевірено на платах |
-| 3 | Шлюз | ✅ | `gateway/gateway.c` |
-| 4 | Стенд з кількома вузлами | ⚠️ | 3 реальні плати + `sim_node`; немає запуску 5–10 симульованих вузлів / docker-compose |
-| 5 | Інструмент моделювання каналу | ⚠️ | Є імпеймент-шар у шлюзі (профілі `good`/`lossy20`/`delay`/`flaky`, розрив N с, втрати/дублі/биті/затримка+jitter/reorder, seed, цільовий вузол, керування з веба). Перевірено локально; на реальних платях ще ні |
-| 6 | Логи / dashboard | ✅ | журнал шлюзу + веб-дашборд |
-| 7 | Звіт про тестування за профілями каналу | ❌ | інструмент (п. 5) є, треба прогнати профілі й зафіксувати таблицю |
-| 8 | Threat model | ❌ | |
-| 9 | Репозиторій | ✅ | |
-| 10 | Інструкція запуску й відтворення | ⚠️ | команди розкидані (`CLAUDE.md`, розділ 0 цього файлу, README), єдиної інструкції/скрипта `run.sh` немає |
-| 11 | Відомі обмеження і техборг | ⚠️ | перелік розкиданий по ROADMAP, окремого документа немає |
+- Unit tests (`make test`): protocol 19, reliability 30, packet queue 17, LCD driver 21 (against an HD44780 emulator), plus a
+  Python/C codec cross-check and a firmware copy check.
+- Emulated node against the real gateway: `lossy20` (150 alarms), `flaky` (corrupted frames rejected, counters match),
+  `delay` (RTT 400 to 600 ms), a 3 s blackout, a late retry arriving 89 packets behind (still deduplicated).
+- Buffered samples are placed at their true measurement time: with a simulated outage the stored times matched the real
+  creation times within 40 ms. Not yet observed on a board.
+- On hardware: simultaneous nodes on UART and TCP, UART hot-unplug and replug, failover to Wi-Fi, store-and-forward after a
+  Wi-Fi outage, LCD sketches.
 
-### Що найбільше «важить» до демо (за пріоритетом)
-1. ~~Імпеймент-симулятор з профілями~~ — зроблено в шлюзі (див. нижче); лишилось прогнати на платях і зібрати результати для звіту №7.
-2. **Специфікація протоколу з діаграмою станів** і **threat model** (deliverable №1, №8): це лише документи, швидко.
-3. Перевірити на демо-сценарії: 20% втрат + ALARM, битий пакет у журналі, розрив 30 с з фіксацією результату.
-4. Звіт про тестування, єдина інструкція запуску, документ про обмеження (№7, №10, №11).
+## Next steps, by priority
 
----
+1. **Record the missing runs on boards**: `lossy20` with the node ALARM button, `flaky`, a 30 s blackout, and a long outage to
+   check buffer overflow (`dropped` on the node must equal the loss the gateway reports). Save the numbers; they become the
+   test report.
+2. **Baseline comparison for the report**: add a naive mode to `sim_node` (send once, no ACK, no buffer) and a script that
+   runs both modes through the same impairment profiles with a fixed seed, producing a table of delivered, lost and duplicate
+   alarms. MQTT or a naive sender is explicitly allowed as a baseline in the brief.
+3. **Sensor-driven alarms** in the firmware: raise ALARM on a threshold (temperature above a limit, tilt or shock) with
+   hysteresis and a cool-down, so the critical event comes from the node instead of a button.
+4. **Documents**: test report (profile, delivered, lost, retries, recovery time) and a high-level threat model (spoofed node,
+   replay, plain-text Wi-Fi password on the serial link, open broker).
+5. **Open questions for the mentor**: CRC-32 versus HMAC, what counts as a critical message, node buffer size.
 
-## 1. Відкриті питання з обговорення
+## Known limitations and technical debt
 
-- [x] **Буфер на платі: ALARM без каналу.** (зроблено: черга `alarm_queue`, повтор після відновлення каналу) Зараз `send_alarm()` без каналу просто пише
-  «ALARM не відправлено» (`node_common.h`, `send_alarm`) і подія губиться. Треба: класти
-  критичні повідомлення в буфер, а після відновлення зв'язку повторювати через ACK/retry.
-  **Найвищий пріоритет** з цього розділу.
-- [ ] **Буфер: вивантаження без підтвердження.** Телеметрія з буфера вважається доставленою,
-  щойно `write()` не повернув помилку. Для мертвого каналу без FIN/отримувача це втрата.
-  Варіанти: ACK на пакети з буфера (хоч би на останній у пачці) або «ковзне» підтвердження.
-- [ ] **Буфер: переповнення і перезавантаження.** Лічильник втрачених при переповненні вже є
-  (`buffer_dropped`, `alarm_dropped`, видно в `status`); лишилось: можливо збереження в NVS/SPIFFS, щоб пережити reboot. Розмір буфера й
-  поведінка при переповненні — питання до ментора (див. `case-brief.md`, розділ 9).
-- [x] **Порядок при вивантаженні.** (зроблено: поки буфер не порожній, нова телеметрія йде в його кінець) Поки йде flush, нова телеметрія шлеться напряму →
-  out-of-order на шлюзі. Або слати нове в кінець черги, або показувати це в метриках як норму.
-- [x] **flush блокує цикл** (зроблено: `flush_buffer_step()`, один пакет за 50 мс) (50 пакетів × 50 мс ≈ 2,5 с) — переробити на неблокуючий
-  (по пакету за прохід `loop()`).
-- [x] **Закомітити зміни `node_esp32.ino`** (зараз `LINK_VIA_USB_CABLE 1`, закомічено в `b478a90`). Лишилось:
-  зробити піни/режим конфігурованими без правки коду (наприклад, `#ifdef BOARD_xxx`),
-  щоб різні плати не конфліктували в git.
-- [ ] **Кілька плат одночасно на кількох UART-портах** (3 плати і hot-plug перевірено, див. розділ 0; лишилось: обмін портів, відповідність id). Шлюз тепер сканує всі порти й визнає ті,
-  що відповіли, але тест із двома платами ще не проведено. Перевірити: node_id за старшинством,
-  реєстр MAC → id, налаштування Wi-Fi на правильний порт, поведінка при обміні портів.
+- CRC-32 only: no authentication and no replay protection. HMAC-SHA256 (mbedTLS is on the ESP32) is the natural next step.
+- Buffered telemetry is fire-and-forget once a link accepts it; if a link dies in the middle of a flush those packets are
+  lost. Fix: acknowledge the last packet of a batch.
+- The node buffer is in RAM (50 telemetry packets, 8 alarms) and does not survive a reboot. NVS persistence is an option.
+- Only one critical message is in flight per node.
+- Loss rate on the dashboard is cumulative since the gateway started; a windowed value (last N packets) would be clearer.
+- Latency is round-trip only; one-way delay and jitter are not measured. After a link switch the smoothed RTT takes about
+  25 s to settle.
+- Impairment acts inside the gateway, so a node on a healthy wire does not notice the loss and does not buffer. Only a
+  blackout reaches the node (it stops the keep-alive).
+- With `LINK_VIA_USB_CABLE 1` the board's serial port carries protocol frames, so logs and console commands are unavailable
+  (use `0` for debugging).
+- The mosquitto config allows anonymous access on all interfaces; Wi-Fi credentials travel to nodes in plain text over the
+  serial link and are stored in NVS in plain text.
+- Two boards report zero roll/pitch/yaw because the MPU9250 is not detected on their I2C bus (wiring or power); the LCD
+  sketch shows `IMU not found` in that case.
+- The LCD backpack may pull SDA/SCL up to 5 V; check this before sharing the bus with a 3.3 V sensor such as the SHT41.
 
-## 2. Великі напрями (від команди)
+## Ideas
 
-- [ ] **Веб-інтерфейс і графіки метрик** (`web/`, блок E): графіки loss rate, latency, backlog,
-  RSSI/якість каналу по кожному вузлу; історія в SQLite вже є.
-- [ ] **Датчики (метрики).** Є скетчі `node_accelerometer` (roll/pitch/yaw, MPU9250) і `node_sht41` (temperature/humidity); перевірено на живих платах, графіки у вебі працюють.
-  Додати інші: BME280, напруга батареї, RSSI Wi-Fi,
-  free heap, uptime. Продумати єдину схему payload і версіювання полів.
-- [ ] **Керування серво** з веба: команда `servo` вже проходить через downlink; на платі
-  `SERVO_ENABLED` і обробка з ACK (`node_common.h`). Довести кінець-у-кінець: кнопка/слайдер
-  у вебі → шлюз → вузол → підтвердження (ACK) → відображення фактичного кута.
-- [ ] **LCD 1602 на кожній ESP (I2C-адаптер, PCF8574).** Виводити: тип з'єднання
-  (UART/TCP/UDP/нічого), IP, node_id, стан буфера (backlog), RSSI, останній ACK/помилку.
-  Дві рядки по 16 символів → кілька «екранів», що гортаються (або кнопка). Адреса I2C
-  зазвичай 0x27/0x3F, може конфліктувати з MPU9250 лише якщо збігаються адреси (0x68 vs 0x27 — ні).
-- [x] **Симуляція складних умов зв'язку** (зроблено в шлюзі, див. «Імпеймент-шар»; лишилась перевірка на платах) (вимога кейса №5 — «інструмент для моделювання
-  нестабільного каналу»). Impairment proxy між вузлом і шлюзом: втрати, jitter, delay,
-  duplication, reorder, розрив на N секунд, burst-втрати; профілі (`good`, `lossy20`,
-  `flaky`, `blackout30s`), відтворюваність через seed. Варіанти: власний UDP/TCP-проксі на C/Python
-  або `tc netem` у Linux. Із керуванням з веба (вмикати профіль кнопкою на демо).
+- Prometheus `/metrics` endpoint and a Grafana dashboard.
+- Adaptive retry: exponential backoff with jitter, timeout from measured RTT.
+- Message priorities (ALARM over CONFIG over TELEMETRY) in the queues; thinning old telemetry on overflow instead of
+  dropping the oldest.
+- End-to-end confirmation of dashboard commands (the dashboard currently reports "sent" once the MQTT publish succeeds).
+- Docker Compose bench (broker, gateway, web, several `sim_node`), a fuzz test for `protocol_unpack`, OTA updates,
+  reset reason in the HELLO frame, systemd units for start on boot.
 
-## 3. Розриви відносно вимог кейса (перевірити/добити)
+## Operating notes
 
-Перелік deliverables і критеріїв — `case-brief.md`, розділи 6–8.
-
-- [x] **Latency та backlog на dashboard** (зроблено). *Latency:* шлюз раз на 5 с шле online-вузлу
-  CONFIG `{"cmd":"ping"}`, вузол відповідає ACK з тим самим sequence, RTT = різниця за **годинником
-  шлюзу** (`CLOCK_MONOTONIC`), тож синхронізація годинників не потрібна. Це ковзне середнє
-  (α=0,3), роздільність ~10–20 мс (цикл шлюзу), зразок старший за 20 с показується як «–». Односторонню
-  затримку не міряємо: `timestamp_ms` плати — це `millis()`, а не час. *Backlog:* плата дописує в
-  телеметрію `backlog` (скільки пакетів лишиться в буфері після цього) і `dropped` у момент
-  відправки, тож під час вивантаження backlog спадає до 0; шлюз бере їх з найновішого пакета,
-  публікує в `case24/gateway/state`, веб показує в картці вузла й у KPI.
-- [ ] **Контроль цілісності / автентифікація.** Зараз CRC32. Кейс допускає «CRC/MAC», питання
-  до ментора. Якщо треба MAC — HMAC-SHA256 зі стандартної бібліотеки (mbedtls є в ESP32),
-  ключ не зберігати відкритим текстом у репозиторії. Захист від replay (sequence/timestamp).
-- [ ] **Специфікація протоколу:** таблиця полів + **діаграма станів** (вимога кейса). Є
-  `protocol-spec-v1-python.md`, яка застаріла (python видалено) → оновити під C-версію,
-  додати CONFIG, HELLO/реєстр id, UART-розпізнавання.
-- [ ] **Threat model високого рівня** (deliverable №8): підміна вузла, replay, DoS по UART/TCP,
-  пароль Wi-Fi через UART (нині відкритим текстом по дроту), відкритий брокер MQTT
-  (`allow_anonymous true`), `gateway.conf` у `.gitignore`.
-- [ ] **Звіт про тестування при різних профілях каналу** (deliverable №7): таблиця
-  loss/jitter/delay → доставлено/втрачено/retry/час відновлення. Залежить від імпеймент-симулятора.
-- [ ] **Інструкція запуску і відтворення** (deliverable №10): один `README` «як підняти
-  стенд з нуля», скрипт `make demo`/`run.sh`.
-- [ ] **Перелік відомих обмежень і техборгу** (deliverable №11) — частина пунктів із цього файлу.
-- [ ] **Критерій №1: ≥3 вузли одночасно.** 2 реальні плати + 1 `sim_node`; бажано прогін із
-  5–10 симульованих вузлів (вимога «3–10 вузлів»).
-- [ ] **Сценарій демо із 10 кроків** (розділ 8 кейса): пройти його цілком і виміряти час.
-  Окремо зробити «шпаргалку демо» з командами.
-- [ ] **Повторювані автотести:** `tests/` вже має unit-тести протоколу і reliability; додати
-  інтеграційні (шлюз + sim_node + impairment): 20% loss, дублікати, биті пакети, розрив 30 с.
-
-- [x] **Веб → плата: `alarm` і `simulate_loss`.** Плата обробляє `MSG_ALARM` від шлюзу (ACK, світлодіод,
-  `status`) і команду `simulate_loss` (втрати на виході, `[LOSS-SIM]`). Шлюз/`sim_node` переживають
-  перезапуск MQTT-брокера; запізнілий ALARM не вважається перезапуском вузла, перезапуск ловиться по HELLO.
-- [ ] **Підтвердження команд з веба наскрізь.** `/api/alarm`, `/api/servo`, `/api/simulate-loss` повертають
-  `sent: true` лише за публікацію в MQTT. Треба: шлюз публікує ACK вузла (топік), веб показує «виконано».
-
-## 4. Ідеї додаткового функціоналу
-
-Те, що показує «інженерну зрілість» і добре виглядає на демо.
-
-- **Імпеймент-панель у вебі:** повзунки loss/delay/jitter/dup + кнопка «blackout 30 s» →
-  графіки реагують наживо. Найкраще демо кроків 4–9.
-- **Відтворюваність:** запис сесії (pcap-подібний лог пакетів) і реплей через симулятор;
-  один seed → однаковий результат; експорт результатів тесту в JSON/CSV.
-- **Prometheus-ендпоінт `/metrics`** на шлюзі/вебі (+ готовий дашборд Grafana як опція) —
-  кейс прямо називає Prometheus/Grafana.
-- **Адаптивний retry:** експоненціальний backoff + jitter замість фіксованих 2 с;
-  вимірювання RTT і динамічний таймаут (як у TCP).
-- **Пріоритети повідомлень:** ALARM > CONFIG > TELEMETRY при вивантаженні буфера і в черзі.
-- **Агрегація/стиснення в буфері:** при переповненні проріджувати старі телеметричні точки,
-  а не просто відкидати найстаріші; критичне ніколи не відкидати.
-- **Захист від replay + опційний HMAC** (див. розділ 3), ключ у `gateway.conf` / NVS.
-- **OTA-оновлення прошивки** вузлів через шлюз (ArduinoOTA) або принаймні віддалена
-  зміна конфігурації (інтервал телеметрії, пороги ALARM) тим самим CONFIG-пакетом.
-- **Watchdog і self-healing на платі:** автоперепідключення Wi-Fi/TCP з backoff, hardware WDT,
-  причина останнього reset у HELLO (`esp_reset_reason`).
-- **Якість каналу в кожному вузлі:** RSSI, кількість retry, % втрат — окремі лічильники
-  на самій платі (показуються на LCD і в телеметрії).
-- **Автовиявлення дротового каналу** вже є (UART). Розширити: mDNS/широкомовне UDP-виявлення
-  шлюзу замість IP через UART.
-- **Журнал подій у вебі:** фільтр за вузлом/типом (ONLINE/OFFLINE, retry вичерпано, битий
-  пакет, дублікат) з часовою шкалою на графіках.
-- **Сповіщення:** звук/банер на дашборді при OFFLINE вузла або «retry вичерпано».
-- **Docker-compose стенду** (mosquitto + gateway + web + кілька sim_node) — «запустив одну
-  команду, побачив усе». Кейс дозволяє емуляцію в Docker.
-- **Fuzz-тест парсера** (libFuzzer/AFL або випадкові байти в `protocol_unpack`) — пряме
-  підтвердження критерію №5 «пошкоджений пакет не валить шлюз».
-
-## 5. Порядок, який я б радив (до фінального демо)
-
-1. Закрити критерії приймання №1–5 надійно (ALARM у буфер, ≥3 вузли, 20% loss, дублікати, битий пакет, розрив 30 с).
-2. Impairment-симулятор з профілями + керування з веба (без нього нема демо кроків 4–8).
-3. Dashboard: loss rate, latency, backlog, online/offline.
-4. Документи: специфікація зі станами, threat model, звіт про тести, інструкція, обмеження.
-5. «Бонуси»: LCD, серво, нові датчики, Prometheus/Grafana, HMAC.
+- Start everything: `./run.sh` (add `--open` for the browser, or use the desktop shortcut from `./install-shortcut.sh`).
+- After pulling changes on the Raspberry Pi: `make -B -C gateway` when `gateway.c` or `protocol/` changed, then restart the
+  gateway and the dashboard. Boards only need reflashing when `node_common/` or the sketches changed.
+- Run `node_common/sync.sh` after editing `node_common/` or `protocol/`; `make test` checks that the sketch copies match.
+- macOS: Firefox needs the Local Network permission; AddressSanitizer hangs on this system, so `make test` uses UBSan.

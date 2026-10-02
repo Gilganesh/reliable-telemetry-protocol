@@ -8,6 +8,9 @@ ESP32 firmware is split into a sensor-independent core and one sketch per sensor
 | `packet_queue.h` | Fixed-capacity ring buffer of packets (unit-tested on the host) |
 | `../node_accelerometer/` | MPU9250 on I2C (SDA 21, SCL 22, address 0x68): `roll`, `pitch`, `yaw` |
 | `../node_sht41/` | SHT41 on I2C (default pins, address 0x44): `temperature`, `humidity` |
+| `node_lcd.h` | Dependency-free driver for a 1602 LCD behind a PCF8574 I2C backpack (unit-tested against an HD44780 emulator) |
+| `../node_default_lcd/` | Sensorless node with an LCD: telemetry is `uptime_s`, `free_heap_kb`, `rssi` |
+| `../node_accelerometer_lcd/`, `../node_sht41_lcd/` | The two sensor sketches with an LCD |
 | `raw_tests/` | Minimal sketches to bring up each sensor on its own |
 | `sync.sh` | Copies the core and `../protocol/` into each sketch folder; `--check` verifies the copies |
 
@@ -21,6 +24,21 @@ bool sensor_payload(char *buf, size_t n);   // JSON object for the next telemetr
 
 Arduino IDE only compiles files located next to the sketch, so run `sync.sh` after editing this folder or
 `../protocol/`.
+
+## LCD
+
+A sketch enables the display with `#define NODE_LCD 1` before including `node_common.h`; without it none of the LCD code is compiled.
+The sketch calls `Wire.begin(NODE_I2C_SDA, NODE_I2C_SCL)` (default SDA 21, SCL 18: valid on both ESP32-WROOM and ESP32-S3; `node_sht41_lcd` overrides SCL to 22 for a WROOM),
+`lcd.setBusClocks(lcd_hz, sensor_hz)` and `lcd_init()`, and implements one extra hook:
+
+```cpp
+bool sensor_display(char *line, size_t n);   // 16-character line for row 2; return false to show buffer statistics
+```
+
+The display is refreshed every 250 ms and at most one changed line is written per pass, so the main loop is never blocked for
+more than a few milliseconds. An MPU9250 on a 400 kHz bus drops to 100 kHz only for the duration of a display write. If the
+display is unplugged the node keeps working and probes for it every 5 s. `lcd_message(line1, line2)` shows a message at
+once (used for the IMU calibration prompt) and `LCD_FLASH(text)` shows a short event for three seconds.
 
 ## Links
 
