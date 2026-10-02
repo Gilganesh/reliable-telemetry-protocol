@@ -154,6 +154,24 @@
         <button class="btn primary" id="btnServo" style="width:100%">Повернути</button>
       </div>
       <div class="panel">
+        <h2>Перешкоди каналу</h2>
+        <div class="sub" id="impStatus" style="color:var(--muted);font-size:12px;margin-bottom:8px">Перешкод немає</div>
+        <div class="row"><label>Профіль</label>
+          <select id="impProfile">
+            <option value="good">good: без перешкод</option>
+            <option value="lossy20">lossy20: 20% втрат</option>
+            <option value="delay">delay: 200 мс + jitter</option>
+            <option value="flaky">flaky: втрати, дублі, биті, reorder</option>
+          </select></div>
+        <div class="row"><label>Вузол</label><select id="impNode"></select></div>
+        <button class="btn primary" id="btnImpApply" style="width:100%">Застосувати профіль</button>
+        <div class="row" style="margin-top:8px">
+          <button class="btn danger" id="btnBlackout" style="flex:1">Розрив 30 с</button>
+          <button class="btn" id="btnBlackoutOff" style="flex:1">Скасувати розрив</button>
+        </div>
+        <div class="sub" style="color:var(--muted);font-size:12px">Перешкоди вмикаються на шлюзі й діють на всі канали (UART/TCP/UDP) в обидва боки; лічильники скидаються при зміні профілю.</div>
+      </div>
+      <div class="panel">
         <h2>Симуляція втрат</h2>
         <div class="row"><label>Вузол</label><select id="lossNode"></select></div>
         <div class="row"><label>Втрати %</label><input type="number" id="lossPct" min="0" max="100" value="20" style="width:80px"></div>
@@ -243,6 +261,7 @@ function nodeCard(n) {
     <div class="bar" title="loss rate"><i style="width:${Math.max(loss, 0.5)}%;background:${lossCls}"></i></div>
     <div class="node-foot">
       <span>loss ${loss.toFixed(1)}% · seq ${n.max_seq_seen} · ${seen}</span><span class="spacer"></span>
+      <button class="btn small" data-fire="${n.node_id}" title="Вузол сам створює ALARM з ACK/retry">ALARM з вузла</button>
       ${n.alarm_active ? `<span class="pill bad">тривога</span><button class="btn small" data-alarm="${n.node_id}" data-state="0">Скинути</button>`
                        : `<button class="btn small danger" data-alarm="${n.node_id}" data-state="1">Аларм</button>`}
     </div>
@@ -264,6 +283,16 @@ function renderState() {
   const bls = nodes.filter(n => n.backlog != null);
   $("kBacklog").textContent = bls.length ? bls.reduce((a, n) => a + n.backlog, 0) : "–";
 
+  const imp = state.impairment || {};
+  if (imp.blackout_left_s > 0 || imp.active) {
+    const parts = [];
+    if (imp.blackout_left_s > 0) parts.push(`<b style="color:var(--bad)">РОЗРИВ: ще ${imp.blackout_left_s.toFixed(0)} с</b>`);
+    parts.push(`профіль <b>${esc(imp.profile)}</b>${imp.node ? " · вузол #" + imp.node : " · всі вузли"}`);
+    parts.push(`втрати ${imp.loss}% · дублі ${imp.dup}% · биті ${imp.corrupt}% · затримка ${imp.delay_ms}+0..${imp.jitter_ms} мс`);
+    parts.push(`зіпсовано: вх. втрачено ${imp.dropped_up}, вих. втрачено ${imp.dropped_down}, дублів ${imp.duplicated}, битих ${imp.corrupted}, відкладено ${imp.delayed}`);
+    $("impStatus").innerHTML = parts.join("<br>");
+  } else $("impStatus").textContent = "Перешкод немає";
+
   const bp = $("brokerPill");
   bp.className = "pill " + (cfg.connected ? "ok" : "bad");
   $("brokerText").textContent = `${cfg.host}:${cfg.port}`;
@@ -284,6 +313,9 @@ function renderState() {
   const key = nodes.map(n => n.node_id).join(",");
   if (key !== lastSelectKey) {
     lastSelectKey = key;
+    const isel = $("impNode"), iprev = isel.value;
+    isel.innerHTML = `<option value="0">Усі вузли</option>` + nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
+    if (iprev) isel.value = iprev;
     for (const id of ["servoNode", "lossNode"]) {
       const sel = $(id), prev = sel.value;
       sel.innerHTML = nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
@@ -382,6 +414,12 @@ async function refreshEvents() {
 }
 
 $("nodes").addEventListener("click", async e => {
+  const fire = e.target.dataset.fire;
+  if (fire) {
+    try { const r = await api(`/api/node-alarm/${fire}`, "POST", {}); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); }
+    catch (err) { toast(err.message); }
+    return;
+  }
   const id = e.target.dataset.alarm; if (!id) return;
   try { await api(`/api/alarm/${id}`, "POST", { state: e.target.dataset.state === "1" }); tick(); }
   catch (err) { toast(err.message); }
@@ -397,6 +435,14 @@ async function sendLoss(on) {
 }
 $("btnLossOn").onclick = () => sendLoss(true);
 $("btnLossOff").onclick = () => sendLoss(false);
+
+async function sendImpair(body) {
+  try { const r = await api("/api/impairment", "POST", body); if (!r.sent) toast("Не надіслано: немає MQTT-з'єднання"); tick(); }
+  catch (e) { toast(e.message); }
+}
+$("btnImpApply").onclick = () => sendImpair({ profile: $("impProfile").value, node: +$("impNode").value });
+$("btnBlackout").onclick = () => sendImpair({ blackout_s: 30, node: +$("impNode").value });
+$("btnBlackoutOff").onclick = () => sendImpair({ blackout_s: 0 });
 
 /* ---------- діалоги ---------- */
 document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest("dialog").close());
