@@ -122,6 +122,8 @@ typedef struct {
     ReplyRoute last_route;
 
     uint64_t last_ts_ms;
+    int64_t  clock_offset_ms;
+    bool     clock_valid;
     uint8_t  prov_acks;
     uint32_t prov_seq_wifi;
     uint32_t prov_seq_gw;
@@ -915,6 +917,7 @@ static void node_seq_reset(NodeState *n) {
     n->alarm_idx = 0;
     n->alarm_filled = 0;
     n->last_ts_ms = 0;
+    n->clock_valid = false;
     provision_reset(n);
 }
 
@@ -970,7 +973,20 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
     cJSON_Delete(j);
 }
 
-static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, RouteKind kind, NodeState *node) {
+#define CLOCK_LEAK_MS 2
+
+static int64_t sample_age_ms(NodeState *n, int64_t delta_ms) {
+    if (!n->clock_valid) {
+        n->clock_offset_ms = delta_ms;
+        n->clock_valid = true;
+        return 0;
+    }
+    int64_t relaxed = n->clock_offset_ms + CLOCK_LEAK_MS;
+    n->clock_offset_ms = delta_ms < relaxed ? delta_ms : relaxed;
+    return delta_ms - n->clock_offset_ms;
+}
+
+static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, RouteKind kind, NodeState *node, int64_t age_ms) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
     cJSON_AddNumberToObject(root, "node_id", pkt->node_id);
@@ -978,6 +994,7 @@ static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, 
     cJSON_AddNumberToObject(root, "ts_ms", (double)pkt->timestamp_ms);
     cJSON_AddNumberToObject(root, "type", pkt->msg_type);
     cJSON_AddStringToObject(root, "transport", route_kind_name(kind));
+    cJSON_AddNumberToObject(root, "age_ms", (double)age_ms);
 
     cJSON *payload = pkt->payload_len > 0 ? cJSON_Parse(payload_str) : NULL;
     if (payload) {
@@ -1099,7 +1116,8 @@ void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *rou
     tmp[pkt.payload_len] = '\0';
 
     if (!is_seq_duplicate) {
-        publish_telemetry(&pkt, tmp, route->kind, node);
+        int64_t age_ms = sample_age_ms(node, (int64_t)t_now - (int64_t)pkt.timestamp_ms);
+        publish_telemetry(&pkt, tmp, route->kind, node, age_ms);
     }
 
     if (pkt.msg_type == MSG_ALARM || pkt.msg_type == MSG_CONFIG) {

@@ -132,7 +132,6 @@
   <span id="gwPill" class="pill"><i class="dot"></i><span>Gateway</span></span>
   <span id="brokerPill" class="pill"><i class="dot"></i><span id="brokerText">MQTT</span></span>
   <button class="btn small" id="btnTheme" title="Switch between dark and light theme"></button>
-  <button class="btn small" id="btnAddNode">+ Node</button>
   <button class="btn small" id="btnBroker">MQTT</button>
 </header>
 
@@ -189,13 +188,6 @@
   </section>
 </main>
 
-<dialog id="dlgNode">
-  <h3>Add node</h3>
-  <div class="row"><label>Node ID</label><input type="number" id="nId" min="1" max="65535" value="1"></div>
-  <div class="row"><label>Name</label><input type="text" id="nName" maxlength="40"></div>
-  <div class="row"><label>IP</label><input type="text" id="nIp" maxlength="45" placeholder="optional"></div>
-  <div class="row"><button class="btn primary" id="nSave" style="flex:1">Add</button><button class="btn" data-close>Cancel</button></div>
-</dialog>
 <dialog id="dlgBroker">
   <h3>MQTT broker</h3>
   <div class="row"><label>Host</label><input type="text" id="bHost"></div>
@@ -207,13 +199,14 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const esc = s => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; };
+const SERVICE_METRICS = ["backlog", "dropped"];
 const PALETTES = {
   dark: ["#4f9cff", "#2dd4bf", "#fbbf24", "#f87171", "#a78bfa", "#f472b6"],
   light: ["#2563eb", "#0d9488", "#d97706", "#dc2626", "#7c3aed", "#db2777"],
 };
 const theme = () => document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-const RANGES = { "5 min": 300, "30 min": 1800, "1 h": 3600, "6 h": 21600, "24 h": 86400 };
+const RANGES = { "1 min": 60, "5 min": 300, "30 min": 1800, "1 h": 3600, "6 h": 21600, "24 h": 86400 };
 
 let state = { nodes: [], mqtt_config: {} };
 let metrics = {};
@@ -250,7 +243,7 @@ function nodeCard(n) {
   const seen = n.last_seen_s == null ? "no packets yet" : n.last_seen_s + " s ago";
   return `<div class="node ${n.online ? "" : "offline"} ${n.alarm_active ? "alarm" : ""}">
     <div class="node-head">
-      <div><div class="title">#${n.node_id} ${esc(n.name)}</div><div class="sub mono">${esc(n.ip_address)}</div></div>
+      <div><div class="title">#${n.node_id} ${esc(n.name)}</div></div>
       <span class="spacer"></span>
       <span class="pill">${esc(n.transport)}</span>
       <span class="pill ${n.online ? "ok" : ""}"><i class="dot"></i>${n.online ? "online" : "offline"}</span>
@@ -330,7 +323,7 @@ function pickDefaults(c) {
   const ids = Object.keys(metrics);
   if (c.node == null || !metrics[c.node]) c.node = ids.length ? +ids[0] : (state.nodes[0] ? state.nodes[0].node_id : null);
   const list = metrics[c.node] || [];
-  if (!list.includes(c.metric)) c.metric = list[0] || null;
+  if (!list.includes(c.metric)) c.metric = list.find(m => !SERVICE_METRICS.includes(m)) || list[0] || null;
 }
 
 function chartHtml(c) {
@@ -358,12 +351,12 @@ function renderCharts() {
     const palette = PALETTES[theme()], color = palette[(c.id - 1) % palette.length];
     instances[c.id] = new Chart(el, {
       type: "line",
-      data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: color + "22", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
+      data: { datasets: [{ data: [], borderColor: color, backgroundColor: color + "22", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
       options: {
         responsive: true, maintainAspectRatio: false, animation: false,
         plugins: { legend: { display: false } },
         scales: {
-          x: { ticks: { color: cssVar("--muted"), maxTicksLimit: 6, maxRotation: 0, font: { size: 10 } }, grid: { color: cssVar("--grid") } },
+          x: { type: "linear", ticks: { color: cssVar("--muted"), maxTicksLimit: 6, maxRotation: 0, font: { size: 10 }, callback: v => new Date(v).toLocaleTimeString("en-GB") }, grid: { color: cssVar("--grid") } },
           y: { ticks: { color: cssVar("--muted"), font: { size: 10 } }, grid: { color: cssVar("--grid") } },
         },
       },
@@ -379,9 +372,10 @@ async function refreshCharts() {
     if (!inst || c.node == null || !c.metric) { if (box) box.classList.remove("hidden"); return; }
     try {
       const d = await api(`/api/history?node_id=${c.node}&metric=${encodeURIComponent(c.metric)}&since_s=${c.range}`);
-      const fmt = c.range > 3600 ? { hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit", second: "2-digit" };
-      inst.data.labels = d.points.map(p => new Date(p.t).toLocaleTimeString("en-GB", fmt));
-      inst.data.datasets[0].data = d.points.map(p => p.v);
+      const end = Date.now();
+      inst.options.scales.x.min = end - c.range * 1000;
+      inst.options.scales.x.max = end;
+      inst.data.datasets[0].data = d.points.map(p => ({ x: p.t, y: p.v }));
       inst.data.datasets[0].label = c.metric;
       inst.update("none");
       box.classList.toggle("hidden", d.points.length > 0);
@@ -433,11 +427,6 @@ $("btnBlackout").onclick = () => sendImpair({ blackout_s: 30, node: +$("impNode"
 $("btnBlackoutOff").onclick = () => sendImpair({ blackout_s: 0 });
 
 document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest("dialog").close());
-$("btnAddNode").onclick = () => $("dlgNode").showModal();
-$("nSave").onclick = async () => {
-  try { await api("/api/nodes/add", "POST", { node_id: +$("nId").value, name: $("nName").value, ip_address: $("nIp").value }); $("dlgNode").close(); tick(); }
-  catch (e) { toast(e.message); }
-};
 $("btnBroker").onclick = () => { $("bHost").value = state.mqtt_config.host || "localhost"; $("bPort").value = state.mqtt_config.port || 1883; $("dlgBroker").showModal(); };
 $("bSave").onclick = async () => {
   try { await api("/api/config/broker", "POST", { host: $("bHost").value, port: +$("bPort").value }); $("dlgBroker").close(); tick(); }
