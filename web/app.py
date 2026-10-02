@@ -224,6 +224,9 @@ def get_or_create_node(node_id: int, ip_address: str = "—", name: str = ""):
             "online": False,
             "transport": "?",
             "last_seen_ms_ago": None,
+            "latency_ms": None,      # RTT до вузла (ping/ACK), міряє Gateway
+            "backlog": None,         # скільки пакетів чекає в буфері плати
+            "buffer_dropped": 0,     # скільки втрачено в буфері плати через переповнення
             "alarm_active": False,
         }
     return nodes[node_id]
@@ -246,7 +249,8 @@ def on_gateway_state(msg):
                 continue
             node = get_or_create_node(node_id)
             for key in ("online", "transport", "received_count", "lost_count",
-                        "duplicate_count", "max_seq_seen", "loss_rate", "last_seen_ms_ago"):
+                        "duplicate_count", "max_seq_seen", "loss_rate", "last_seen_ms_ago",
+                        "latency_ms", "backlog", "buffer_dropped"):
                 if key in gw:
                     node[key] = gw[key]
 

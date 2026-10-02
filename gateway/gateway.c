@@ -165,6 +165,17 @@ typedef struct {
     uint32_t prov_seq_wifi;   // sequence наших CONFIG-пакетів (0 = ще не надсилали)
     uint32_t prov_seq_gw;
     uint64_t prov_last_ms;    // коли востаннє слали (для повторів)
+
+    // Затримка: шлюз раз на PING_INTERVAL_MS шле вузлу CONFIG {"cmd":"ping"} і міряє
+    // час до ACK на СВОЄМУ монотонному годиннику (годинники плат не синхронізуємо).
+    uint32_t ping_seq;        // sequence пінга, що чекає на ACK (0 = нема)
+    uint64_t ping_sent_ms;
+    uint64_t ping_next_ms;    // коли слати наступний (0 = одразу)
+    double   rtt_ms;          // ковзне середнє RTT
+    uint64_t rtt_at_ms;       // коли отримано останній зразок (0 = ще не було)
+    // Стан буфера на платі (поле backlog/dropped у payload найновішої телеметрії)
+    int32_t  backlog;         // -1 = вузол не повідомляє
+    uint32_t buffer_dropped;
 } NodeState;
 
 NodeState nodes[MAX_NODES];
@@ -271,6 +282,7 @@ NodeState* find_or_create_node(uint16_t node_id) {
         memset(new_node, 0, sizeof(NodeState));
         new_node->node_id = node_id;
         new_node->max_seq_seen = -1; // -1 означає, що пакетів ще не було
+        new_node->backlog = -1;
         new_node->was_online = true; // щойно прийшов перший пакет -- вважаємо online
         node_count++;
         log_event("[СТАТУС] Новий вузол %u зареєстрований\n", node_id);
@@ -811,7 +823,15 @@ static void send_frame_route(const ReplyRoute *route, uint8_t type, uint16_t nod
     pkt.payload_len = (uint16_t)n;
     uint8_t tx[256];
     int len = protocol_pack(&pkt, tx, sizeof(tx));
-    if (len > 0) route_reply(route, tx, len);
+    if (len <= 0) return;
+    if (route->kind == ROUTE_MQTT) {
+        // MQTT-вузол слухає свій downlink-топік (потрібен node_id != 0)
+        char topic[64];
+        snprintf(topic, sizeof(topic), DOWNLINK_PREFIX "%u", node_id);
+        mosquitto_publish(mosq_global, NULL, topic, len, tx, 0, false);
+    } else {
+        route_reply(route, tx, len);
+    }
 }
 
 // Скидає облік sequence/дедуплікації вузла (плата перезапустилась і почала
@@ -833,7 +853,7 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
     js[pkt->payload_len] = '\0';
 
     cJSON *j = cJSON_Parse(js);
-    cJSON *mac_j = j ? cJSON_GetObjectItemCaseSensitive(j, "mac") : NULL;
+    cJSON *mac_j = cJSON_IsObject(j) ? cJSON_GetObjectItemCaseSensitive(j, "mac") : NULL;
     if (!cJSON_IsString(mac_j) || strlen(mac_j->valuestring) < 8 || strlen(mac_j->valuestring) >= sizeof(g_reg[0].mac)) {
         log_event("[ID] HELLO без коректного mac, відхилено (канал=%s)\n", route_kind_name(route->kind));
         cJSON_Delete(j);
@@ -881,7 +901,7 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
 
 // Публікує пакет у TELEMETRY_TOPIC. Payload, якщо це валідний JSON, іде як
 // вкладений об'єкт; інакше -- сирим рядком у "payload_raw".
-static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, RouteKind kind) {
+static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, RouteKind kind, NodeState *node) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
     cJSON_AddNumberToObject(root, "node_id", pkt->node_id);
@@ -892,6 +912,13 @@ static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, 
 
     cJSON *payload = pkt->payload_len > 0 ? cJSON_Parse(payload_str) : NULL;
     if (payload) {
+        // Стан буфера беремо лише з найновішого пакета: запізнілі з буфера описують минуле
+        if (node && cJSON_IsObject(payload) && (int32_t)pkt->sequence == node->max_seq_seen) {
+            cJSON *bl = cJSON_GetObjectItemCaseSensitive(payload, "backlog");
+            cJSON *dr = cJSON_GetObjectItemCaseSensitive(payload, "dropped");
+            if (cJSON_IsNumber(bl) && bl->valuedouble >= 0 && bl->valuedouble < 1e6) node->backlog = (int32_t)bl->valuedouble;
+            if (cJSON_IsNumber(dr) && dr->valuedouble >= 0 && dr->valuedouble < 4e9) node->buffer_dropped = (uint32_t)dr->valuedouble;
+        }
         cJSON_AddItemToObject(root, "payload", payload);
     } else if (pkt->payload_len > 0) {
         cJSON_AddStringToObject(root, "payload_raw", payload_str);
@@ -904,6 +931,8 @@ static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, 
     }
     cJSON_Delete(root);
 }
+
+static void latency_on_ack(const SensorPacket *ack);
 
 void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) {
     SensorPacket pkt = {0};
@@ -927,6 +956,7 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
     // це не телеметрія, у облік sequence/втрат не потрапляє.
     if (pkt.msg_type == MSG_ACK) {
         provision_on_ack(&pkt);
+        latency_on_ack(&pkt);
         return;
     }
 
@@ -1027,7 +1057,7 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
 
     // Дублі не віддаємо вебу -- у БД вони теж не потрібні.
     if (!is_seq_duplicate && pkt.msg_type != MSG_ACK) {
-        publish_telemetry(&pkt, tmp, route->kind);
+        publish_telemetry(&pkt, tmp, route->kind, node);
     }
 
     // Обробка критичних подій -- тепер логуємо ОБИДВА випадки: і нову
@@ -1134,6 +1164,46 @@ static void mqtt_maintain(uint64_t now) {
     if (mosquitto_reconnect_async(mosq_global) != MOSQ_ERR_SUCCESS && ++failures == 3) {
         log_event("[MQTT] Брокер %s:%d недоступний -- шлюз працює без MQTT і пробує знову кожні %d с\n",
                    MQTT_HOST, MQTT_PORT, MQTT_RETRY_MS / 1000);
+    }
+}
+
+// ---- Вимірювання затримки (RTT) ----
+// Раз на PING_INTERVAL_MS кожному online-вузлу йде CONFIG {"cmd":"ping"}; вузол
+// відповідає ACK з тим самим sequence. RTT = час між відправкою і ACK за годинником
+// шлюзу, тому синхронізація годинників не потрібна. Роздільність ~10-20 мс (цикл шлюзу).
+// Вузол, що не відповів, просто не дає зразка (разом із втратами це видно в loss rate).
+#define PING_INTERVAL_MS 5000
+#define RTT_STALE_MS 20000     // зразок старший за це -- у стані latency_ms = null
+#define RTT_EWMA_ALPHA 0.3
+
+static void ping_tick(uint64_t now) {
+    for (int i = 0; i < node_count; i++) {
+        NodeState *n = &nodes[i];
+        if (now - n->last_seen_ms >= NODE_TIMEOUT_MS) { n->ping_seq = 0; continue; } // OFFLINE
+        if (n->ping_next_ms != 0 && now < n->ping_next_ms) continue;
+
+        ReplyRoute route = n->last_route;
+        if (route.kind == ROUTE_UART && !uart_port_by_fd(route.fd)) continue;
+        if (route.kind == ROUTE_TCP && !tcp_fd_active(route.fd)) continue;
+        if (route.kind == ROUTE_MQTT && !g_mqtt_connected) continue;
+
+        n->ping_next_ms = now + PING_INTERVAL_MS;
+        n->ping_seq = next_down_seq();
+        n->ping_sent_ms = now;
+        send_frame_route(&route, MSG_CONFIG, n->node_id, n->ping_seq, "{\"cmd\":\"ping\"}");
+    }
+}
+
+static void latency_on_ack(const SensorPacket *ack) {
+    uint64_t now = get_monotonic_time_ms();
+    for (int i = 0; i < node_count; i++) {
+        NodeState *n = &nodes[i];
+        if (n->node_id != ack->node_id || n->ping_seq == 0 || ack->sequence != n->ping_seq) continue;
+        double rtt = (double)(now - n->ping_sent_ms);
+        n->rtt_ms = n->rtt_at_ms == 0 ? rtt : RTT_EWMA_ALPHA * rtt + (1.0 - RTT_EWMA_ALPHA) * n->rtt_ms;
+        n->rtt_at_ms = now;
+        n->ping_seq = 0; // запізнілий дубль ACK вдруге не рахуємо
+        return;
     }
 }
 
@@ -1445,9 +1515,9 @@ void poll_uart(void) {
 void print_dashboard() {
     uint64_t now = get_monotonic_time_ms();
     printf("\n--- Дашборд (Вузлів: %d) ---\n", node_count);
-    printf("%-5s | %-7s | %-6s | %-6s | %-6s | %-6s | %-10s\n",
-           "Вузол", "Статус", "Канал", "Отр.", "Втрат", "Дубл.", "Max Seq");
-    printf("--------------------------------------------------------------\n");
+    printf("%-5s | %-7s | %-6s | %-6s | %-6s | %-6s | %-8s | %-7s | %-10s\n",
+           "Вузол", "Статус", "Канал", "Отр.", "Втрат", "Дубл.", "RTT мс", "Backlog", "Max Seq");
+    printf("----------------------------------------------------------------------------------\n");
 
     for (int i = 0; i < node_count; i++) {
         NodeState *n = &nodes[i];
@@ -1471,10 +1541,13 @@ void print_dashboard() {
             loss_rate = ((double)n->lost_count / (n->received_count + n->lost_count)) * 100.0;
         }
 
-        printf("%-5u | %-7s | %-6s | %-6u | %-6u | %-6u | %-10d (Loss: %.1f%%)\n",
+        char rtt_s[16] = "-", bl_s[16] = "-";
+        if (n->rtt_at_ms != 0 && now - n->rtt_at_ms < RTT_STALE_MS) snprintf(rtt_s, sizeof(rtt_s), "%.0f", n->rtt_ms);
+        if (n->backlog >= 0) snprintf(bl_s, sizeof(bl_s), "%d", n->backlog);
+        printf("%-5u | %-7s | %-6s | %-6u | %-6u | %-6u | %-8s | %-7s | %-10d (Loss: %.1f%%)\n",
                n->node_id, online ? "ONLINE" : "OFFLINE", route_kind_name(n->last_transport),
                n->received_count, n->lost_count, n->duplicate_count,
-               n->max_seq_seen, loss_rate);
+               rtt_s, bl_s, n->max_seq_seen, loss_rate);
     }
     printf("Всього битих пакетів з початку роботи: %u\n", corrupted_count);
     printf("======================================================\n");
@@ -1518,6 +1591,12 @@ void publish_gateway_state(void) {
         // порівнянний лише сам із собою (не з wall-clock веб-сторони).
         // Веб показує це як "X.Xс тому", а не намагається звести годинники.
         cJSON_AddNumberToObject(node_json, "last_seen_ms_ago", (double)(now - n->last_seen_ms));
+        bool rtt_fresh = n->rtt_at_ms != 0 && now - n->rtt_at_ms < RTT_STALE_MS;
+        if (rtt_fresh) cJSON_AddNumberToObject(node_json, "latency_ms", n->rtt_ms);
+        else           cJSON_AddNullToObject(node_json, "latency_ms");
+        if (n->backlog >= 0) cJSON_AddNumberToObject(node_json, "backlog", n->backlog);
+        else                 cJSON_AddNullToObject(node_json, "backlog");
+        cJSON_AddNumberToObject(node_json, "buffer_dropped", n->buffer_dropped);
         cJSON_AddItemToArray(nodes_json, node_json);
     }
 
@@ -1583,6 +1662,7 @@ int main(void) {
 
         now = get_monotonic_time_ms();
         uart_tick(now);
+        ping_tick(now);
         if (now - last_dash_ms >= 2000) {
             print_dashboard();
             publish_gateway_state(); // те саме, що дашборд, але для веб (Блок E)

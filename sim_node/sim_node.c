@@ -105,9 +105,16 @@ static void sim_reliable_send(void *userdata, const uint8_t *buf, int len) {
 /* Викликається бібліотекою mosquitto, коли приходить повідомлення в
  * топіку, на який ми підписані (case24/downlink/99) -- тобто ACK від
  * Gateway. */
+/* CONFIG {"cmd":"ping"} від шлюзу (вимірювання затримки) */
+static bool payload_is_ping(const SensorPacket *pkt) {
+    char js[MAX_PAYLOAD_SIZE + 1];
+    memcpy(js, pkt->payload, pkt->payload_len);
+    js[pkt->payload_len] = '\0';
+    return strstr(js, "\"ping\"") != NULL;
+}
+
 static void on_downlink_message(struct mosquitto *mosq, void *userdata,
                                  const struct mosquitto_message *msg) {
-    (void)mosq;
     (void)userdata;
 
     SensorPacket pkt = {0};
@@ -119,6 +126,18 @@ static void on_downlink_message(struct mosquitto *mosq, void *userdata,
     if (pkt.msg_type == MSG_ACK) {
         printf("[ACK] Отримано підтвердження sequence=%u\n", pkt.sequence);
         reliable_on_ack_received(&g_reliable, pkt.sequence);
+    } else if (pkt.msg_type == MSG_CONFIG && pkt.node_id == SIM_NODE_ID && payload_is_ping(&pkt)) {
+        /* Ping шлюзу для вимірювання затримки: відповідаємо ACK з тим самим sequence.
+         * Іде через transport_publish, тож --loss-percent діє і на відповіді. */
+        SensorPacket ack = {0};
+        ack.version = PROTOCOL_VERSION;
+        ack.msg_type = MSG_ACK;
+        ack.node_id = SIM_NODE_ID;
+        ack.sequence = pkt.sequence;
+        ack.timestamp_ms = now_ms();
+        uint8_t tx[RELIABLE_MAX_PACKET];
+        int len = protocol_pack(&ack, tx, sizeof(tx));
+        if (len > 0) transport_publish(mosq, tx, len);
     }
 }
 
