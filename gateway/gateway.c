@@ -22,33 +22,20 @@
 #include <arpa/inet.h>
 #include <mosquitto.h>
 #include <cjson/cJSON.h>
-#include "protocol.h" // Підключаємо реальний протокол Блока А
+#include "protocol.h"
 
 #define MAX_NODES 10
 #define MAX_SEEN_ALARMS 16
-#define SEQ_WINDOW 64 // скільки останніх sequence пам'ятаємо для відрізнення дубліката від запізнілого пакета
-#define NODE_TIMEOUT_MS 15000 // 15 с без повідомлень = вузол OFFLINE (плата шле раз на 5 с, тож 3 пропуски поспіль)
+#define SEQ_WINDOW 64
+#define NODE_TIMEOUT_MS 15000
 #define LOG_FILE_PATH "gateway_log.txt"
 
-/* ==== 30.09 (3) -- три РІЗНІ транспорти для трьох фізичних плат ====
- * Мета: та сама протокольна логіка (protocol_unpack, дедуп, ACK) працює
- * НЕЗАЛЕЖНО від того, як байти прийшли -- MQTT (як і раніше, для
- * sim_node/сумісності), "сирий" UDP, "сирий" TCP, чи UART через дріт.
- * Це і є вимога кейсу "транспортний рівень замінний" -- зроблена не як
- * документ-намір, а як реальний код: чотири джерела, один
- * handle_packet(), один дашборд, один case24/gateway/state для веб. */
 #define UDP_PORT      5005
+#define UDP_MAX_PER_POLL 32
 #define TCP_PORT      5006
-#define UART_DEVICE   "/dev/ttyUSB0"  /* USB-до-TTL перехідник; якщо інша
-                                        * назва -- перевір `ls /dev/ttyUSB*`
-                                        * після підключення й зміни тут. */
 #define UART_FRAME_GAP_MS 100
-#define UART_BAUD     B115200         /* має збігатися з Serial2.begin()
-                                        * на платі, яка сидить на UART */
+#define UART_BAUD     B115200
 
-/* Максимальний розмір ОДНОГО кадру "на дроті": заголовок + весь можливий
- * payload + CRC. Використовується і для UDP-буфера, і для TCP/UART
- * складання кадру з потоку байтів. */
 #define FRAME_MAX_SIZE (HEADER_SIZE + MAX_PAYLOAD_SIZE + CRC_SIZE)
 
 typedef enum {
@@ -58,20 +45,12 @@ typedef enum {
     ROUTE_UART,
 } RouteKind;
 
-/* "Куди відповісти" -- заповнюється в момент прийому пакета (звідки б він
- * не прийшов), і використовується одразу ж для відправки ACK назад ТИМ
- * САМИМ каналом. Нічого зберігати довше не треба -- ACK завжди йде як
- * пряма відповідь на щойно отриманий критичний пакет. */
 typedef struct {
     RouteKind kind;
-    struct sockaddr_in udp_addr; /* дійсно лише для ROUTE_UDP */
-    int fd;                      /* дійсно для ROUTE_TCP (fd клієнта) і ROUTE_UART */
+    struct sockaddr_in udp_addr;
+    int fd;
 } ReplyRoute;
 
-/* Складання кадру з потоку байтів (TCP і UART -- байтовий потік, на
- * відміну від UDP, де межі датаграми й так збігаються з межами пакета).
- * Читаємо по одному байту: спершу назбируємо HEADER_SIZE байт, дістаємо
- * з них payload_len, тоді знаємо повний розмір кадру і чекаємо решту. */
 typedef struct {
     uint8_t buf[FRAME_MAX_SIZE];
     size_t  have;
@@ -85,32 +64,25 @@ static void frame_reader_init(FrameReader *fr) {
     fr->header_done = false;
 }
 
-/* Чи може fr->buf[0..have) бути початком справжнього кадру: версія протоколу,
- * відомий тип повідомлення, правдоподібний payload_len. Це дає самосинхронізацію:
- * сміття (завантажувач ESP32, підключення посеред кадру) відкидається побайтово,
- * а не з'їдає наступні справжні кадри і не рахується битим пакетом. */
 static bool frame_prefix_plausible(const FrameReader *fr) {
     if (fr->have >= 1 && fr->buf[0] != PROTOCOL_VERSION) return false;
     if (fr->have >= 2 && fr->buf[1] > MSG_ACK) return false;
     if (fr->have >= HEADER_SIZE) {
         uint16_t payload_len;
-        memcpy(&payload_len, fr->buf + 16, 2); /* offset payload_len у заголовку, див. protocol.h */
+        memcpy(&payload_len, fr->buf + 16, 2);
         if (payload_len > MAX_PAYLOAD_SIZE) return false;
     }
     return true;
 }
 
-/* Повертає true, якщо ПІСЛЯ цього байта кадр у fr->buf[0..fr->have) повний
- * і готовий для protocol_unpack(). Викликач має одразу забрати дані й
- * викликати frame_reader_init() перед наступним feed. */
 static bool frame_reader_feed_byte(FrameReader *fr, uint8_t byte) {
     if (fr->have >= sizeof(fr->buf)) {
-        frame_reader_init(fr); /* переповнення -- явно биті дані, скидаємо */
+        frame_reader_init(fr);
     }
     fr->buf[fr->have++] = byte;
 
     while (fr->have > 0 && !frame_prefix_plausible(fr)) {
-        memmove(fr->buf, fr->buf + 1, fr->have - 1); /* зсув на байт: шукаємо початок кадру далі */
+        memmove(fr->buf, fr->buf + 1, fr->have - 1);
         fr->have--;
     }
     if (fr->have >= HEADER_SIZE) {
@@ -125,21 +97,12 @@ static bool frame_reader_feed_byte(FrameReader *fr, uint8_t byte) {
     return fr->header_done && fr->have == fr->need;
 }
 
-// Топік, куди Gateway публікує СВІЙ вже оброблений стан (Блок E, веб-
-// дашборд, читає ЛИШЕ звідси, а не парсить сирий case24/uplink сам --
-// інакше виходять два незалежні "шлюзи" з розбіжною статистикою, а
-// контракт (00-overview-shared-contract.md) віддає трекінг/dashboard/лог
-// винятково Блоку C). Публікується разом з терміналним дашбордом.
-#define STATE_TOPIC "case24/gateway/state"
+#define STATE_TOPIC "telemetry/gateway/state"
 
-// Сюди Gateway публікує КОЖЕН валідний (не дубльований) пакет вузла у вигляді
-// JSON, незалежно від того, яким транспортом він прийшов (UDP/TCP/UART/MQTT).
-// Веб бере значення сенсорів для графіків і БД ЛИШЕ звідси -- плати на
-// UDP/TCP/UART у case24/uplink взагалі не потрапляють.
-#define TELEMETRY_TOPIC "case24/gateway/telemetry"
-#define DOWNLINK_PREFIX "case24/downlink/"
+#define TELEMETRY_TOPIC "telemetry/gateway/telemetry"
+#define DOWNLINK_PREFIX "telemetry/downlink/"
+#define UPLINK_TOPIC "telemetry/uplink"
 
-// Структура для відстеження стану кожного сенсорного вузла
 typedef struct {
     uint16_t node_id;
     int32_t  max_seq_seen;
@@ -147,36 +110,29 @@ typedef struct {
     uint32_t lost_count;
     uint32_t duplicate_count;
     uint64_t last_seen_ms;
-    bool     was_online; // для виявлення моменту переходу ONLINE<->OFFLINE (Крок 8)
+    bool     was_online;
 
-    // Кільцевий буфер для дедуплікації критичних повідомлень
     uint32_t recent_alarms[MAX_SEEN_ALARMS];
     int alarm_idx;
-    int alarm_filled; // скільки комірок recent_alarms реально заповнено (щоб порожні нулі не збігались з seq=0)
+    int alarm_filled;
 
-    // Біт i = "пакет з sequence (max_seq_seen - i) уже отримано". Дозволяє
-    // відрізнити справжній дублікат від запізнілого (reordered) пакета.
     uint64_t seen_mask;
 
-    RouteKind last_transport; // яким каналом прийшов ОСТАННІЙ пакет цього вузла
-    ReplyRoute last_route;    // куди слати команди з веба (downlink) для UDP/TCP/UART-вузла
+    RouteKind last_transport;
+    ReplyRoute last_route;
 
-    uint64_t last_ts_ms;      // timestamp_ms (millis плати) найновішого пакета -- для виявлення перезапуску
-    // Автоналаштування вузла по UART (Wi-Fi + адреса шлюзу)
-    uint8_t  prov_acks;       // біт0 -- wifi підтверджено, біт1 -- gw підтверджено
-    uint32_t prov_seq_wifi;   // sequence наших CONFIG-пакетів (0 = ще не надсилали)
+    uint64_t last_ts_ms;
+    uint8_t  prov_acks;
+    uint32_t prov_seq_wifi;
     uint32_t prov_seq_gw;
-    uint64_t prov_last_ms;    // коли востаннє слали (для повторів)
+    uint64_t prov_last_ms;
 
-    // Затримка: шлюз раз на PING_INTERVAL_MS шле вузлу CONFIG {"cmd":"ping"} і міряє
-    // час до ACK на СВОЄМУ монотонному годиннику (годинники плат не синхронізуємо).
-    uint32_t ping_seq;        // sequence пінга, що чекає на ACK (0 = нема)
+    uint32_t ping_seq;
     uint64_t ping_sent_ms;
-    uint64_t ping_next_ms;    // коли слати наступний (0 = одразу)
-    double   rtt_ms;          // ковзне середнє RTT
-    uint64_t rtt_at_ms;       // коли отримано останній зразок (0 = ще не було)
-    // Стан буфера на платі (поле backlog/dropped у payload найновішої телеметрії)
-    int32_t  backlog;         // -1 = вузол не повідомляє
+    uint64_t ping_next_ms;
+    double   rtt_ms;
+    uint64_t rtt_at_ms;
+    int32_t  backlog;
     uint32_t buffer_dropped;
 } NodeState;
 
@@ -184,33 +140,25 @@ NodeState nodes[MAX_NODES];
 int node_count = 0;
 struct mosquitto *mosq_global = NULL;
 
-// Дескриптори трьох "сирих" транспортів (окрім MQTT, який лишається на
-// mosq_global). -1 означає "не піднявся" -- гейтвей просто пропускає цей
-// канал у циклі опитування, решта транспортів працюють як і раніше.
 int g_udp_fd = -1;
 int g_tcp_listen_fd = -1;
-// Кілька TCP-клієнтів одночасно: кожна плата, що має TCP як резервний
-// канал, тримає своє з'єднання. Кадр складається окремо для кожного.
 #define MAX_TCP_CLIENTS 4
-#define TCP_IDLE_TIMEOUT_MS 20000 // плата шле раз на 5 с; мовчання довше = з'єднання мертве
+#define TCP_IDLE_TIMEOUT_MS 20000
 typedef struct {
     int fd;
     FrameReader reader;
     uint64_t last_rx_ms;
 } TcpClient;
 TcpClient g_tcp_clients[MAX_TCP_CLIENTS];
-// Кілька послідовних портів одночасно: шлюз сам знаходить USB-TTL перехідники
-// (/dev/ttyUSB*, /dev/ttyACM*), шле на кожен пробні пінги і запам'ятовує як
-// "наш" той порт, звідки прийшов валідний кадр протоколу.
 #define MAX_UART_PORTS 4
-#define UART_PROBE_WARN_MS 15000 // стільки порт мовчить -- повідомляємо, що там, схоже, не наша плата
+#define UART_PROBE_WARN_MS 15000
 typedef struct {
-    int fd;                // -1 = слот вільний
-    char path[256];        // справжній шлях (після realpath) -- для дедуплікації
+    int fd;
+    char path[256];
     FrameReader reader;
-    uint64_t last_rx_ms;   // коли востаннє прийшли байти (для скидання сміття між кадрами)
+    uint64_t last_rx_ms;
     uint64_t opened_ms;
-    bool responded;        // з порту вже приходив валідний кадр
+    bool responded;
     bool warned_silent;
 } UartPort;
 UartPort g_uart_ports[MAX_UART_PORTS];
@@ -236,21 +184,15 @@ const char *route_kind_name(RouteKind k) {
     return "?";
 }
 
-// Крок 8: лог у файл (окрім екрана) + наскрізний лічильник битих пакетів.
 FILE *g_log_file = NULL;
 uint32_t corrupted_count = 0;
 
-// Отримання монотонного часу (незалежного від системного годинника)
 uint64_t get_monotonic_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)(ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-// Одна подія -> одразу і на екран (printf), і у файл (fprintf), з міткою
-// часу, за форматом "простий текстовий файл, рядок на подію", як просив
-// block-C-gateway.md для Рівня 3. fflush одразу -- щоб дані не загубились
-// у буфері, якщо шлюз впаде посеред демо.
 void log_event(const char *fmt, ...) {
     time_t t = time(NULL);
     struct tm tm_info;
@@ -274,7 +216,6 @@ void log_event(const char *fmt, ...) {
     va_end(args_file);
 }
 
-// Пошук існуючого або створення нового запису вузла в пам'яті
 NodeState* find_or_create_node(uint16_t node_id) {
     for (int i = 0; i < node_count; i++) {
         if (nodes[i].node_id == node_id) return &nodes[i];
@@ -283,23 +224,22 @@ NodeState* find_or_create_node(uint16_t node_id) {
         NodeState *new_node = &nodes[node_count];
         memset(new_node, 0, sizeof(NodeState));
         new_node->node_id = node_id;
-        new_node->max_seq_seen = -1; // -1 означає, що пакетів ще не було
+        new_node->max_seq_seen = -1;
         new_node->backlog = -1;
-        new_node->was_online = true; // щойно прийшов перший пакет -- вважаємо online
+        new_node->was_online = true;
         node_count++;
-        log_event("[СТАТУС] Новий вузол %u зареєстрований\n", node_id);
+        log_event("[STATUS] New node %u registered\n", node_id);
         return new_node;
     }
-    static int last_rejected_id = -1; // щоб не спамити логом на кожен пакет
+    static int last_rejected_id = -1;
     if (last_rejected_id != node_id) {
         last_rejected_id = node_id;
-        log_event("[ПОПЕРЕДЖЕННЯ] Таблиця вузлів заповнена (MAX_NODES=%d), вузол %u ігнорується\n",
+        log_event("[WARN] Node table full (MAX_NODES=%d), ignoring node %u\n",
                    MAX_NODES, node_id);
     }
     return NULL;
 }
 
-// Перевірка на наявність дублікатів ALARM
 bool is_duplicate_alarm(NodeState *node, uint32_t seq) {
     for (int i = 0; i < node->alarm_filled; i++) {
         if (node->recent_alarms[i] == seq) return true;
@@ -307,16 +247,12 @@ bool is_duplicate_alarm(NodeState *node, uint32_t seq) {
     return false;
 }
 
-// Фіксація нового sequence для ALARM
 void record_alarm(NodeState *node, uint32_t seq) {
     node->recent_alarms[node->alarm_idx] = seq;
     node->alarm_idx = (node->alarm_idx + 1) % MAX_SEEN_ALARMS;
     if (node->alarm_filled < MAX_SEEN_ALARMS) node->alarm_filled++;
 }
 
-// Надсилає сирі байти НАЗАД тим самим каналом, звідки прийшов пакет.
-// MQTT сюди не заходить -- для нього потрібен топік, а не сокет/fd, це
-// лишається окремо в send_ack_via() нижче.
 void route_reply(const ReplyRoute *route, const uint8_t *data, int len) {
     switch (route->kind) {
         case ROUTE_UDP:
@@ -330,41 +266,31 @@ void route_reply(const ReplyRoute *route, const uint8_t *data, int len) {
             write(route->fd, data, len);
             break;
         case ROUTE_MQTT:
-            break; // оброблюється окремо нижче (потрібен топік, не fd)
+            break;
     }
 }
 
-// ==== Імпеймент-шар: керовані перешкоди каналу ====
-// Кейс просить "Impairment Simulator" між вузлом і шлюзом (loss, delay, jitter, duplication,
-// розрив). Робимо його ВСЕРЕДИНІ шлюзу, в єдиних точках входу/виходу кадрів: так він
-// однаково діє на UART, TCP, UDP і MQTT, а зовнішній проксі покрив би лише Wi-Fi (UART-вузли
-// ходять дротом). Керується з веба через CONTROL_TOPIC, відтворюється через seed.
-//   вхід  (вузол -> шлюз): handle_packet() -- втрати, дублі, биті байти, затримка, розрив;
-//   вихід (шлюз -> вузол): downlink_send()  -- втрати (ACK/команди), затримка, розрив.
-// Службовий "пінг дроту" по UART (uart_tick) перешкодам не підлягає, крім розриву для всіх
-// вузлів: інакше плата на дроті ніколи б не побачила розриву й не пішла б у буфер.
-#define CONTROL_TOPIC "case24/gateway/control"
-#define IMP_QUEUE 64 // скільки кадрів може одночасно чекати своєї затримки (решта йде без неї)
+#define CONTROL_TOPIC "telemetry/gateway/control"
+#define IMP_QUEUE 64
 
 typedef struct {
-    char     profile[24]; // назва активного профілю (для відображення)
-    int      loss;        // % втрат, окремо для кожного напрямку
-    int      dup;         // % дублювання вхідних пакетів
-    int      corrupt;     // % вхідних пакетів із зіпсованим байтом (має відсіюватись за CRC)
-    int      delay_ms;    // базова затримка кожного кадру
-    int      jitter_ms;   // + випадково 0..jitter_ms; через нього кадри міняються місцями (reorder)
-    uint16_t node;        // до якого вузла застосовувати (0 = до всіх)
-    uint64_t blackout_until_ms; // до цього моменту каналу "немає" взагалі (повний розрив)
-    uint32_t rng;         // стан xorshift32: той самий seed -> та сама послідовність втрат
-    // лічильники для веба (скидаються при зміні профілю, щоб кожен тест рахувався з нуля)
+    char     profile[24];
+    int      loss;
+    int      dup;
+    int      corrupt;
+    int      delay_ms;
+    int      jitter_ms;
+    uint16_t node;
+    uint64_t blackout_until_ms;
+    uint32_t rng;
     uint32_t dropped_up, dropped_down, duplicated, n_corrupted, delayed;
 } Impair;
 static Impair g_imp = { .profile = "good", .rng = 1 };
 
 typedef struct {
     bool        used;
-    bool        up;       // true: вхідний (вузол->шлюз), false: вихідний
-    uint64_t    due_ms;   // коли віддати далі
+    bool        up;
+    uint64_t    due_ms;
     uint8_t     buf[FRAME_MAX_SIZE];
     int         len;
     ReplyRoute  route;
@@ -375,7 +301,6 @@ static ImpItem g_imp_q[IMP_QUEUE];
 void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *route);
 static bool tcp_fd_active(int fd);
 
-// xorshift32: власний генератор замість rand(), щоб seed робив прогін відтворюваним
 static uint32_t imp_rand(void) {
     uint32_t x = g_imp.rng ? g_imp.rng : 1;
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
@@ -387,14 +312,12 @@ static bool imp_blackout(uint64_t now) { return now < g_imp.blackout_until_ms; }
 static bool imp_enabled(uint64_t now) {
     return g_imp.loss || g_imp.dup || g_imp.corrupt || g_imp.delay_ms || g_imp.jitter_ms || imp_blackout(now);
 }
-// Перешкоди діють лише на обраний вузол; кадри без id (HELLO, node_id=0) -- лише коли обрано "всі"
 static bool imp_applies(uint16_t node_id) { return g_imp.node == 0 || g_imp.node == node_id; }
 static bool imp_blackout_all(uint64_t now) { return imp_blackout(now) && g_imp.node == 0; }
 static uint64_t imp_delay(void) {
     return (uint64_t)g_imp.delay_ms + (g_imp.jitter_ms > 0 ? imp_rand() % (uint32_t)(g_imp.jitter_ms + 1) : 0);
 }
 
-// Кладе кадр у чергу затримки. false -- черга повна: тоді викликач віддає кадр без затримки.
 static bool imp_enqueue(bool up, const ReplyRoute *route, uint16_t node_id, const uint8_t *data, int len, uint64_t due) {
     if (len <= 0 || len > (int)sizeof(g_imp_q[0].buf)) return false;
     for (int i = 0; i < IMP_QUEUE; i++) {
@@ -411,10 +334,8 @@ static bool imp_enqueue(bool up, const ReplyRoute *route, uint16_t node_id, cons
     return false;
 }
 
-// Справжня відправка вихідного кадру (після перешкод).
 static void downlink_emit(const ReplyRoute *route, uint16_t node_id, const uint8_t *data, int len) {
     if (route->kind == ROUTE_MQTT) {
-        // MQTT-вузол слухає свій downlink-топік (потрібен node_id != 0)
         char topic[64];
         snprintf(topic, sizeof(topic), DOWNLINK_PREFIX "%u", node_id);
         mosquitto_publish(mosq_global, NULL, topic, len, data, 0, false);
@@ -423,7 +344,6 @@ static void downlink_emit(const ReplyRoute *route, uint16_t node_id, const uint8
     }
 }
 
-// ЄДИНА точка виходу кадрів шлюз -> вузол (ACK, команди, відповіді на HELLO, пінги).
 static void downlink_send(const ReplyRoute *route, uint16_t node_id, const uint8_t *data, int len) {
     uint64_t now = get_monotonic_time_ms();
     if (imp_enabled(now) && imp_applies(node_id)) {
@@ -434,11 +354,9 @@ static void downlink_send(const ReplyRoute *route, uint16_t node_id, const uint8
     downlink_emit(route, node_id, data, len);
 }
 
-// ЄДИНА точка входу кадрів вузол -> шлюз (MQTT, UDP, TCP, UART). Далі -- справжня обробка.
 void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) {
     uint64_t now = get_monotonic_time_ms();
     uint16_t nid = 0;
-    // node_id лежить у заголовку зі зміщенням 2 (версія, тип, потім node_id)
     if (raw_len >= HEADER_SIZE) memcpy(&nid, raw + 2, 2);
     if (raw_len < HEADER_SIZE || raw_len > FRAME_MAX_SIZE || !imp_enabled(now) || !imp_applies(nid)) {
         handle_packet_now(raw, raw_len, route);
@@ -449,27 +367,23 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
     uint8_t copy[FRAME_MAX_SIZE];
     memcpy(copy, raw, raw_len);
     if (imp_chance(g_imp.corrupt)) {
-        // Псуємо випадковий байт: CRC32 не збіжиться, шлюз має відхилити й записати в журнал
         copy[imp_rand() % raw_len] ^= (uint8_t)(1 + imp_rand() % 255);
         g_imp.n_corrupted++;
     }
     int copies = 1;
     if (imp_chance(g_imp.dup)) { copies = 2; g_imp.duplicated++; }
     for (int c = 0; c < copies; c++) {
-        // кожна копія має власний jitter, тож дубль може прийти і після наступних пакетів
         uint64_t d = imp_delay();
         if (d > 0 && imp_enqueue(true, route, nid, copy, (int)raw_len, now + d)) g_imp.delayed++;
         else handle_packet_now(copy, raw_len, route);
     }
 }
 
-// Віддає далі кадри, у яких вийшла затримка. З головного циклу.
 static void impair_tick(uint64_t now) {
     for (int i = 0; i < IMP_QUEUE; i++) {
         if (!g_imp_q[i].used || g_imp_q[i].due_ms > now) continue;
         ImpItem it = g_imp_q[i];
-        g_imp_q[i].used = false; // звільняємо ДО обробки: вона може сама покласти в чергу вихідний кадр
-        // за час затримки дріт міг відключитись, а TCP-клієнт піти -- fd більше не наш
+        g_imp_q[i].used = false;
         if (it.route.kind == ROUTE_TCP && !tcp_fd_active(it.route.fd)) continue;
         if (it.route.kind == ROUTE_UART && !uart_port_by_fd(it.route.fd)) continue;
         if (it.up) handle_packet_now(it.buf, (size_t)it.len, &it.route);
@@ -482,18 +396,17 @@ static void impair_reset(void) {
     memset(&g_imp, 0, sizeof(g_imp));
     snprintf(g_imp.profile, sizeof(g_imp.profile), "good");
     g_imp.rng = seed;
-    memset(g_imp_q, 0, sizeof(g_imp_q)); // кадри, що чекали затримки, скасовуємо
+    memset(g_imp_q, 0, sizeof(g_imp_q));
 }
 
-// Готові профілі для демо. false -- невідома назва.
 static bool impair_set_profile(const char *name) {
     int loss = 0, dup = 0, corrupt = 0, delay = 0, jitter = 0;
     if (strcmp(name, "good") == 0) {
-    } else if (strcmp(name, "lossy20") == 0) {  // вимога кейса: 20% втрат
+    } else if (strcmp(name, "lossy20") == 0) {
         loss = 20;
-    } else if (strcmp(name, "delay") == 0) {    // повільний канал: RTT має зрости на ~2x затримки
+    } else if (strcmp(name, "delay") == 0) {
         delay = 200; jitter = 100;
-    } else if (strcmp(name, "flaky") == 0) {    // усе разом: втрати, дублі, биті, reorder через jitter
+    } else if (strcmp(name, "flaky") == 0) {
         loss = 10; dup = 10; corrupt = 5; delay = 100; jitter = 300;
     } else {
         return false;
@@ -517,9 +430,6 @@ static int imp_json_int(cJSON *j, const char *key, int lo, int hi, int *out) {
     return 1;
 }
 
-// Команда з веба в CONTROL_TOPIC: {"cmd":"impair", "profile":..., "loss":.., "delay_ms":.., "jitter_ms":..,
-//   "dup":.., "corrupt":.., "node":.., "seed":.., "blackout_s":..}. Усі поля необов'язкові:
-// "profile" спершу скидає все, решта полів уточнюють поточний стан, "blackout_s" не чіпає профіль.
 static void handle_control(const char *payload, int len) {
     char *js = malloc((size_t)len + 1);
     if (!js) return;
@@ -534,11 +444,12 @@ static void handle_control(const char *payload, int len) {
     }
     int v;
     cJSON *seed = cJSON_GetObjectItemCaseSensitive(j, "seed");
-    if (cJSON_IsNumber(seed)) g_imp.rng = (uint32_t)seed->valuedouble ? (uint32_t)seed->valuedouble : 1;
+    if (cJSON_IsNumber(seed) && seed->valuedouble >= 1 && seed->valuedouble <= 4294967295.0)
+        g_imp.rng = (uint32_t)seed->valuedouble;
     if (imp_json_int(j, "node", 0, 65535, &v)) g_imp.node = (uint16_t)v;
     cJSON *prof = cJSON_GetObjectItemCaseSensitive(j, "profile");
     if (cJSON_IsString(prof) && !impair_set_profile(prof->valuestring)) {
-        log_event("[ПЕРЕШКОДИ] Невідомий профіль \"%s\"\n", prof->valuestring);
+        log_event("[IMPAIR] Unknown profile \"%s\"\n", prof->valuestring);
         cJSON_Delete(j);
         return;
     }
@@ -551,17 +462,16 @@ static void handle_control(const char *payload, int len) {
     if (custom && !cJSON_IsString(prof)) snprintf(g_imp.profile, sizeof(g_imp.profile), "custom");
     if (imp_json_int(j, "blackout_s", 0, 3600, &v)) {
         g_imp.blackout_until_ms = v > 0 ? get_monotonic_time_ms() + (uint64_t)v * 1000 : 0;
-        log_event(v > 0 ? "[ПЕРЕШКОДИ] РОЗРИВ каналу на %d с (вузол: %s)\n" : "[ПЕРЕШКОДИ] Розрив скасовано%s\n",
-                   v, g_imp.node ? "обраний" : "усі");
+        if (v > 0)
+            log_event("[IMPAIR] Link BLACKOUT for %d s (nodes: %s)\n", v, g_imp.node ? "selected" : "all");
+        else
+            log_event("[IMPAIR] Blackout cancelled\n");
     }
-    log_event("[ПЕРЕШКОДИ] Профіль=%s втрати=%d%% дублі=%d%% биті=%d%% затримка=%d+0..%d мс вузол=%u\n",
+    log_event("[IMPAIR] profile=%s loss=%d%% dup=%d%% corrupt=%d%% delay=%d+0..%d ms node=%u\n",
                g_imp.profile, g_imp.loss, g_imp.dup, g_imp.corrupt, g_imp.delay_ms, g_imp.jitter_ms, g_imp.node);
     cJSON_Delete(j);
 }
 
-// Формування та відправка ACK -- каналом, яким прийшов оригінальний
-// критичний пакет (route). Для MQTT це, як і раніше, публікація в
-// case24/downlink/<node_id>; для UDP/TCP/UART -- пряма відповідь route_reply().
 void send_ack_via(uint16_t node_id, uint32_t seq, const ReplyRoute *route) {
     SensorPacket ack_pkt = {0};
     ack_pkt.version = PROTOCOL_VERSION;
@@ -572,28 +482,15 @@ void send_ack_via(uint16_t node_id, uint32_t seq, const ReplyRoute *route) {
     ack_pkt.payload_len = 0;
 
     uint8_t tx_buf[256];
-    // Отримуємо компактні байти (лише заголовок + CRC), а не всю структуру
     int len = protocol_pack(&ack_pkt, tx_buf, sizeof(tx_buf));
     if (len <= 0) return;
 
-    downlink_send(route, node_id, tx_buf, len); // через імпеймент-шар: ACK теж може "загубитись"
+    downlink_send(route, node_id, tx_buf, len);
 }
 
-// ЄДИНА обробка вхідного пакета -- незалежно від того, MQTT це, UDP, TCP
-// чи UART. Саме це і є "транспорт замінний, логіка протоколу одна", а не
-// просто документ-намір: протокол/дедуп/дашборд не знають і не питають,
-// яким дротом прийшли байти.
-// ==== Автоналаштування вузла по UART ====
-// Коли вузол вийшов на зв'язок через UART-дріт, Gateway сам передає йому
-// налаштування хоста, на якому працює: Wi-Fi (SSID/пароль) і власну IP з
-// портами UDP/TCP. Плата зберігає їх у пам'яті й надалі тримає Wi-Fi
-// резервним каналом: коли дріт відключили, дані йдуть по Wi-Fi.
-// Налаштування беруться (по пріоритету): gateway.conf -> автовизначення
-// (IP з мережевих інтерфейсів, SSID/пароль активного Wi-Fi через nmcli).
-// Файл gateway.conf НЕ в git: пароль Wi-Fi не повинен потрапляти в репозиторій.
 #define CONF_FILE_PATH "gateway.conf"
 #define PROVISION_RETRY_MS 3000
-#define UART_PING_MS 1000 // як часто шлемо "дріт живий" -- по ньому плата розуміє, що Pi на іншому кінці
+#define UART_PING_MS 1000
 
 typedef struct {
     char ssid[64];
@@ -605,7 +502,7 @@ typedef struct {
 
 static ProvisionConfig g_prov;
 static bool g_prov_ready = false;
-static uint32_t g_down_seq = 1; // sequence наших пакетів до плат; 0 зарезервовано як "не надсилали"
+static uint32_t g_down_seq = 1;
 
 static uint32_t next_down_seq(void) {
     uint32_t v = g_down_seq++;
@@ -623,7 +520,7 @@ static void str_trim(char *s) {
 static int iface_score(const char *name) {
     if (!strncmp(name, "lo", 2) || !strncmp(name, "docker", 6) ||
         !strncmp(name, "br-", 3) || !strncmp(name, "veth", 4)) return 0;
-    if (!strncmp(name, "wl", 2)) return 3;                      // wlan0, wlp...
+    if (!strncmp(name, "wl", 2)) return 3;
     if (!strncmp(name, "eth", 3) || !strncmp(name, "en", 2)) return 2;
     return 1;
 }
@@ -647,7 +544,6 @@ static bool detect_own_ip(char *out, size_t n) {
     return best > 0;
 }
 
-// Виконує команду й повертає перший непорожній рядок виводу (без \n).
 static bool run_first_line(const char *cmd, char *out, size_t n) {
     FILE *f = popen(cmd, "r");
     if (!f) return false;
@@ -658,8 +554,6 @@ static bool run_first_line(const char *cmd, char *out, size_t n) {
     return out[0] != '\0';
 }
 
-// SSID активної Wi-Fi мережі (NetworkManager). У режимі -t двокрапка й
-// зворотна скісна в назві екрануються як "\:" і "\\".
 static bool detect_wifi_ssid(char *out, size_t n) {
     FILE *f = popen("nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null", "r");
     if (!f) return false;
@@ -680,8 +574,6 @@ static bool detect_wifi_ssid(char *out, size_t n) {
     return found;
 }
 
-// Ім'я активного Wi-Fi підключення NetworkManager. Воно не завжди збігається
-// з SSID (профіль із Raspberry Pi Imager зветься "preconfigured").
 static bool detect_wifi_conn_name(char *out, size_t n) {
     FILE *f = popen("nmcli -t -f NAME,TYPE connection show --active 2>/dev/null", "r");
     if (!f) return false;
@@ -705,15 +597,11 @@ static bool detect_wifi_conn_name(char *out, size_t n) {
     return found;
 }
 
-// Пароль активної Wi-Fi мережі з профілю NetworkManager. Звичайному
-// користувачеві паролі часто недоступні, тому пробуємо ще `sudo -n`
-// (на Raspberry Pi OS sudo без пароля -- типове налаштування). Пароль іде
-// лише в UART-кабель до плати, у лог і в git він не потрапляє.
 static bool detect_wifi_pass(const char *ssid, char *out, size_t n) {
     (void)ssid;
     char conn[128];
     if (!detect_wifi_conn_name(conn, sizeof(conn))) return false;
-    if (strchr(conn, '\'') || strchr(conn, '\\')) return false; // не складаємо shell-команду з дивних символів
+    if (strchr(conn, '\'') || strchr(conn, '\\')) return false;
     char cmd[320];
     snprintf(cmd, sizeof(cmd),
              "nmcli -s -g 802-11-wireless-security.psk connection show '%s' 2>/dev/null", conn);
@@ -723,10 +611,6 @@ static bool detect_wifi_pass(const char *ssid, char *out, size_t n) {
     return run_first_line(cmd, out, n);
 }
 
-// Збирає актуальні налаштування. Мережа Pi може змінитися на ходу, тому
-// ПОТОЧНІ дані (IP, активна Wi-Fi) мають пріоритет. gateway.conf може
-// містити кілька мереж (пари wifi_ssid / wifi_pass): береться та, що збігається
-// з активною Wi-Fi Pi. Якщо в файлі її нема -- пароль шукаємо в NetworkManager.
 #define MAX_KNOWN_NETWORKS 8
 
 static void build_provision_config(ProvisionConfig *out, bool *conf_other_network) {
@@ -781,7 +665,6 @@ static void build_provision_config(ProvisionConfig *out, bool *conf_other_networ
         if (!out->pass[0]) detect_wifi_pass(active, out->pass, sizeof(out->pass));
         if (!out->pass[0] && !matched && net_count > 0) *conf_other_network = true;
     } else if (net_count > 0) {
-        // активну Wi-Fi визначити не вдалося (немає nmcli) -- беремо першу мережу з файлу
         snprintf(out->ssid, sizeof(out->ssid), "%s", nets[0].ssid);
         snprintf(out->pass, sizeof(out->pass), "%s", nets[0].pass);
     }
@@ -794,21 +677,20 @@ static bool prov_config_equal(const ProvisionConfig *a, const ProvisionConfig *b
 
 static void log_provision_config(bool conf_other_network) {
     if (g_prov_ready) {
-        log_event("[НАЛАШТУВАННЯ] Шлюз передаватиме вузлам по UART: gateway_ip=%s, UDP=%d, TCP=%d, Wi-Fi \"%s\", пароль %s\n",
+        log_event("[PROVISION] Nodes on UART will receive: gateway_ip=%s, UDP=%d, TCP=%d, Wi-Fi \"%s\", password %s\n",
                    g_prov.ip, g_prov.udp_port, g_prov.tcp_port, g_prov.ssid,
-                   g_prov.pass[0] ? "заданий" : "НЕ ЗАДАНИЙ");
+                   g_prov.pass[0] ? "set" : "NOT SET");
         if (conf_other_network)
-            log_event("[НАЛАШТУВАННЯ] Pi зараз у мережі \"%s\", а в %s її нема і пароль із системи не отримано -- "
-                       "додайте пару wifi_ssid/wifi_pass для цієї мережі в %s\n", g_prov.ssid, CONF_FILE_PATH, CONF_FILE_PATH);
+            log_event("[PROVISION] Host is on network \"%s\", which is not listed in %s, and the system did not provide its password -- "
+                       "add a wifi_ssid/wifi_pass pair for this network to %s\n", g_prov.ssid, CONF_FILE_PATH, CONF_FILE_PATH);
         else if (!g_prov.pass[0])
-            log_event("[НАЛАШТУВАННЯ] Пароль Wi-Fi не визначено -- впишіть wifi_pass у %s, якщо мережа не відкрита\n", CONF_FILE_PATH);
+            log_event("[PROVISION] Wi-Fi password unknown -- set wifi_pass in %s unless the network is open\n", CONF_FILE_PATH);
     } else {
-        log_event("[НАЛАШТУВАННЯ] Не вдалося визначити Wi-Fi/IP -- автоналаштування вузлів вимкнено. "
-                   "Створіть %s (див. gateway.conf.example)\n", CONF_FILE_PATH);
+        log_event("[PROVISION] Could not detect Wi-Fi/IP -- node provisioning disabled. "
+                   "Create %s (see gateway.conf.example)\n", CONF_FILE_PATH);
     }
 }
 
-// Скидає стан автоналаштування вузла -- наступний цикл uart_tick() надішле все знову.
 static void provision_reset(NodeState *n) {
     n->prov_acks = 0;
     n->prov_seq_wifi = 0;
@@ -816,10 +698,6 @@ static void provision_reset(NodeState *n) {
     n->prov_last_ms = 0;
 }
 
-// Визначення мережі (nmcli, sudo) може тривати секунди, тому воно йде у
-// ФОНОВОМУ потоці раз на 10 с, щоб головний цикл не зупинявся (інакше він не
-// читає порти й не шле "пінги", і плата вважає дріт мертвим). Потік лише
-// будує конфіг і кладе його в g_prov_pending; логує й застосовує головний потік.
 static pthread_mutex_t g_prov_mtx = PTHREAD_MUTEX_INITIALIZER;
 static ProvisionConfig g_prov_pending;
 static bool g_prov_pending_other = false;
@@ -844,12 +722,9 @@ static void *prov_worker(void *arg) {
 static void provision_start_worker(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, prov_worker, NULL) == 0) pthread_detach(t);
-    else log_event("[НАЛАШТУВАННЯ] Не вдалося запустити фоновий потік визначення мережі\n");
+    else log_event("[PROVISION] Failed to start the network detection thread\n");
 }
 
-// Викликається з головного циклу: забирає готовий результат фонового потоку.
-// Мережа Pi змінилася -- плати на дроті отримують нові налаштування без
-// перезапуску шлюзу.
 static void provision_refresh(uint64_t now) {
     (void)now;
     ProvisionConfig fresh;
@@ -869,13 +744,12 @@ static void provision_refresh(uint64_t now) {
 
     g_prov = fresh;
     g_prov_ready = g_prov.ssid[0] && g_prov.ip[0];
-    if (!first) log_event("[НАЛАШТУВАННЯ] Мережа Pi змінилася -- оновлюю налаштування вузлів\n");
+    if (!first) log_event("[PROVISION] Host network changed -- updating node settings\n");
     first = false;
     log_provision_config(other);
     for (int i = 0; i < node_count; i++) provision_reset(&nodes[i]);
 }
 
-// Пакує й пише у UART один кадр (шлюз -> плата). payload_json може бути NULL.
 static bool uart_write_frame(int fd, uint8_t type, uint16_t node_id, uint32_t seq, const char *payload_json) {
     if (fd < 0) return false;
     SensorPacket pkt = {0};
@@ -887,7 +761,7 @@ static bool uart_write_frame(int fd, uint8_t type, uint16_t node_id, uint32_t se
     if (payload_json) {
         size_t n = strlen(payload_json);
         if (n > MAX_PAYLOAD_SIZE) {
-            log_event("[НАЛАШТУВАННЯ] Payload %zu байт > %d -- не надіслано (задовгий SSID/пароль?)\n", n, MAX_PAYLOAD_SIZE);
+            log_event("[PROVISION] Payload of %zu bytes exceeds %d -- not sent (SSID/password too long?)\n", n, MAX_PAYLOAD_SIZE);
             return false;
         }
         memcpy(pkt.payload, payload_json, n);
@@ -899,7 +773,6 @@ static bool uart_write_frame(int fd, uint8_t type, uint16_t node_id, uint32_t se
     return write(fd, tx, len) == len;
 }
 
-// Два невеликі CONFIG-пакети (разом SSID+пароль+IP не влізли б у 128 байт payload).
 static void provision_send(NodeState *n) {
     if (!(n->prov_acks & 1)) {
         if (n->prov_seq_wifi == 0) n->prov_seq_wifi = next_down_seq();
@@ -932,22 +805,19 @@ static void provision_on_ack(const SensorPacket *ack) {
         if (n->prov_seq_wifi != 0 && ack->sequence == n->prov_seq_wifi) n->prov_acks |= 1;
         if (n->prov_seq_gw != 0 && ack->sequence == n->prov_seq_gw) n->prov_acks |= 2;
         if (before != 3 && n->prov_acks == 3)
-            log_event("[НАЛАШТУВАННЯ] Вузол %u прийняв налаштування (Wi-Fi + адреса шлюзу)\n", n->node_id);
+            log_event("[PROVISION] Node %u accepted settings (Wi-Fi + gateway address)\n", n->node_id);
         return;
     }
 }
 
-// Викликається з головного циклу: "пінг" дроту + повтори автоналаштування.
 static void uart_tick(uint64_t now) {
     static uint64_t last_ping = 0;
     if (now - last_ping >= UART_PING_MS) {
         last_ping = now;
         uint32_t seq = next_down_seq();
-        // Пінг іде на ВСІ відкриті порти: той, де є наша плата, відповість.
-        // Під час розриву для всіх вузлів пінг мовчить -- інакше плата вважала б дріт живим.
         if (!imp_blackout_all(now))
             for (int i = 0; i < MAX_UART_PORTS; i++)
-                uart_write_frame(g_uart_ports[i].fd, MSG_HEARTBEAT, 0, seq, NULL); // node_id 0 = усім
+                uart_write_frame(g_uart_ports[i].fd, MSG_HEARTBEAT, 0, seq, NULL);
     }
 
     provision_refresh(now);
@@ -955,24 +825,15 @@ static void uart_tick(uint64_t now) {
     for (int i = 0; i < node_count; i++) {
         NodeState *n = &nodes[i];
         if (n->last_route.kind != ROUTE_UART || n->prov_acks == 3) continue;
-        if (!uart_port_by_fd(n->last_route.fd)) continue; // порт, де бачили вузол, зник
-        if (now - n->last_seen_ms > NODE_TIMEOUT_MS) continue; // вузол зараз не на дроті
+        if (!uart_port_by_fd(n->last_route.fd)) continue;
+        if (now - n->last_seen_ms > NODE_TIMEOUT_MS) continue;
         if (n->prov_last_ms != 0 && now - n->prov_last_ms < PROVISION_RETRY_MS) continue;
         n->prov_last_ms = now ? now : 1;
         provision_send(n);
-        log_event("[НАЛАШТУВАННЯ] Надіслано налаштування вузлу %u по UART\n", n->node_id);
+        log_event("[PROVISION] Sent settings to node %u over UART\n", n->node_id);
     }
 }
 
-// ==== Автопризначення node_id за старшинством ====
-// Плата не має "своєї" node_id: вона шле HELLO (HEARTBEAT з node_id=0 і
-// payload {"mac":"...","id":<збережений або 0>}). Шлюз веде реєстр
-// MAC -> node_id: хто з'явився першим, той отримує найменший вільний id
-// (1, 2, 3...). Реєстр зберігається у файлі, тож id не міняються після
-// перезапуску шлюзу. Якщо плата мала вже прописаний id, що не збігається з
-// реєстром (наприклад, такий самий, як у іншої плати), вона перезаписує його
-// на призначений. Шлюз відповідає на кожен HELLO (відповідь ідемпотентна),
-// плата повторює HELLO, поки не отримає id.
 #define REGISTRY_FILE "node_registry.txt"
 
 typedef struct {
@@ -986,7 +847,7 @@ static int g_reg_count = 0;
 static void registry_save(void) {
     FILE *f = fopen(REGISTRY_FILE, "w");
     if (!f) {
-        log_event("[ID] Не вдалося записати %s: %s\n", REGISTRY_FILE, strerror(errno));
+        log_event("[ID] Failed to write %s: %s\n", REGISTRY_FILE, strerror(errno));
         return;
     }
     for (int i = 0; i < g_reg_count; i++) fprintf(f, "%s %u\n", g_reg[i].mac, g_reg[i].id);
@@ -1005,16 +866,15 @@ static void registry_load(void) {
         g_reg_count++;
     }
     fclose(f);
-    if (g_reg_count > 0) log_event("[ID] Завантажено реєстр плат: %d шт. (%s)\n", g_reg_count, REGISTRY_FILE);
+    if (g_reg_count > 0) log_event("[ID] Loaded node registry: %d entries (%s)\n", g_reg_count, REGISTRY_FILE);
 }
 
 static bool id_in_use(uint16_t id) {
     for (int i = 0; i < g_reg_count; i++) if (g_reg[i].id == id) return true;
-    for (int i = 0; i < node_count; i++) if (nodes[i].node_id == id) return true; // вузли без HELLO (sim_node)
+    for (int i = 0; i < node_count; i++) if (nodes[i].node_id == id) return true;
     return false;
 }
 
-// Повертає id для MAC (існуючий або новий найменший вільний); 0 -- реєстр заповнений.
 static uint16_t registry_assign(const char *mac, bool *is_new) {
     *is_new = false;
     for (int i = 0; i < g_reg_count; i++) {
@@ -1031,7 +891,6 @@ static uint16_t registry_assign(const char *mac, bool *is_new) {
     return id;
 }
 
-// Пакує кадр і відправляє ТИМ КАНАЛОМ, звідки прийшов запит (UART/UDP/TCP).
 static void send_frame_route(const ReplyRoute *route, uint8_t type, uint16_t node_id,
                              uint32_t seq, const char *payload_json) {
     SensorPacket pkt = {0};
@@ -1050,20 +909,17 @@ static void send_frame_route(const ReplyRoute *route, uint8_t type, uint16_t nod
     downlink_send(route, node_id, tx, len);
 }
 
-// Скидає облік sequence/дедуплікації вузла (плата перезапустилась і почала
-// sequence з нуля). Лічильники received/lost/duplicate лишаються.
 static void node_seq_reset(NodeState *n) {
     n->max_seq_seen = -1;
     n->seen_mask = 0;
     n->alarm_idx = 0;
     n->alarm_filled = 0;
     n->last_ts_ms = 0;
-    // Після перезапуску плата могла втратити налаштування -- шлемо знову
     provision_reset(n);
 }
 
 static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
-    if (route->kind == ROUTE_MQTT) return; // MQTT-вузли id не отримують (sim_node має свій)
+    if (route->kind == ROUTE_MQTT) return;
     char js[MAX_PAYLOAD_SIZE + 1];
     memcpy(js, pkt->payload, pkt->payload_len);
     js[pkt->payload_len] = '\0';
@@ -1071,35 +927,30 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
     cJSON *j = cJSON_Parse(js);
     cJSON *mac_j = cJSON_IsObject(j) ? cJSON_GetObjectItemCaseSensitive(j, "mac") : NULL;
     if (!cJSON_IsString(mac_j) || strlen(mac_j->valuestring) < 8 || strlen(mac_j->valuestring) >= sizeof(g_reg[0].mac)) {
-        log_event("[ID] HELLO без коректного mac, відхилено (канал=%s)\n", route_kind_name(route->kind));
+        log_event("[ID] HELLO without a valid mac rejected (link=%s)\n", route_kind_name(route->kind));
         cJSON_Delete(j);
         return;
     }
     cJSON *had_j = cJSON_GetObjectItemCaseSensitive(j, "id");
     unsigned had = cJSON_IsNumber(had_j) ? (unsigned)had_j->valuedouble : 0;
-    // "probe":1 -- плата вже має підтверджений id і лише перевіряє, що шлюз на зв'язку
-    // (раз на кілька секунд по Wi-Fi). Це не перезавантаження, тож облік sequence не скидаємо.
     cJSON *probe_j = cJSON_GetObjectItemCaseSensitive(j, "probe");
     bool is_probe = cJSON_IsNumber(probe_j) && probe_j->valuedouble != 0;
 
     bool is_new;
     uint16_t id = registry_assign(mac_j->valuestring, &is_new);
     if (id == 0) {
-        log_event("[ID] Реєстр заповнений (%d плат), плата %s id не отримала\n", MAX_NODES, mac_j->valuestring);
+        log_event("[ID] Registry full (%d boards), board %s got no id\n", MAX_NODES, mac_j->valuestring);
         cJSON_Delete(j);
         return;
     }
     if (is_new)
-        log_event("[ID] Нова плата %s (канал=%s) -> node_id=%u\n", mac_j->valuestring, route_kind_name(route->kind), id);
+        log_event("[ID] New board %s (link=%s) -> node_id=%u\n", mac_j->valuestring, route_kind_name(route->kind), id);
     if (had != 0 && had != id)
-        log_event("[ID] Плата %s мала id=%u, переписано на %u\n", mac_j->valuestring, had, id);
+        log_event("[ID] Board %s had id=%u, reassigned to %u\n", mac_j->valuestring, had, id);
 
-    // HELLO шле лише плата, що щойно завантажилась (id ще не підтверджено в цій
-    // сесії). Це надійніша ознака перезапуску, ніж евристика за sequence/timestamp:
-    // та плутає запізнілий ALARM із перезапуском.
     for (int i = 0; !is_probe && i < node_count; i++) {
         if (nodes[i].node_id == id && nodes[i].max_seq_seen != -1) {
-            log_event("[СТАТУС] Вузол %u перезапустився (HELLO від %s). Скидаю відстеження sequence\n",
+            log_event("[STATUS] Node %u restarted (HELLO from %s), resetting sequence tracking\n",
                        id, mac_j->valuestring);
             node_seq_reset(&nodes[i]);
             break;
@@ -1112,15 +963,13 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
     cJSON_AddNumberToObject(reply, "id", id);
     char *rs = cJSON_PrintUnformatted(reply);
     if (rs) {
-        send_frame_route(route, MSG_CONFIG, 0, next_down_seq(), rs); // node_id=0: адресат визначається за mac
+        send_frame_route(route, MSG_CONFIG, 0, next_down_seq(), rs);
         free(rs);
     }
     cJSON_Delete(reply);
     cJSON_Delete(j);
 }
 
-// Публікує пакет у TELEMETRY_TOPIC. Payload, якщо це валідний JSON, іде як
-// вкладений об'єкт; інакше -- сирим рядком у "payload_raw".
 static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, RouteKind kind, NodeState *node) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
@@ -1132,7 +981,6 @@ static void publish_telemetry(const SensorPacket *pkt, const char *payload_str, 
 
     cJSON *payload = pkt->payload_len > 0 ? cJSON_Parse(payload_str) : NULL;
     if (payload) {
-        // Стан буфера беремо лише з найновішого пакета: запізнілі з буфера описують минуле
         if (node && cJSON_IsObject(payload) && (int32_t)pkt->sequence == node->max_seq_seen) {
             cJSON *bl = cJSON_GetObjectItemCaseSensitive(payload, "backlog");
             cJSON *dr = cJSON_GetObjectItemCaseSensitive(payload, "dropped");
@@ -1157,61 +1005,48 @@ static void latency_on_ack(const SensorPacket *ack);
 void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) {
     SensorPacket pkt = {0};
 
-    // Розпакування та строга перевірка CRC32
     int status = protocol_unpack(raw, raw_len, &pkt);
 
     if (status == PROTO_ERR_BAD_CRC) {
         corrupted_count++;
-        log_event("[ПОМИЛКА] Пакет битий (PROTO_ERR_BAD_CRC), канал=%s! Відхилено. "
-                   "Разом битих пакетів: %u\n", route_kind_name(route->kind), corrupted_count);
+        log_event("[ERROR] Corrupted packet (PROTO_ERR_BAD_CRC), link=%s, rejected. "
+                   "Corrupted total: %u\n", route_kind_name(route->kind), corrupted_count);
         return;
     } else if (status != PROTO_OK) {
         corrupted_count++;
-        log_event("[ПОПЕРЕДЖЕННЯ] Помилка розпакування (код: %d), канал=%s. Відхилено. "
-                   "Разом битих пакетів: %u\n", status, route_kind_name(route->kind), corrupted_count);
+        log_event("[WARN] Unpack error (code %d), link=%s, rejected. "
+                   "Corrupted total: %u\n", status, route_kind_name(route->kind), corrupted_count);
         return;
     }
 
-    // ACK від вузла (підтвердження наших CONFIG-пакетів автоналаштування) --
-    // це не телеметрія, у облік sequence/втрат не потрапляє.
     if (pkt.msg_type == MSG_ACK) {
         provision_on_ack(&pkt);
         latency_on_ack(&pkt);
         return;
     }
 
-    // HELLO від плати без id: HEARTBEAT з node_id=0 -- запит на призначення id.
     if (pkt.msg_type == MSG_HEARTBEAT && pkt.node_id == 0) {
         handle_hello(&pkt, route);
         return;
     }
-    if (pkt.node_id == 0) return; // node_id=0 зарезервовано; інші пакети без id не приймаємо
+    if (pkt.node_id == 0) return;
 
-    // Трекінг вузла
     NodeState *node = find_or_create_node(pkt.node_id);
     if (!node) return;
 
-    // Дріт утикнули знову (вузол з'явився на UART після того, як був деінде або мовчав):
-    // налаштування Wi-Fi могли застаріти -- перенастроюємо.
     uint64_t t_now = get_monotonic_time_ms();
     if (route->kind == ROUTE_UART && node->last_seen_ms != 0 &&
         (node->last_route.kind != ROUTE_UART || node->last_route.fd != route->fd ||
          t_now - node->last_seen_ms > NODE_TIMEOUT_MS)) {
-        log_event("[НАЛАШТУВАННЯ] Вузол %u знову на UART -- перенастроюю\n", pkt.node_id);
+        log_event("[PROVISION] Node %u is back on UART, re-provisioning\n", pkt.node_id);
         provision_reset(node);
     }
     node->last_seen_ms = t_now;
     node->last_transport = route->kind;
     node->last_route = *route;
 
-    // Аналіз втрат, дублікатів і порядку (вікно SEQ_WINDOW останніх sequence).
     bool is_seq_duplicate = false;
-    // ALARM/CONFIG плата може повторювати дуже пізно (черга на платі, retry після
-    // розриву), тож їхні старі sequence/timestamp -- не ознака перезапуску.
     bool critical = pkt.msg_type == MSG_ALARM || pkt.msg_type == MSG_CONFIG;
-    // Перезапуск плати: millis() пішов з нуля, тобто timestamp різко впав.
-    // Лише за sequence це видно не одразу (поки не набіжить SEQ_WINDOW пакетів).
-    // Основний сигнал перезапуску -- HELLO (див. handle_hello), це запасна евристика.
     bool ts_restart = !critical && node->max_seq_seen != -1 && pkt.timestamp_ms + 30000 < node->last_ts_ms;
     if (node->max_seq_seen == -1) {
         node->max_seq_seen = (int32_t)pkt.sequence;
@@ -1221,8 +1056,6 @@ void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *rou
     } else {
         int64_t diff = (int64_t)pkt.sequence - (int64_t)node->max_seq_seen;
         if (diff > 0) {
-            // Новий найвищий sequence; усе, що пропущено між ними, -- втрати
-            // (якщо воно потім прийде запізно, лічильник втрат зменшиться).
             node->lost_count += (uint32_t)(diff - 1);
             node->seen_mask = (diff >= SEQ_WINDOW) ? 1 : ((node->seen_mask << diff) | 1);
             node->max_seq_seen = (int32_t)pkt.sequence;
@@ -1234,31 +1067,24 @@ void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *rou
                 is_seq_duplicate = true;
                 node->duplicate_count++;
             } else {
-                // Запізнілий пакет (порушення порядку): не дублікат, і раніше
-                // він був зарахований як втрачений.
                 node->seen_mask |= bit;
                 node->received_count++;
                 if (node->lost_count > 0) node->lost_count--;
-                log_event("[ПОРЯДОК] Вузол %u: пакет Seq %u прийшов із запізненням (порушення порядку)\n",
+                log_event("[ORDER] Node %u: seq %u arrived late (out of order)\n",
                            pkt.node_id, pkt.sequence);
             }
         } else if (critical) {
-            // ALARM/CONFIG відстає від максимуму більше ніж на вікно: це запізніле
-            // повторення, а не перезапуск. Обліку sequence не чіпаємо, дублікат
-            // визначаємо за списком уже бачених критичних sequence.
             if (is_duplicate_alarm(node, pkt.sequence)) {
                 is_seq_duplicate = true;
                 node->duplicate_count++;
             } else {
                 node->received_count++;
                 if (node->lost_count > 0) node->lost_count--;
-                log_event("[ПОРЯДОК] Вузол %u: критичний пакет Seq %u прийшов за межами вікна (запізнілий)\n",
+                log_event("[ORDER] Node %u: critical seq %u arrived outside the window (late retry)\n",
                            pkt.node_id, pkt.sequence);
             }
         } else {
-            // sequence відстає від максимуму більше ніж на вікно -- це не
-            // дублікат, а перезапуск вузла (sequence пішов з нуля).
-            log_event("[СТАТУС] Вузол %u, схоже, перезапустився (Seq %u після %d, timestamp %llu мс). Скидаю відстеження sequence\n",
+            log_event("[STATUS] Node %u appears to have restarted (seq %u after %d, timestamp %llu ms), resetting sequence tracking\n",
                        pkt.node_id, pkt.sequence, node->max_seq_seen, (unsigned long long)pkt.timestamp_ms);
             node_seq_reset(node);
             node->max_seq_seen = (int32_t)pkt.sequence;
@@ -1268,38 +1094,28 @@ void handle_packet_now(const uint8_t *raw, size_t raw_len, const ReplyRoute *rou
         }
     }
 
-    // Парсинг JSON-корисного навантаження (у локальний буфер +1 байт для
-    // '\0' -- НЕ пишемо термінатор у сам pkt.payload, бо payload_len може
-    // дорівнювати MAX_PAYLOAD_SIZE і це був би вихід за межі масиву).
     char tmp[MAX_PAYLOAD_SIZE + 1];
     memcpy(tmp, pkt.payload, pkt.payload_len);
     tmp[pkt.payload_len] = '\0';
 
-    // Дублі не віддаємо вебу -- у БД вони теж не потрібні.
-    if (!is_seq_duplicate && pkt.msg_type != MSG_ACK) {
+    if (!is_seq_duplicate) {
         publish_telemetry(&pkt, tmp, route->kind, node);
     }
 
-    // Обробка критичних подій -- тепер логуємо ОБИДВА випадки: і нову
-    // подію, і задедупліковану, бо саме другий випадок і є доказом
-    // критерію №3 (повторний пакет не створив дублікат бізнес-події).
     if (pkt.msg_type == MSG_ALARM || pkt.msg_type == MSG_CONFIG) {
         if (!is_duplicate_alarm(node, pkt.sequence)) {
-            log_event("[ПОДІЯ] Вузол %u надіслав ALARM/CONFIG (Seq: %u, канал=%s) -- НОВА подія\n",
+            log_event("[EVENT] Node %u sent ALARM/CONFIG (seq %u, link=%s) -- new event\n",
                        pkt.node_id, pkt.sequence, route_kind_name(route->kind));
             record_alarm(node, pkt.sequence);
         } else {
-            log_event("[ПОДІЯ] Вузол %u повторив ALARM/CONFIG (Seq: %u, канал=%s) -- "
-                       "ДЕДУПЛІКОВАНО, друга подія НЕ створена\n",
+            log_event("[EVENT] Node %u repeated ALARM/CONFIG (seq %u, link=%s) -- "
+                       "deduplicated, no second event\n",
                        pkt.node_id, pkt.sequence, route_kind_name(route->kind));
         }
         send_ack_via(pkt.node_id, pkt.sequence, route);
     }
 }
 
-// Колбек MQTT -- лише розпаковує ReplyRoute{ROUTE_MQTT} і передає в
-// спільний handle_packet(). Лишається для sim_node і для сумісності --
-// фізичні плати тепер ідуть через UDP/TCP/UART нижче.
 static bool tcp_fd_active(int fd) {
     if (fd < 0) return false;
     for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
@@ -1308,11 +1124,6 @@ static bool tcp_fd_active(int fd) {
     return false;
 }
 
-// Команди з веба (ALARM/CONFIG) приходять в MQTT-топік case24/downlink/<id>.
-// Плата на UDP/TCP/UART цього топіка не слухає, тому Gateway сам пересилає
-// кадр тим каналом, яким вузол останній раз вийшов на зв'язок. Для MQTT-вузлів
-// (sim_node) нічого не робимо -- вони підписані на топік самі. Власні ACK
-// Gateway, які теж ідуть у цей топік, ігноруємо (msg_type == ACK).
 void forward_downlink(const struct mosquitto_message *msg) {
     SensorPacket pkt = {0};
     if (protocol_unpack((const uint8_t*)msg->payload, (size_t)msg->payloadlen, &pkt) != PROTO_OK) return;
@@ -1322,28 +1133,21 @@ void forward_downlink(const struct mosquitto_message *msg) {
         if (nodes[i].node_id != pkt.node_id) continue;
         ReplyRoute route = nodes[i].last_route;
         if (route.kind == ROUTE_MQTT) return;
-        // fd для TCP міг змінитись після перепідключення -- беремо поточний
         if (route.kind == ROUTE_UART && !uart_port_by_fd(route.fd)) route.fd = -1;
         if (route.kind == ROUTE_TCP && !tcp_fd_active(route.fd)) route.fd = -1;
         if ((route.kind == ROUTE_TCP || route.kind == ROUTE_UART) && route.fd < 0) {
-            log_event("[DOWNLINK] Вузол %u: канал %s не активний, команду з веба не доставлено\n",
+            log_event("[DOWNLINK] Node %u: link %s is down, web command not delivered\n",
                        pkt.node_id, route_kind_name(route.kind));
             return;
         }
         downlink_send(&route, pkt.node_id, (const uint8_t*)msg->payload, msg->payloadlen);
-        log_event("[DOWNLINK] Команда з веба (тип %u, Seq %u) -> вузол %u через %s\n",
+        log_event("[DOWNLINK] Web command (type %u, seq %u) -> node %u via %s\n",
                    pkt.msg_type, pkt.sequence, pkt.node_id, route_kind_name(route.kind));
         return;
     }
-    log_event("[DOWNLINK] Команду для невідомого вузла %u відкинуто\n", pkt.node_id);
+    log_event("[DOWNLINK] Dropped command for unknown node %u\n", pkt.node_id);
 }
 
-// ---- З'єднання з MQTT-брокером ----
-// mosquitto_loop() у неблокуючому режимі сам не перепідключається, а сесія clean=true
-// втрачає підписки, тож підписуємось у on_connect, а перепідключення робить
-// mqtt_maintain() з головного циклу. Без брокера шлюз не падає: UDP/TCP/UART працюють.
-// Саме IPv4-адреса, не "localhost": асинхронне підключення пробує лише першу адресу,
-// а "localhost" на macOS спершу дає IPv6 (::1), на якому брокер не слухає.
 #define MQTT_HOST "127.0.0.1"
 #define MQTT_PORT 1883
 #define MQTT_RETRY_MS 1000
@@ -1352,55 +1156,47 @@ static bool g_mqtt_connected = false;
 static void on_mqtt_connect(struct mosquitto *mosq, void *userdata, int rc) {
     (void)userdata;
     if (rc != 0) {
-        log_event("[MQTT] Брокер відхилив підключення (код %d), пробую знову\n", rc);
+        log_event("[MQTT] Broker refused connection (code %d), retrying\n", rc);
         return;
     }
-    mosquitto_subscribe(mosq, NULL, "case24/uplink", 0);
+    mosquitto_subscribe(mosq, NULL, UPLINK_TOPIC, 0);
     mosquitto_subscribe(mosq, NULL, DOWNLINK_PREFIX "+", 0);
     mosquitto_subscribe(mosq, NULL, CONTROL_TOPIC, 0);
     g_mqtt_connected = true;
-    log_event("[MQTT] Підключено до брокера %s:%d\n", MQTT_HOST, MQTT_PORT);
+    log_event("[MQTT] Connected to broker %s:%d\n", MQTT_HOST, MQTT_PORT);
 }
 
 static void on_mqtt_disconnect(struct mosquitto *mosq, void *userdata, int rc) {
     (void)mosq; (void)userdata;
     if (g_mqtt_connected)
-        log_event("[MQTT] З'єднання з брокером втрачено (код %d), перепідключаюсь\n", rc);
+        log_event("[MQTT] Lost connection to broker (code %d), reconnecting\n", rc);
     g_mqtt_connected = false;
 }
 
-// Викликається щоразу в головному циклі: крутить MQTT і, якщо зв'язку немає,
-// раз на MQTT_RETRY_MS пробує підключитись (без блокування циклу).
 static void mqtt_maintain(uint64_t now) {
     static uint64_t last_try = 0;
     static int failures = 0;
 
-    int rc = mosquitto_loop(mosq_global, 0, 1); // неблокуюче -- решта каналів теж мають встигати
+    int rc = mosquitto_loop(mosq_global, 0, 1);
     if (rc != MOSQ_ERR_SUCCESS) g_mqtt_connected = false;
     if (g_mqtt_connected) { failures = 0; return; }
 
     if (last_try != 0 && now - last_try < MQTT_RETRY_MS) return;
     last_try = now ? now : 1;
-    // Перша спроба після connect_async часто повертає помилку -- попереджаємо з другої
     if (mosquitto_reconnect_async(mosq_global) != MOSQ_ERR_SUCCESS && ++failures == 3) {
-        log_event("[MQTT] Брокер %s:%d недоступний -- шлюз працює без MQTT і пробує знову кожні %d с\n",
+        log_event("[MQTT] Broker %s:%d unreachable -- running without MQTT, retrying every %d s\n",
                    MQTT_HOST, MQTT_PORT, MQTT_RETRY_MS / 1000);
     }
 }
 
-// ---- Вимірювання затримки (RTT) ----
-// Раз на PING_INTERVAL_MS кожному online-вузлу йде CONFIG {"cmd":"ping"}; вузол
-// відповідає ACK з тим самим sequence. RTT = час між відправкою і ACK за годинником
-// шлюзу, тому синхронізація годинників не потрібна. Роздільність ~10-20 мс (цикл шлюзу).
-// Вузол, що не відповів, просто не дає зразка (разом із втратами це видно в loss rate).
 #define PING_INTERVAL_MS 5000
-#define RTT_STALE_MS 20000     // зразок старший за це -- у стані latency_ms = null
+#define RTT_STALE_MS 20000
 #define RTT_EWMA_ALPHA 0.3
 
 static void ping_tick(uint64_t now) {
     for (int i = 0; i < node_count; i++) {
         NodeState *n = &nodes[i];
-        if (now - n->last_seen_ms >= NODE_TIMEOUT_MS) { n->ping_seq = 0; continue; } // OFFLINE
+        if (now - n->last_seen_ms >= NODE_TIMEOUT_MS) { n->ping_seq = 0; continue; }
         if (n->ping_next_ms != 0 && now < n->ping_next_ms) continue;
 
         ReplyRoute route = n->last_route;
@@ -1423,7 +1219,7 @@ static void latency_on_ack(const SensorPacket *ack) {
         double rtt = (double)(now - n->ping_sent_ms);
         n->rtt_ms = n->rtt_at_ms == 0 ? rtt : RTT_EWMA_ALPHA * rtt + (1.0 - RTT_EWMA_ALPHA) * n->rtt_ms;
         n->rtt_at_ms = now;
-        n->ping_seq = 0; // запізнілий дубль ACK вдруге не рахуємо
+        n->ping_seq = 0;
         return;
     }
 }
@@ -1442,11 +1238,10 @@ void on_mqtt_message(struct mosquitto *mosq, void *userdata, const struct mosqui
     handle_packet((const uint8_t*)msg->payload, (size_t)msg->payloadlen, &route);
 }
 
-// ---- UDP: підняти сокет і опитати його (неблокуюче) ----
 void setup_udp(void) {
     g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_udp_fd < 0) {
-        fprintf(stderr, "[UDP] Не вдалося створити сокет: %s\n", strerror(errno));
+        fprintf(stderr, "[UDP] Failed to create socket: %s\n", strerror(errno));
         return;
     }
     int opt = 1;
@@ -1458,14 +1253,14 @@ void setup_udp(void) {
     addr.sin_port = htons(UDP_PORT);
 
     if (bind(g_udp_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[UDP] Не вдалося прив'язати порт %d: %s\n", UDP_PORT, strerror(errno));
+        fprintf(stderr, "[UDP] Failed to bind port %d: %s\n", UDP_PORT, strerror(errno));
         close(g_udp_fd);
         g_udp_fd = -1;
         return;
     }
     int flags = fcntl(g_udp_fd, F_GETFL, 0);
     fcntl(g_udp_fd, F_SETFL, flags | O_NONBLOCK);
-    log_event("[UDP] Слухаю на порту %d\n", UDP_PORT);
+    log_event("[UDP] Listening on port %d\n", UDP_PORT);
 }
 
 void poll_udp(void) {
@@ -1475,22 +1270,20 @@ void poll_udp(void) {
     struct sockaddr_in sender;
     socklen_t sender_len = sizeof(sender);
 
-    // UDP зберігає межі датаграми -- на відміну від TCP/UART, тут не
-    // потрібне збирання кадру по байтах: одна recvfrom() = один пакет.
-    ssize_t n = recvfrom(g_udp_fd, buf, sizeof(buf), 0,
-                          (struct sockaddr*)&sender, &sender_len);
-    if (n > 0) {
+    for (int i = 0; i < UDP_MAX_PER_POLL; i++) {
+        sender_len = sizeof(sender);
+        ssize_t n = recvfrom(g_udp_fd, buf, sizeof(buf), 0,
+                              (struct sockaddr*)&sender, &sender_len);
+        if (n <= 0) break;
         ReplyRoute route = { .kind = ROUTE_UDP, .udp_addr = sender };
         handle_packet(buf, (size_t)n, &route);
     }
-    // n < 0 (EAGAIN/EWOULDBLOCK) -- просто немає нових даних, це норма.
 }
 
-// ---- TCP: слухати, приймати ОДНЕ з'єднання за раз, читати з фреймінгом ----
 void setup_tcp(void) {
     g_tcp_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_tcp_listen_fd < 0) {
-        fprintf(stderr, "[TCP] Не вдалося створити сокет: %s\n", strerror(errno));
+        fprintf(stderr, "[TCP] Failed to create socket: %s\n", strerror(errno));
         return;
     }
     int opt = 1;
@@ -1502,13 +1295,13 @@ void setup_tcp(void) {
     addr.sin_port = htons(TCP_PORT);
 
     if (bind(g_tcp_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[TCP] Не вдалося прив'язати порт %d: %s\n", TCP_PORT, strerror(errno));
+        fprintf(stderr, "[TCP] Failed to bind port %d: %s\n", TCP_PORT, strerror(errno));
         close(g_tcp_listen_fd);
         g_tcp_listen_fd = -1;
         return;
     }
     if (listen(g_tcp_listen_fd, MAX_TCP_CLIENTS) < 0) {
-        fprintf(stderr, "[TCP] listen() не вдався: %s\n", strerror(errno));
+        fprintf(stderr, "[TCP] listen() failed: %s\n", strerror(errno));
         close(g_tcp_listen_fd);
         g_tcp_listen_fd = -1;
         return;
@@ -1516,11 +1309,14 @@ void setup_tcp(void) {
     int flags = fcntl(g_tcp_listen_fd, F_GETFL, 0);
     fcntl(g_tcp_listen_fd, F_SETFL, flags | O_NONBLOCK);
     for (int i = 0; i < MAX_TCP_CLIENTS; i++) g_tcp_clients[i].fd = -1;
-    log_event("[TCP] Слухаю на порту %d\n", TCP_PORT);
+    log_event("[TCP] Listening on port %d\n", TCP_PORT);
 }
 
 static void tcp_client_close(TcpClient *c, const char *why) {
-    log_event("[TCP] Вузол (fd=%d) відключено: %s\n", c->fd, why);
+    log_event("[TCP] Client (fd=%d) disconnected: %s\n", c->fd, why);
+    for (int i = 0; i < node_count; i++)
+        if (nodes[i].last_route.kind == ROUTE_TCP && nodes[i].last_route.fd == c->fd)
+            nodes[i].last_route.fd = -1;
     close(c->fd);
     c->fd = -1;
 }
@@ -1529,7 +1325,6 @@ void poll_tcp(void) {
     if (g_tcp_listen_fd < 0) return;
     uint64_t now = get_monotonic_time_ms();
 
-    // Приймаємо всі нові з'єднання, що чекають
     for (;;) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -1540,7 +1335,7 @@ void poll_tcp(void) {
             if (g_tcp_clients[i].fd < 0) { slot = i; break; }
         }
         if (slot < 0) {
-            log_event("[TCP] Забагато клієнтів (макс. %d), з'єднання з %s відхилено\n",
+            log_event("[TCP] Too many clients (max %d), rejected connection from %s\n",
                        MAX_TCP_CLIENTS, inet_ntoa(client_addr.sin_addr));
             close(fd);
             continue;
@@ -1550,7 +1345,7 @@ void poll_tcp(void) {
         g_tcp_clients[slot].fd = fd;
         g_tcp_clients[slot].last_rx_ms = now;
         frame_reader_init(&g_tcp_clients[slot].reader);
-        log_event("[TCP] Вузол підключився з %s (fd=%d)\n", inet_ntoa(client_addr.sin_addr), fd);
+        log_event("[TCP] Client connected from %s (fd=%d)\n", inet_ntoa(client_addr.sin_addr), fd);
     }
 
     for (int c = 0; c < MAX_TCP_CLIENTS; c++) {
@@ -1569,16 +1364,15 @@ void poll_tcp(void) {
                 }
             }
         } else if (n == 0) {
-            tcp_client_close(cl, "закрито вузлом");
+            tcp_client_close(cl, "closed by peer");
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             tcp_client_close(cl, strerror(errno));
         } else if (now - cl->last_rx_ms > TCP_IDLE_TIMEOUT_MS) {
-            tcp_client_close(cl, "немає даних (обрив без FIN)");
+            tcp_client_close(cl, "idle timeout (connection lost without FIN)");
         }
     }
 }
 
-// Відкриває порт у сирому режимі 8N1 115200. Повертає fd або -1.
 static int uart_open_configured(const char *path) {
     int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
@@ -1590,15 +1384,15 @@ static int uart_open_configured(const char *path) {
     cfsetospeed(&tty, UART_BAUD);
     cfsetispeed(&tty, UART_BAUD);
 
-    tty.c_cflag &= ~PARENB;    // без парності
-    tty.c_cflag &= ~CSTOPB;    // 1 стоп-біт
+    tty.c_cflag &= ~PARENB;
+    tty.c_cflag &= ~CSTOPB;
     tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;        // 8 біт даних
-    tty.c_cflag &= ~CRTSCTS;   // без апаратного flow control
+    tty.c_cflag |= CS8;
+    tty.c_cflag &= ~CRTSCTS;
     tty.c_cflag |= (CREAD | CLOCAL);
-    tty.c_cflag &= ~HUPCL;     // не смикати DTR/RTS при закритті порту (вони скидають ESP32)
+    tty.c_cflag &= ~HUPCL;
 
-    tty.c_lflag &= ~(ICANON | IEXTEN);    // сирий режим: без по-рядкової обробки і службових символів (DISCARD, LNEXT)
+    tty.c_lflag &= ~(ICANON | IEXTEN);
     tty.c_lflag &= ~(ECHO | ECHOE | ISIG);
 
     tty.c_iflag &= ~(IXON | IXOFF | IXANY);
@@ -1611,16 +1405,13 @@ static int uart_open_configured(const char *path) {
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); return -1; }
 
-    // USB-UART адаптер плати: DTR/RTS підключені до EN/GPIO0, і відкриття порту
-    // їх активує (плата перезавантажується). Знімаємо обидва, щоб далі вона працювала.
     int modem_bits = TIOCM_DTR | TIOCM_RTS;
     ioctl(fd, TIOCMBIC, &modem_bits);
     return fd;
 }
 
 static void uart_close_port(UartPort *p, const char *why) {
-    log_event("[UART] %s: %s -- порт закрито\n", p->path, why);
-    // Вузли, яких чули через цей порт, більше не мають дроту (і fd може дістатися іншому порту).
+    log_event("[UART] %s: %s, port closed\n", p->path, why);
     for (int i = 0; i < node_count; i++)
         if (nodes[i].last_route.kind == ROUTE_UART && nodes[i].last_route.fd == p->fd)
             nodes[i].last_route.fd = -1;
@@ -1628,11 +1419,6 @@ static void uart_close_port(UartPort *p, const char *why) {
     p->fd = -1;
 }
 
-// Шукає послідовні порти й відкриває нові. Номер ttyUSBx Linux видає за порядком
-// появи пристроїв і він "скаче", тому кожен порт ідентифікуємо за realpath, а які
-// з них наші -- вирішує відповідь на пробний пінг, а не назва.
-//   GATEWAY_UART='/dev/serial/by-id/usb-FTDI*' -- шукати лише за цим шаблоном/шляхом
-//   не задано -- усі /dev/ttyUSB* і /dev/ttyACM*
 static void uart_scan(bool first) {
     const char *env = getenv("GATEWAY_UART");
     const char *defaults[] = { "/dev/ttyUSB*", "/dev/ttyACM*" };
@@ -1655,11 +1441,11 @@ static void uart_scan(bool first) {
                 if (g_uart_ports[j].fd < 0 && !slot) slot = &g_uart_ports[j];
             }
             if (known) continue;
-            if (!slot) break; // усі слоти зайняті
+            if (!slot) break;
 
             int fd = uart_open_configured(real);
             if (fd < 0) {
-                if (first) fprintf(stderr, "[UART] Не вдалося відкрити %s (%s)\n", real, strerror(errno));
+                if (first) fprintf(stderr, "[UART] Failed to open %s (%s)\n", real, strerror(errno));
                 continue;
             }
             slot->fd = fd;
@@ -1669,7 +1455,7 @@ static void uart_scan(bool first) {
             slot->opened_ms = get_monotonic_time_ms();
             slot->responded = false;
             slot->warned_silent = false;
-            log_event("[UART] Знайдено порт %s (115200 8N1) -- шлю пробні пінги, чекаю відповіді плати\n", real);
+            log_event("[UART] Found port %s (115200 8N1), probing for a node\n", real);
         }
         globfree(&g);
     }
@@ -1679,12 +1465,12 @@ static void uart_scan(bool first) {
         for (int j = 0; j < MAX_UART_PORTS; j++) any = any || g_uart_ports[j].fd >= 0;
         if (!any)
             fprintf(stderr,
-                    "[UART] Послідовних портів не знайдено (/dev/ttyUSB*, /dev/ttyACM*) -- UART-вузли недоступні. "
-                    "Шлюз шукає знову кожні 2 с, решта каналів працює.\n");
+                    "[UART] No serial ports found (/dev/ttyUSB*, /dev/ttyACM*). "
+                    "Rescanning every 2 s, other links keep working.\n");
     }
 }
 
-#define UART_SCAN_MS 2000 // як часто шукаємо нові порти (перехідник могли встромити пізніше)
+#define UART_SCAN_MS 2000
 
 void poll_uart(void) {
     uint64_t now_ms = get_monotonic_time_ms();
@@ -1700,15 +1486,11 @@ void poll_uart(void) {
         UartPort *p = &g_uart_ports[pi];
         if (p->fd < 0) continue;
 
-        // Після вимкнення USB-перехідника Linux "кладе слухавку" (hangup) на відкритий порт:
-        // read() тоді повертає 0, так само як при відсутності даних, і помилки не видно.
-        // Без цієї перевірки мертвий порт лишається відкритим, займає слот (їх лише
-        // MAX_UART_PORTS), а нова назва після replug (ttyUSB1...) не з'являється в маршрутах.
         struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
         struct stat st;
         if ((poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) ||
             stat(p->path, &st) != 0) {
-            uart_close_port(p, "порт відключено");
+            uart_close_port(p, "device unplugged");
             continue;
         }
 
@@ -1716,15 +1498,11 @@ void poll_uart(void) {
         ssize_t n = read(p->fd, rx, sizeof(rx));
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             char why[96];
-            snprintf(why, sizeof(why), "порт зник (%s)", strerror(errno));
+            snprintf(why, sizeof(why), "port gone (%s)", strerror(errno));
             uart_close_port(p, why);
             continue;
         }
         if (n > 0) {
-            // Кадр плата пише одним блоком (~15 мс на 115200). Пауза довша за
-            // UART_FRAME_GAP_MS всередині недоскладеного кадру означає сміття (завантажувач
-            // ESP32 друкує текст при скиданні) -- скидаємо складання, щоб наступний
-            // справжній кадр не з'їхав на зміщення.
             if (p->reader.have > 0 && now_ms - p->last_rx_ms > UART_FRAME_GAP_MS)
                 frame_reader_init(&p->reader);
             p->last_rx_ms = now_ms;
@@ -1734,18 +1512,17 @@ void poll_uart(void) {
                     SensorPacket probe;
                     if (!p->responded && protocol_unpack(p->reader.buf, p->reader.have, &probe) == PROTO_OK) {
                         p->responded = true;
-                        log_event("[UART] %s: пристрій відповів валідним кадром -- це наш сенсор\n", p->path);
+                        log_event("[UART] %s: received a valid frame, node detected\n", p->path);
                     }
                     handle_packet(p->reader.buf, p->reader.have, &route);
                     frame_reader_init(&p->reader);
                 }
             }
         }
-        // now_ms узято до uart_scan() вище, тож для щойно відкритого порту він "старіший" за opened_ms
         if (!p->responded && !p->warned_silent && now_ms > p->opened_ms &&
             now_ms - p->opened_ms > UART_PROBE_WARN_MS) {
             p->warned_silent = true;
-            log_event("[UART] %s: немає відповіді на пінги %d с -- схоже, не наша плата (порт лишається відкритим)\n",
+            log_event("[UART] %s: no response to probes for %d s, probably not a node (port stays open)\n",
                       p->path, UART_PROBE_WARN_MS / 1000);
         }
     }
@@ -1753,23 +1530,20 @@ void poll_uart(void) {
 
 void print_dashboard() {
     uint64_t now = get_monotonic_time_ms();
-    printf("\n--- Дашборд (Вузлів: %d) ---\n", node_count);
+    printf("\n--- Dashboard (nodes: %d) ---\n", node_count);
     printf("%-5s | %-7s | %-6s | %-6s | %-6s | %-6s | %-8s | %-7s | %-10s\n",
-           "Вузол", "Статус", "Канал", "Отр.", "Втрат", "Дубл.", "RTT мс", "Backlog", "Max Seq");
+           "Node", "Status", "Link", "Recv", "Lost", "Dup", "RTT ms", "Backlog", "Max Seq");
     printf("----------------------------------------------------------------------------------\n");
 
     for (int i = 0; i < node_count; i++) {
         NodeState *n = &nodes[i];
         bool online = (now - n->last_seen_ms) < NODE_TIMEOUT_MS;
 
-        // Крок 8: фіксуємо МОМЕНТ переходу ONLINE<->OFFLINE у лог --
-        // саме ці мітки часу потрібні для звіту про 30-секундний розрив
-        // (критерій приймання №4): коли вузол "зник" і коли "повернувся".
         if (online != n->was_online) {
             if (online) {
-                log_event("[СТАТУС] Вузол %u знову ONLINE (зв'язок відновлено)\n", n->node_id);
+                log_event("[STATUS] Node %u is ONLINE again\n", n->node_id);
             } else {
-                log_event("[СТАТУС] Вузол %u перейшов у OFFLINE (немає повідомлень > %dмс)\n",
+                log_event("[STATUS] Node %u went OFFLINE (no messages for > %d ms)\n",
                            n->node_id, NODE_TIMEOUT_MS);
             }
             n->was_online = online;
@@ -1788,25 +1562,14 @@ void print_dashboard() {
                n->received_count, n->lost_count, n->duplicate_count,
                rtt_s, bl_s, n->max_seq_seen, loss_rate);
     }
-    printf("Всього битих пакетів з початку роботи: %u\n", corrupted_count);
+    printf("Corrupted packets since start: %u\n", corrupted_count);
     if (imp_enabled(get_monotonic_time_ms()))
-        printf("Перешкоди: %s | втрати %d%% дублі %d%% биті %d%% затримка %d+%d мс | зіпсовано: вх. втрачено %u, вих. втрачено %u, дублів %u, битих %u\n",
+        printf("Impairment: %s | loss %d%% dup %d%% corrupt %d%% delay %d+%d ms | dropped up %u, dropped down %u, duplicated %u, corrupted %u\n",
                g_imp.profile, g_imp.loss, g_imp.dup, g_imp.corrupt, g_imp.delay_ms, g_imp.jitter_ms,
                g_imp.dropped_up, g_imp.dropped_down, g_imp.duplicated, g_imp.n_corrupted);
     printf("======================================================\n");
 }
 
-// Публікує оброблений стан (те саме, що показує термінальний дашборд, і
-// нічого більше) у STATE_TOPIC як JSON. Це ЄДИНИЙ канал, звідки веб-
-// інтерфейс (Блок E) має брати received/lost/duplicate/online -- він НЕ
-// повинен сам рахувати це з сирого case24/uplink, інакше виходять два
-// незалежні шлюзи з можливо різними цифрами. Веб лишається "вікном" у
-// стан Gateway, як і намальовано в архітектурі кейсу
-// (Sensor Node -> ... -> Gateway -> Event Store / Dashboard).
-//
-// НЕ чіпає n->was_online -- це виключно відповідальність print_dashboard()
-// (там же і лог переходів ONLINE<->OFFLINE), щоб не було двох місць, які
-// одночасно мутують один стан.
 void publish_gateway_state(void) {
     uint64_t now = get_monotonic_time_ms();
     cJSON *root = cJSON_CreateObject();
@@ -1830,9 +1593,6 @@ void publish_gateway_state(void) {
         cJSON_AddNumberToObject(node_json, "duplicate_count", n->duplicate_count);
         cJSON_AddNumberToObject(node_json, "max_seq_seen", n->max_seq_seen);
         cJSON_AddNumberToObject(node_json, "loss_rate", loss_rate);
-        // Скільки мс тому прийшов останній пакет -- монотонний час, тому
-        // порівнянний лише сам із собою (не з wall-clock веб-сторони).
-        // Веб показує це як "X.Xс тому", а не намагається звести годинники.
         cJSON_AddNumberToObject(node_json, "last_seen_ms_ago", (double)(now - n->last_seen_ms));
         bool rtt_fresh = n->rtt_at_ms != 0 && now - n->rtt_at_ms < RTT_STALE_MS;
         if (rtt_fresh) cJSON_AddNumberToObject(node_json, "latency_ms", n->rtt_ms);
@@ -1846,7 +1606,6 @@ void publish_gateway_state(void) {
     cJSON_AddItemToObject(root, "nodes", nodes_json);
     cJSON_AddNumberToObject(root, "corrupted_count", corrupted_count);
 
-    // Поточні перешкоди каналу: веб показує активний профіль і лічильники того, що вони зіпсували
     cJSON *imp = cJSON_CreateObject();
     cJSON_AddStringToObject(imp, "profile", g_imp.profile);
     cJSON_AddBoolToObject(imp, "active", imp_enabled(now));
@@ -1876,33 +1635,27 @@ int main(void) {
     g_log_file = fopen(LOG_FILE_PATH, "a");
     if (g_log_file != NULL) {
         time_t start_t = time(NULL);
-        fprintf(g_log_file, "\n===== Новий запуск Gateway: %s", ctime(&start_t)); /* ctime сам додає \n */
+        fprintf(g_log_file, "\n===== Gateway started: %s", ctime(&start_t));
         fflush(g_log_file);
-        printf("Лог подій пишеться у файл: %s\n", LOG_FILE_PATH);
+        printf("Event log: %s\n", LOG_FILE_PATH);
     } else {
-        fprintf(stderr, "[УВАГА] Не вдалося відкрити %s для запису -- лог буде тільки на екрані.\n",
+        fprintf(stderr, "[WARN] Cannot open %s for writing, logging to stdout only.\n",
                 LOG_FILE_PATH);
     }
 
-    signal(SIGPIPE, SIG_IGN); // запис у закритий TCP/UART не повинен вбивати шлюз
+    signal(SIGPIPE, SIG_IGN);
 
     mosquitto_lib_init();
     mosq_global = mosquitto_new("GatewayClient", true, NULL);
     if (!mosq_global) {
-        fprintf(stderr, "Не вдалося створити MQTT-клієнта.\n");
+        fprintf(stderr, "Failed to create MQTT client.\n");
         return 1;
     }
     mosquitto_connect_callback_set(mosq_global, on_mqtt_connect);
     mosquitto_disconnect_callback_set(mosq_global, on_mqtt_disconnect);
     mosquitto_message_callback_set(mosq_global, on_mqtt_message);
-    // connect_async лише запам'ятовує адресу брокера; саме підключення робить
-    // mqtt_maintain() (reconnect_async) -- так само на старті й після обриву.
     mosquitto_connect_async(mosq_global, MQTT_HOST, MQTT_PORT, 60);
 
-    // 30.09 (3) -- три додаткові "сирі" транспорти поряд з MQTT. Кожен
-    // піднімається незалежно: якщо, наприклад, UART-перехідник не
-    // підключений, UART-сканер лише друкує попередження і gateway
-    // продовжує працювати з рештою каналів (MQTT/UDP/TCP).
     setup_udp();
     setup_tcp();
     uart_init();
@@ -1910,7 +1663,7 @@ int main(void) {
     registry_load();
     provision_start_worker();
 
-    printf("Шлюз успішно запущено. Очікування телеметрії (MQTT/UDP/TCP/UART)...\n");
+    printf("Gateway started, waiting for telemetry (MQTT/UDP/TCP/UART)...\n");
 
     uint64_t last_dash_ms = get_monotonic_time_ms();
 
@@ -1927,11 +1680,11 @@ int main(void) {
         ping_tick(now);
         if (now - last_dash_ms >= 2000) {
             print_dashboard();
-            publish_gateway_state(); // те саме, що дашборд, але для веб (Блок E)
+            publish_gateway_state();
             last_dash_ms = now;
         }
 
-        usleep(10000); // 10мс -- щоб порожній цикл не вантажив CPU на 100%
+        usleep(10000);
     }
 
     mosquitto_destroy(mosq_global);

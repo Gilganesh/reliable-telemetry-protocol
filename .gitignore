@@ -19,3 +19,5 @@ gateway/gateway.conf
 gateway/node_registry.txt
 node_registry.txt
 .venv/
+sim_node/sim_node
+local/

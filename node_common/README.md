@@ -1,143 +1,62 @@
-# node_common/ (колишній node_esp32/)
+# Node firmware
 
-Прошивка розділена на спільне ядро й два скетчі під датчики:
-- `node_common.h` -- усе, що не залежить від датчика (канали, буфер, ALARM, автоналаштування);
-- `../node_accelerometer/` -- MPU9250 (roll/pitch/yaw), потрібна бібліотека "MPU9250" автора hideakitai;
-- `../node_sht41/` -- SHT41 (temperature/humidity), без додаткових бібліотек.
-Скетч датчика реалізує `sensor_setup()`, `sensor_update()`, `sensor_payload()`.
-Arduino IDE бачить лише файли в папці скетча, тому після змін у `node_common/` чи `../protocol/`
-запускай `node_common/sync.sh` (розкладе копії); `sync.sh --check` перевіряє, що копії ідентичні.
-Нижче -- історичні нотатки: `node_esp32.ino` там = тепер `node_common.h` + скетч датчика.
+ESP32 firmware is split into a sensor-independent core and one sketch per sensor.
 
-## Усі канали одночасно (UART + TCP + UDP), автоналаштування від Pi
+| File | Role |
+|---|---|
+| `node_common.h` | Links, buffering, ALARM delivery, provisioning, console |
+| `packet_queue.h` | Fixed-capacity ring buffer of packets (unit-tested on the host) |
+| `../node_accelerometer/` | MPU9250 on I2C (SDA 21, SCL 22, address 0x68): `roll`, `pitch`, `yaw` |
+| `../node_sht41/` | SHT41 on I2C (default pins, address 0x44): `temperature`, `humidity` |
+| `raw_tests/` | Minimal sketches to bring up each sensor on its own |
+| `sync.sh` | Copies the core and `../protocol/` into each sketch folder; `--check` verifies the copies |
 
-Плата більше не обирає транспорт при прошивці (`NODE_TRANSPORT` прибрано).
-Пріоритет каналів: **UART (дріт) > TCP > UDP**; без жодного каналу пакети
-йдуть у буфер і вивантажуються, щойно канал з'явився.
-
-- Wi-Fi і адресу шлюзу плата **не питає в людини**: шлюз на Pi, побачивши
-  плату на UART, сам шле два CONFIG-пакети (`cmd:"wifi"` і `cmd:"gw"`).
-  Плата зберігає їх у NVS, підтверджує ACK і тримає Wi-Fi у фоні.
-- "Дріт живий" = за останні 3 с прийшов валідний кадр від шлюзу по UART
-  (шлюз шле "пінг" щосекунди). Відключили дріт -- плата сама йде на Wi-Fi.
-- Перший запуск: підключіть дріт до Pi при запущеному шлюзі. Далі плата
-  працює й без дроту (налаштування збережені).
-- Команди Serial Monitor: `alarm`, `status`, `forget` (стерти налаштування).
-- `node_id` прописувати не треба: його призначає шлюз за старшинством (за MAC плати), плата зберігає його в NVS. Для серво на одній платі: `SERVO_ENABLED true` (бібліотека ESP32Servo).
-
-**USB-кабель замість пінів.** `#define LINK_VIA_USB_CABLE 1` (за замовчуванням):
-зв'язок зі шлюзом іде через вбудований USB-UART плати (UART0). Кабель плата→Pi,
-піни не потрібні; Serial Monitor недоступний (канал зайнятий). Для налагодження
-`LINK_VIA_USB_CABLE 0` + кабель до ПК, а до Pi -- через USB-TTL на GPIO16/17.
-
-Нижче -- старі нотатки (частково застаріли: розділи про вибір
-`NODE_TRANSPORT` і питання Wi-Fi через Serial більше не стосуються).
-
-
-Сюди йде Arduino-скетч ESP32-вузла (Блок B).
-Інструкція: `docs/team-blocks/block-B-esp32-node.md`.
-
-`protocol.h`/`protocol.c`/`reliability.h`/`reliability.c` з `../protocol/`
-копіюються в цю папку (Arduino компілює всі .c/.h файли поруч зі скетчем).
-Уже покладені сюди актуальні копії — якщо міняєш оригінали в `../protocol/`,
-не забудь скопіювати їх сюди знов перед прошивкою.
-
-## 30.09 — злито дві паралельні гілки в один `node_esp32.ino`
-
-Того ж дня команда принесла два незалежні покращення одного файлу
-(не послідовні версії одна одної):
-- виправлення реального бага: старий `reconnect_mqtt()`/`setup_wifi()`
-  були блокуючими, через що під час реального обриву зв'язку весь
-  `loop()` зависав і телеметрія (а отже й буфер, Критерій №4) не
-  йшла й не накопичувалась як слід;
-- реальний IMU-сенсор (MPU9250, roll/pitch/yaw) замість фейкових
-  температури/вологості.
-
-Обидва злиті в поточний `node_esp32.ino`: неблокуючий reconnect +
-буфер на 50 пакетів + ALARM/ACK (`reliability.c`) + реальні дані з
-IMU. Треба бібліотека **"MPU9250" автора hideakitai** (Arduino IDE →
-Tools → Manage Libraries — шукати саме цього автора, є схожі назви
-для інших давачів). IMU підключається по I2C (SDA/SCL), адреса `0x68`.
-
-**Перед прошивкою КОЖНОЇ фізичної плати** — постати унікальний
-`MY_NODE_ID` на початку файлу (зараз `1`). Кожен вузол мережі мусить
-мати свій ID, інакше Gateway/веб не розрізнять вузли.
-
-## 30.09 (2) — фікс "плата зависла, Serial мовчить"
-
-На тесті з 3 платами Вузол 1 пішов offline і не відновився, а його
-власний Serial Monitor перестав виводити взагалі щось — тобто завис не
-Wi-Fi/MQTT, а сам `loop()`. Найімовірніша причина: `mpu.update()`
-(читання IMU по I2C) викликався в `loop()` безумовно, на кожній
-ітерації, а бібліотека I2C за замовчуванням може чекати відповіді
-давача **нескінченно**, якщо шина "зависла" (просідання живлення IMU в
-момент передачі Wi-Fi, слабкий контакт SDA/SCL). Один такий завислий
-виклик — і весь `loop()` стоїть назавжди, разом з ним і `Serial.print`,
-які мали б щось вивести.
-
-Три зміни в коді:
-1. `Wire.setTimeOut(1000)` в `setup()` — I2C-транзакція тепер завершується
-   з помилкою через 1с, а не висить вічно.
-2. `imu_ok` — прапорець, чи IMU взагалі відповіла при старті;
-   `mpu.update()` викликається тільки якщо `imu_ok == true`.
-3. MQTT `client_id` тепер `char[24]` через `snprintf`, а не
-   `String`-конкатенація — в неблокуючому reconnect-циклі (спроба раз
-   на 2с, поки вузол офлайн) повторне виділення `String` довго міг
-   фрагментувати heap і теж призвести до зависання/краху.
-
-**Якщо зависання повториться навіть після цих фіксів** — це вже не
-прошивка, а апаратна проблема: перевір фізичний контакт SDA/SCL/GND/VCC
-IMU на саме цій платі (не на інших двох) і чи не живиться вона від
-слабкого/нестабільного джерела (USB-хаб без власного живлення,
-задовгий/тонкий кабель) — під час передачі Wi-Fi ESP32 короткочасно
-споживає значно більше струму, і просідання напруги саме в цей момент
-— типова причина "живого" I2C-давача, який раптом перестає відповідати.
-
-## 30.09 (3) — три плати, три різні транспорти, один файл
-
-Кейс вимагає показати, що транспортний рівень замінний. Замість трьох
-окремих `.ino`, які з часом розійдуться — **один файл**, і перед
-прошивкою кожної плати міняєш лише `NODE_TRANSPORT` (поруч із
-`MY_NODE_ID`, на самому початку файлу):
+A sensor sketch implements three hooks and forwards `setup()`/`loop()` to the core:
 
 ```cpp
-#define NODE_TRANSPORT NODE_TRANSPORT_UDP   // або _TCP, або _UART
+void sensor_setup();                        // once, after Serial is up
+void sensor_update();                       // every loop iteration (e.g. IMU filter)
+bool sensor_payload(char *buf, size_t n);   // JSON object for the next telemetry packet; false skips it
 ```
 
-Все інше (IMU, буфер на 50 пакетів, ACK/retry через `reliability.c`)
-лишається спільним і не залежить від вибраного транспорту.
+Arduino IDE only compiles files located next to the sketch, so run `sync.sh` after editing this folder or
+`../protocol/`.
 
-| Режим | Що використовує | Потребує WiFi? | Порт/пристрій на шлюзі |
-|---|---|---|---|
-| `NODE_TRANSPORT_UDP` | `WiFiUDP` | так | Pi:5005 |
-| `NODE_TRANSPORT_TCP` | `WiFiClient` (сирий сокет, без MQTT) | так | Pi:5006 |
-| `NODE_TRANSPORT_UART` | `HardwareSerial(2)` — апаратний UART2 | **ні** | `/dev/ttyUSB0` на Pi через USB-TTL перехідник |
+## Links
 
-**UDP і TCP** — при прошивці далі як і раніше питають SSID/пароль/IP
-шлюзу через Serial Monitor (той самий майстер, що й був, просто питає
-"IP шлюзу", а не "MQTT-брокера" — це той самий Pi, інший порт).
+The node keeps all links open and sends over the best live one: **UART > TCP > UDP**.
 
-**UART** — питань про WiFi не буде взагалі: плата фізично прив'язана
-дротом до Pi, тому НЕ може працювати на відстані, як інші дві. З'єднання:
+- **UART** is alive while frames from the gateway keep arriving (the gateway sends a keep-alive every second;
+  timeout 3 s).
+- **TCP/UDP** are alive only while the gateway answers on them. Every 2 s the node sends a HELLO probe over both; a
+  link without a reply for 7 s is considered dead. An open socket alone is not trusted: a lost gateway would
+  otherwise swallow packets instead of letting them be buffered.
+- With no live link, telemetry goes into a 50-packet RAM buffer (oldest dropped on overflow) and is flushed in order,
+  one packet every 50 ms, once a link returns. New telemetry is appended to the buffer while it drains.
+- ALARMs go through a separate 8-entry queue and are delivered one at a time with ACK/retry. If retries are
+  exhausted the ALARM returns to the head of the queue and is retried after 5 s.
 
-- ESP32 `GPIO17 (TX2)` → USB-TTL перехідник `RX`
-- ESP32 `GPIO16 (RX2)` → USB-TTL перехідник `TX`
-- ESP32 `GND` → USB-TTL перехідник `GND` (обов'язково, інакше сигнал "пливе")
-- USB-TTL перехідник → USB-порт Pi (з'явиться як `/dev/ttyUSB0`, перевір
-  `ls /dev/ttyUSB*` після підключення)
+## Provisioning
 
-Якщо GPIO16/17 зайняті під щось інше на конкретній платі — зміни
-`UART_RX_PIN`/`UART_TX_PIN` на початку файлу. Швидкість (`UART_BAUD`,
-зараз 115200) має збігатися з `UART_BAUD` у `gateway/gateway.c`.
+No credentials are compiled in. On first boot, connect the board to the gateway over UART: it receives a node id,
+Wi-Fi credentials and the gateway address, acknowledges them and stores them in NVS. After that it can run on Wi-Fi
+alone. The serial command `forget` erases the stored settings.
 
-Команда `alarm` у Serial Monitor працює однаково в усіх трьох режимах —
-це завжди основний USB-Serial, окремий від UART2-лінії до шлюзу.
+## Build options
 
-**Рекомендований розподіл трьох плат** (можна поміняти, головне —
-пам'ятати, яка плата на якому режимі прошита):
-
-| node_id | Транспорт | Примітка |
+| Option | Default | Meaning |
 |---|---|---|
-| 1 | UDP | працює на WiFi як і раніше, найпростіший режим |
-| 2 | TCP | працює на WiFi, тримає постійне з'єднання із шлюзом |
-| 43 | UART | фізично поруч з Pi, з'єднана дротом через USB-TTL |
+| `LINK_VIA_USB_CABLE` | `1` | Wired link over the board's USB serial (UART0). Logs and console commands are disabled because the port carries protocol frames |
+| | `0` | Wired link over UART2: GPIO17 (TX) → adapter RX, GPIO16 (RX) → adapter TX, common GND. USB serial stays free for logs and the `alarm`, `status`, `forget` commands |
+| `SERVO_ENABLED` | `false` | Drive a servo on GPIO18 (ESP32Servo library) |
+| `WIRE_TIMEOUT_MS` | `3000` | Wired link timeout |
+| `WIFI_PROBE_MS` / `WIFI_LINK_TIMEOUT_MS` | `2000` / `7000` | Wi-Fi probe interval and timeout |
+| `BUFFER_CAPACITY` / `ALARM_QUEUE_CAP` | `50` / `8` | Offline buffer sizes |
+
+Telemetry is sent every 5 s once the node has an id.
+
+## Hardware notes
+
+An I2C transaction can hang forever if the bus glitches, for example when the supply sags during Wi-Fi transmission,
+so both sketches set `Wire.setTimeOut(1000)`. If a board still stops responding, check the sensor wiring and power the
+boards from a powered USB hub.

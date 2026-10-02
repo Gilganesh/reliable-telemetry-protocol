@@ -14,7 +14,6 @@ uint8_t crc8(const uint8_t *data, int len) {
   return crc;
 }
 
-// м'який ресет датчика — виводить його зі стану "середині виміру"
 void shtReset() {
   Wire.beginTransmission(SHT_ADDR);
   Wire.write(0x89);
@@ -23,7 +22,7 @@ void shtReset() {
 }
 
 bool readSHT41(float &temperature, float &humidity) {
-  for (int attempt = 0; attempt < 3; attempt++) {   // <-- ретраї
+  for (int attempt = 0; attempt < 3; attempt++) {
     Wire.beginTransmission(SHT_ADDR);
     Wire.write(CMD_MEAS);
     if (Wire.endTransmission() != 0) { delay(10); continue; }
@@ -54,18 +53,18 @@ void setup() {
   delay(500);
   Serial.println("=== SHT41 ===");
 
-  Wire.begin();          // БЕЗ параметрів — як у робочому варіанті
+  Wire.begin();
   Wire.setClock(100000);
 
-  shtReset();            // <-- головне ліки від "потрібно 2 ресети"
+  shtReset();
 }
 
 void loop() {
   float t, h;
   if (readSHT41(t, h)) {
-    Serial.printf("Температура: %.2f °C  |  Вологість: %.2f %%\n", t, h);
+    Serial.printf("Temperature: %.2f C  |  Humidity: %.2f %%\n", t, h);
   } else {
-    Serial.println("Помилка читання SHT41 — ресет");
+    Serial.println("SHT41 read failed, resetting");
     shtReset();
   }
   delay(1000);
