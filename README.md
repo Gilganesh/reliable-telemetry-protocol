@@ -96,6 +96,19 @@ make test       # unit tests, Python codec cross-check, firmware copy check
 
 ### Run the stack
 
+One command starts the broker, the gateway and the dashboard, writes their logs to `logs/` and stops everything on
+Ctrl+C:
+
+```bash
+./run.sh            # add --open to launch the dashboard in a browser
+```
+
+It builds the gateway, creates the Python environment on first use, stops the system `mosquitto` service if it is
+running, and prints the dashboard addresses.
+
+On a desktop session (for example Raspberry Pi OS) `./install-shortcut.sh` puts a **Telemetry Dashboard** icon on the
+desktop: double-click it to run everything and open the dashboard in the browser. To start the services by hand instead:
+
 ```bash
 # 1. MQTT broker (listens on all interfaces, anonymous access)
 mosquitto -c mosquitto_open.conf
