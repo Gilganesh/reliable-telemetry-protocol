@@ -214,7 +214,6 @@ datagram/message.
 | POST | `/api/impairment` | Apply a profile, custom parameters or a blackout |
 | POST | `/api/node-alarm/<node_id>` | Ask a node to raise an ALARM |
 | POST | `/api/alarm/<node_id>`, `/api/alarm/all` | Toggle the remote alarm on nodes |
-| POST | `/api/servo/<node_id>` | Set servo angle (0..180) |
 | POST | `/api/simulate-loss/<node_id>` | Enable outbound packet loss on the node itself |
 | POST | `/api/nodes/add`, `/api/config/broker` | Register a node manually, switch MQTT broker |
 

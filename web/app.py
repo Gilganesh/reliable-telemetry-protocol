@@ -438,13 +438,6 @@ def api_config_broker():
     ok, msg = start_mqtt_client(host, port)
     return jsonify({"success": ok, "message": msg})
 
-@app.route("/api/servo/<int:node_id>", methods=["POST"])
-def api_servo(node_id):
-    angle = body().get("angle")
-    if isinstance(angle, bool) or not isinstance(angle, (int, float)) or not 0 <= angle <= 180:
-        return bad("angle must be in 0..180")
-    return jsonify({"sent": publish_packet(node_id, MsgType.CONFIG, {"cmd": "servo", "angle": angle})})
-
 @app.route("/api/simulate-loss/<int:node_id>", methods=["POST"])
 def api_simulate_loss(node_id):
     percent = body().get("loss_percent")
