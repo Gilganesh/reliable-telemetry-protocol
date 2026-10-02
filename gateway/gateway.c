@@ -814,6 +814,18 @@ static void send_frame_route(const ReplyRoute *route, uint8_t type, uint16_t nod
     if (len > 0) route_reply(route, tx, len);
 }
 
+// Скидає облік sequence/дедуплікації вузла (плата перезапустилась і почала
+// sequence з нуля). Лічильники received/lost/duplicate лишаються.
+static void node_seq_reset(NodeState *n) {
+    n->max_seq_seen = -1;
+    n->seen_mask = 0;
+    n->alarm_idx = 0;
+    n->alarm_filled = 0;
+    n->last_ts_ms = 0;
+    // Після перезапуску плата могла втратити налаштування -- шлемо знову
+    provision_reset(n);
+}
+
 static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
     if (route->kind == ROUTE_MQTT) return; // MQTT-вузли id не отримують (sim_node має свій)
     char js[MAX_PAYLOAD_SIZE + 1];
@@ -841,6 +853,18 @@ static void handle_hello(const SensorPacket *pkt, const ReplyRoute *route) {
         log_event("[ID] Нова плата %s (канал=%s) -> node_id=%u\n", mac_j->valuestring, route_kind_name(route->kind), id);
     if (had != 0 && had != id)
         log_event("[ID] Плата %s мала id=%u, переписано на %u\n", mac_j->valuestring, had, id);
+
+    // HELLO шле лише плата, що щойно завантажилась (id ще не підтверджено в цій
+    // сесії). Це надійніша ознака перезапуску, ніж евристика за sequence/timestamp:
+    // та плутає запізнілий ALARM із перезапуском.
+    for (int i = 0; i < node_count; i++) {
+        if (nodes[i].node_id == id && nodes[i].max_seq_seen != -1) {
+            log_event("[СТАТУС] Вузол %u перезапустився (HELLO від %s). Скидаю відстеження sequence\n",
+                       id, mac_j->valuestring);
+            node_seq_reset(&nodes[i]);
+            break;
+        }
+    }
 
     cJSON *reply = cJSON_CreateObject();
     cJSON_AddStringToObject(reply, "cmd", "id");
@@ -932,9 +956,13 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
 
     // Аналіз втрат, дублікатів і порядку (вікно SEQ_WINDOW останніх sequence).
     bool is_seq_duplicate = false;
+    // ALARM/CONFIG плата може повторювати дуже пізно (черга на платі, retry після
+    // розриву), тож їхні старі sequence/timestamp -- не ознака перезапуску.
+    bool critical = pkt.msg_type == MSG_ALARM || pkt.msg_type == MSG_CONFIG;
     // Перезапуск плати: millis() пішов з нуля, тобто timestamp різко впав.
     // Лише за sequence це видно не одразу (поки не набіжить SEQ_WINDOW пакетів).
-    bool ts_restart = node->max_seq_seen != -1 && pkt.timestamp_ms + 30000 < node->last_ts_ms;
+    // Основний сигнал перезапуску -- HELLO (див. handle_hello), це запасна евристика.
+    bool ts_restart = !critical && node->max_seq_seen != -1 && pkt.timestamp_ms + 30000 < node->last_ts_ms;
     if (node->max_seq_seen == -1) {
         node->max_seq_seen = (int32_t)pkt.sequence;
         node->seen_mask = 1;
@@ -964,19 +992,29 @@ void handle_packet(const uint8_t *raw, size_t raw_len, const ReplyRoute *route) 
                 log_event("[ПОРЯДОК] Вузол %u: пакет Seq %u прийшов із запізненням (порушення порядку)\n",
                            pkt.node_id, pkt.sequence);
             }
+        } else if (critical) {
+            // ALARM/CONFIG відстає від максимуму більше ніж на вікно: це запізніле
+            // повторення, а не перезапуск. Обліку sequence не чіпаємо, дублікат
+            // визначаємо за списком уже бачених критичних sequence.
+            if (is_duplicate_alarm(node, pkt.sequence)) {
+                is_seq_duplicate = true;
+                node->duplicate_count++;
+            } else {
+                node->received_count++;
+                if (node->lost_count > 0) node->lost_count--;
+                log_event("[ПОРЯДОК] Вузол %u: критичний пакет Seq %u прийшов за межами вікна (запізнілий)\n",
+                           pkt.node_id, pkt.sequence);
+            }
         } else {
             // sequence відстає від максимуму більше ніж на вікно -- це не
             // дублікат, а перезапуск вузла (sequence пішов з нуля).
             log_event("[СТАТУС] Вузол %u, схоже, перезапустився (Seq %u після %d, timestamp %llu мс). Скидаю відстеження sequence\n",
                        pkt.node_id, pkt.sequence, node->max_seq_seen, (unsigned long long)pkt.timestamp_ms);
+            node_seq_reset(node);
             node->max_seq_seen = (int32_t)pkt.sequence;
             node->seen_mask = 1;
-            node->alarm_idx = 0;
-            node->alarm_filled = 0;
             node->received_count++;
             node->last_ts_ms = pkt.timestamp_ms;
-            // Після перезапуску плата могла втратити налаштування -- шлемо знову
-            provision_reset(node);
         }
     }
 
@@ -1048,6 +1086,55 @@ void forward_downlink(const struct mosquitto_message *msg) {
         return;
     }
     log_event("[DOWNLINK] Команду для невідомого вузла %u відкинуто\n", pkt.node_id);
+}
+
+// ---- З'єднання з MQTT-брокером ----
+// mosquitto_loop() у неблокуючому режимі сам не перепідключається, а сесія clean=true
+// втрачає підписки, тож підписуємось у on_connect, а перепідключення робить
+// mqtt_maintain() з головного циклу. Без брокера шлюз не падає: UDP/TCP/UART працюють.
+// Саме IPv4-адреса, не "localhost": асинхронне підключення пробує лише першу адресу,
+// а "localhost" на macOS спершу дає IPv6 (::1), на якому брокер не слухає.
+#define MQTT_HOST "127.0.0.1"
+#define MQTT_PORT 1883
+#define MQTT_RETRY_MS 1000
+static bool g_mqtt_connected = false;
+
+static void on_mqtt_connect(struct mosquitto *mosq, void *userdata, int rc) {
+    (void)userdata;
+    if (rc != 0) {
+        log_event("[MQTT] Брокер відхилив підключення (код %d), пробую знову\n", rc);
+        return;
+    }
+    mosquitto_subscribe(mosq, NULL, "case24/uplink", 0);
+    mosquitto_subscribe(mosq, NULL, DOWNLINK_PREFIX "+", 0);
+    g_mqtt_connected = true;
+    log_event("[MQTT] Підключено до брокера %s:%d\n", MQTT_HOST, MQTT_PORT);
+}
+
+static void on_mqtt_disconnect(struct mosquitto *mosq, void *userdata, int rc) {
+    (void)mosq; (void)userdata;
+    if (g_mqtt_connected)
+        log_event("[MQTT] З'єднання з брокером втрачено (код %d), перепідключаюсь\n", rc);
+    g_mqtt_connected = false;
+}
+
+// Викликається щоразу в головному циклі: крутить MQTT і, якщо зв'язку немає,
+// раз на MQTT_RETRY_MS пробує підключитись (без блокування циклу).
+static void mqtt_maintain(uint64_t now) {
+    static uint64_t last_try = 0;
+    static int failures = 0;
+
+    int rc = mosquitto_loop(mosq_global, 0, 1); // неблокуюче -- решта каналів теж мають встигати
+    if (rc != MOSQ_ERR_SUCCESS) g_mqtt_connected = false;
+    if (g_mqtt_connected) { failures = 0; return; }
+
+    if (last_try != 0 && now - last_try < MQTT_RETRY_MS) return;
+    last_try = now ? now : 1;
+    // Перша спроба після connect_async часто повертає помилку -- попереджаємо з другої
+    if (mosquitto_reconnect_async(mosq_global) != MOSQ_ERR_SUCCESS && ++failures == 3) {
+        log_event("[MQTT] Брокер %s:%d недоступний -- шлюз працює без MQTT і пробує знову кожні %d с\n",
+                   MQTT_HOST, MQTT_PORT, MQTT_RETRY_MS / 1000);
+    }
 }
 
 void on_mqtt_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg) {
@@ -1461,15 +1548,16 @@ int main(void) {
 
     mosquitto_lib_init();
     mosq_global = mosquitto_new("GatewayClient", true, NULL);
-    mosquitto_message_callback_set(mosq_global, on_mqtt_message);
-
-    if (mosquitto_connect(mosq_global, "localhost", 1883, 60) != 0) {
-        fprintf(stderr, "Помилка підключення до MQTT-брокера.\n");
+    if (!mosq_global) {
+        fprintf(stderr, "Не вдалося створити MQTT-клієнта.\n");
         return 1;
     }
-
-    mosquitto_subscribe(mosq_global, NULL, "case24/uplink", 0);
-    mosquitto_subscribe(mosq_global, NULL, DOWNLINK_PREFIX "+", 0);
+    mosquitto_connect_callback_set(mosq_global, on_mqtt_connect);
+    mosquitto_disconnect_callback_set(mosq_global, on_mqtt_disconnect);
+    mosquitto_message_callback_set(mosq_global, on_mqtt_message);
+    // connect_async лише запам'ятовує адресу брокера; саме підключення робить
+    // mqtt_maintain() (reconnect_async) -- так само на старті й після обриву.
+    mosquitto_connect_async(mosq_global, MQTT_HOST, MQTT_PORT, 60);
 
     // 30.09 (3) -- три додаткові "сирі" транспорти поряд з MQTT. Кожен
     // піднімається незалежно: якщо, наприклад, UART-перехідник не
@@ -1487,12 +1575,13 @@ int main(void) {
     uint64_t last_dash_ms = get_monotonic_time_ms();
 
     while (1) {
-        mosquitto_loop(mosq_global, 0, 1); // неблокуюче -- решта каналів теж мають встигати
+        uint64_t now = get_monotonic_time_ms();
+        mqtt_maintain(now);
         poll_udp();
         poll_tcp();
         poll_uart();
 
-        uint64_t now = get_monotonic_time_ms();
+        now = get_monotonic_time_ms();
         uart_tick(now);
         if (now - last_dash_ms >= 2000) {
             print_dashboard();

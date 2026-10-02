@@ -122,6 +122,30 @@ static void on_downlink_message(struct mosquitto *mosq, void *userdata,
     }
 }
 
+/* Стан зв'язку з брокером. mosquitto_loop() сам не перепідключається, а сесія
+ * clean=true губить підписку, тому підписуємось у on_connect, а після обриву
+ * main() перепідключає вручну. */
+static bool g_connected = false;
+
+static void on_connect(struct mosquitto *mosq, void *userdata, int rc) {
+    (void)userdata;
+    if (rc != 0) {
+        printf("[MQTT] Брокер відхилив підключення (код %d)\n", rc);
+        return;
+    }
+    char topic[32];
+    snprintf(topic, sizeof(topic), "case24/downlink/%d", SIM_NODE_ID);
+    mosquitto_subscribe(mosq, NULL, topic, 0);
+    g_connected = true;
+    printf("[MQTT] Підключено до брокера\n");
+}
+
+static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc) {
+    (void)mosq; (void)userdata;
+    if (g_connected) printf("[MQTT] З'єднання з брокером втрачено (код %d), перепідключаюсь\n", rc);
+    g_connected = false;
+}
+
 static void send_one_telemetry(struct mosquitto *mosq) {
     SensorPacket pkt = {0};
     pkt.version = PROTOCOL_VERSION;
@@ -188,6 +212,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    setvbuf(stdout, NULL, _IOLBF, 0); /* рядок одразу в лог, навіть коли stdout перенаправлено у файл */
     mosquitto_lib_init();
     struct mosquitto *mosq = mosquitto_new("SimNode99", true, NULL);
     if (!mosq) {
@@ -196,16 +221,15 @@ int main(int argc, char **argv) {
     }
 
     reliable_init(&g_reliable, sim_reliable_send, mosq);
+    mosquitto_connect_callback_set(mosq, on_connect);
+    mosquitto_disconnect_callback_set(mosq, on_disconnect);
     mosquitto_message_callback_set(mosq, on_downlink_message);
 
     if (mosquitto_connect(mosq, broker_host, 1883, 60) != MOSQ_ERR_SUCCESS) {
+        /* Не виходимо: основний цикл сам перепідключиться, коли брокер з'явиться */
         fprintf(stderr, "Не вдалося підключитись до брокера %s:1883 "
-                        "(чи запущений mosquitto?)\n", broker_host);
-        return 1;
+                        "(чи запущений mosquitto?) -- пробую знову кожну секунду\n", broker_host);
     }
-    char downlink_topic[32];
-    snprintf(downlink_topic, sizeof(downlink_topic), "case24/downlink/%d", SIM_NODE_ID);
-    mosquitto_subscribe(mosq, NULL, downlink_topic, 0);
 
     printf("sim_node запущено, node_id=%d, брокер=%s:1883.\n", SIM_NODE_ID, broker_host);
     printf("Телеметрія кожні %dмс. loss=%d%%, duplicate=%d%%. %s\n",
@@ -214,6 +238,8 @@ int main(int argc, char **argv) {
     printf("Ctrl+C для зупинки.\n");
 
     uint64_t last_telemetry_ms = 0;
+    uint64_t start_ms = now_ms();
+    uint64_t last_reconnect_ms = 0;
     bool alarm_pending = send_alarm_once;
 
     while (1) {
@@ -226,7 +252,7 @@ int main(int argc, char **argv) {
 
         /* Тривогу шлемо трохи згодом після старту (щоб з'єднання й
          * підписка вже точно встигли встановитись), рівно один раз. */
-        if (alarm_pending && now > 1500) {
+        if (alarm_pending && g_connected && now - start_ms > 1500) {
             alarm_pending = false;
             send_one_alarm(now);
         }
@@ -244,7 +270,18 @@ int main(int argc, char **argv) {
          * не проґавити дедлайн ACK_TIMEOUT_MS (2000мс) чи вхідний ACK,
          * і НЕ блокує довше, ніж на 100мс (на відміну від старого
          * sleep(3), який ловив вхідні повідомлення лише раз на 3с). */
-        mosquitto_loop(mosq, 100, 1);
+        int lrc = mosquitto_loop(mosq, 100, 1);
+        if (lrc != MOSQ_ERR_SUCCESS) {
+            g_connected = false;
+            /* Брокер впав/перезапустився: пробуємо знову раз на секунду.
+             * mosquitto_reconnect блокуючий, але перебирає всі адреси
+             * (на відміну від async, який пробує лише першу, напр. ::1). */
+            if (now - last_reconnect_ms >= 1000) {
+                last_reconnect_ms = now;
+                mosquitto_reconnect(mosq);
+            }
+            usleep(100000); /* mosquitto_loop повертається одразу -- не крутимо CPU */
+        }
     }
 
     mosquitto_destroy(mosq);
