@@ -124,6 +124,8 @@
     <div class="kpi"><div class="label">Втрати пакетів</div><div class="value" id="kLoss">–</div><div class="sub">за всіма вузлами</div></div>
     <div class="kpi"><div class="label">Дублікати</div><div class="value" id="kDup">–</div><div class="sub">відкинуто Gateway</div></div>
     <div class="kpi"><div class="label">Пошкоджені</div><div class="value" id="kBad">–</div><div class="sub">відхилено за CRC</div></div>
+    <div class="kpi"><div class="label">Затримка (RTT)</div><div class="value" id="kLat">–</div><div class="sub">середня по online-вузлах</div></div>
+    <div class="kpi"><div class="label">Backlog</div><div class="value" id="kBacklog">–</div><div class="sub">пакетів чекає в буферах плат</div></div>
   </section>
 
   <section>
@@ -215,6 +217,8 @@ async function api(path, method = "GET", data) {
 function toast(msg) { const b = $("banner"); b.textContent = msg; b.className = "banner warn"; setTimeout(() => b.classList.add("hidden"), 4000); }
 
 /* ---------- вузли ---------- */
+function fmtMs(v) { return v == null ? "–" : (v < 10 ? v.toFixed(1) : Math.round(v)) + " мс"; }
+
 function nodeCard(n) {
   const loss = Math.min(100, n.loss_rate || 0);
   const lossCls = loss > 10 ? "var(--bad)" : loss > 2 ? "var(--warn)" : "var(--ok)";
@@ -230,6 +234,11 @@ function nodeCard(n) {
       <div><b style="color:var(--ok)">${n.received_count}</b><span>отримано</span></div>
       <div><b style="color:var(--bad)">${n.lost_count}</b><span>втрачено</span></div>
       <div><b style="color:var(--warn)">${n.duplicate_count}</b><span>дублікатів</span></div>
+    </div>
+    <div class="stats" style="margin-top:0">
+      <div><b>${fmtMs(n.latency_ms)}</b><span>затримка (RTT)</span></div>
+      <div><b style="color:${n.backlog > 0 ? "var(--warn)" : "inherit"}">${n.backlog == null ? "–" : n.backlog}</b><span>backlog</span></div>
+      <div><b style="color:${n.buffer_dropped > 0 ? "var(--bad)" : "inherit"}">${n.buffer_dropped || 0}</b><span>втрачено в буфері</span></div>
     </div>
     <div class="bar" title="loss rate"><i style="width:${Math.max(loss, 0.5)}%;background:${lossCls}"></i></div>
     <div class="node-foot">
@@ -250,6 +259,10 @@ function renderState() {
   $("kLoss").textContent = (recv + lost ? (lost / (recv + lost) * 100).toFixed(1) : "0.0") + "%";
   $("kDup").textContent = dup;
   $("kBad").textContent = state.corrupted_count;
+  const lats = nodes.filter(n => n.online && n.latency_ms != null).map(n => n.latency_ms);
+  $("kLat").textContent = lats.length ? fmtMs(lats.reduce((a, b) => a + b, 0) / lats.length) : "–";
+  const bls = nodes.filter(n => n.backlog != null);
+  $("kBacklog").textContent = bls.length ? bls.reduce((a, n) => a + n.backlog, 0) : "–";
 
   const bp = $("brokerPill");
   bp.className = "pill " + (cfg.connected ? "ok" : "bad");

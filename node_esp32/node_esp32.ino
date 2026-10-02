@@ -444,6 +444,9 @@ void handle_config_packet(const SensorPacket *pkt) {
     json_get_int(js, "tcp", &t);
     apply_gw_config(ip, u, t);
     send_ack_to_gateway(pkt->sequence);
+  } else if (strcmp(cmd, "ping") == 0) {
+    // Вимірювання затримки: шлюз міряє час від свого ping до цього ACK
+    send_ack_to_gateway(pkt->sequence);
   } else if (strcmp(cmd, "simulate_loss") == 0) {
     long pct = 0;
     json_get_int(js, "loss_percent", &pct);
@@ -530,6 +533,31 @@ void poll_downlink() {
 }
 
 // ================== БУФЕР STORE-AND-FORWARD ==================
+// Дописує в JSON телеметрії поточний стан буфера: "backlog" (скільки пакетів ще чекає
+// ПІСЛЯ цього) і "dropped" (скільки втрачено через переповнення). Викликається в момент
+// відправки, а не створення, тож під час вивантаження шлюз бачить backlog, що спадає
+// до нуля. Ідемпотентна: повторний виклик замінює попередні значення.
+void stamp_buffer_stats(SensorPacket *pkt, int backlog) {
+  if (pkt->msg_type != MSG_TELEMETRY || pkt->payload_len == 0 || pkt->payload_len >= MAX_PAYLOAD_SIZE) return;
+  pkt->payload[pkt->payload_len] = '\0';
+  char *old = strstr((char*)pkt->payload, ",\"backlog\":");
+  if (old) { // відрізаємо раніше дописане
+    *old = '}';
+    pkt->payload[old - (char*)pkt->payload + 1] = '\0';
+    pkt->payload_len = (uint16_t)(old - (char*)pkt->payload + 1);
+  }
+  if (pkt->payload[pkt->payload_len - 1] != '}') return;
+  int base = pkt->payload_len - 1;
+  int n = snprintf((char*)pkt->payload + base, MAX_PAYLOAD_SIZE - base,
+                   ",\"backlog\":%d,\"dropped\":%lu}", backlog, (unsigned long)tele_q.dropped);
+  if (n > 0 && base + n < MAX_PAYLOAD_SIZE) {
+    pkt->payload_len = (uint16_t)(base + n);
+  } else { // не влізло -- лишаємо JSON як був
+    pkt->payload[base] = '}';
+    pkt->payload[base + 1] = '\0';
+  }
+}
+
 void buffer_packet(const SensorPacket* pkt) {
   if (pq_push(&tele_q, pkt)) {
     DBG.print("[BUFFER] Переповнення -- втрачено найстаріший пакет. Всього втрачено: ");
@@ -558,6 +586,7 @@ void flush_buffer_step() {
   // Шлюз міг перепризначити node_id, поки пакет лежав у буфері. Sequence і
   // timestamp лишаються з моменту створення -- їх не чіпаємо.
   if (MY_NODE_ID != 0) head->node_id = MY_NODE_ID;
+  stamp_buffer_stats(head, tele_q.count - 1); // скільки лишиться після цього пакета
 
   uint8_t tx_buf[256];
   int packed_len = protocol_pack(head, tx_buf, sizeof(tx_buf));
@@ -624,11 +653,9 @@ void send_telemetry() {
   pkt.sequence = seq_counter++;
   pkt.timestamp_ms = millis();
 
-  // backlog/dropped -- стан буфера на момент створення пакета (для дашборда: скільки
-  // даних чекає на канал і скільки вже втрачено через переповнення).
   snprintf((char*)pkt.payload, MAX_PAYLOAD_SIZE,
-           "{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,\"backlog\":%d,\"dropped\":%lu}",
-           mpu.getRoll(), mpu.getPitch(), mpu.getYaw(), tele_q.count, (unsigned long)tele_q.dropped);
+           "{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f}",
+           mpu.getRoll(), mpu.getPitch(), mpu.getYaw());
   pkt.payload_len = strlen((char*)pkt.payload);
 
   // Поки є непорожній буфер, нова телеметрія йде в його кінець (порядок на шлюзі)
@@ -637,6 +664,7 @@ void send_telemetry() {
     return;
   }
 
+  stamp_buffer_stats(&pkt, 0); // буфер порожній, інакше пакет пішов би в нього
   uint8_t tx_buf[256];
   int packed_len = protocol_pack(&pkt, tx_buf, sizeof(tx_buf));
   if (packed_len > 0) {
