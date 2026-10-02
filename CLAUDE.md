@@ -26,6 +26,9 @@
 - `node_common/node_common.h` + `packet_queue.h` — спільне ядро прошивки вузла (буфер, черга ALARM, канали UART>TCP>UDP).
   Скетчі: `node_accelerometer/` (MPU9250) і `node_sht41/` (SHT41) — лише драйвер датчика (хуки `sensor_setup/update/payload`).
   Правки ядра — в `node_common/`, потім `node_common/sync.sh`. `node_common/raw_tests/` — налагоджувальні скетчі датчиків.
+- LCD-варіанти: `node_default_lcd/` (без датчиків: uptime/heap/rssi), `node_accelerometer_lcd/`, `node_sht41_lcd/`. Вмикаються
+  `#define NODE_LCD 1` перед `node_common.h`, драйвер екрана — `node_common/node_lcd.h` (власний, без бібліотек), тест — `tests/test_lcd.cpp`.
+  Скетчі без LCD (`node_accelerometer`, `node_sht41`) не чіпати: це «final-version-nolcd».
 - `sim_node/` — симульований вузол (MQTT, `--node-id`). `web/` — дашборд (`app.py`, `static/index.html`).
 - `tests/` — unit-тести C.
 - MQTT-топіки: `telemetry/uplink`, `telemetry/downlink/<id>`, `telemetry/gateway/{state,telemetry,control}`.
