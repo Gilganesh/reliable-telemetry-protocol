@@ -21,3 +21,4 @@ node_registry.txt
 .venv/
 sim_node/sim_node
 local/
+logs/

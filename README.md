@@ -22,6 +22,8 @@ blackouts) so the reliability guarantees can be demonstrated and measured on rea
 - **Zero-touch provisioning**: a board plugged into the gateway over UART receives its node id, Wi-Fi credentials
   and gateway address automatically and can then work over Wi-Fi alone.
 - **Link quality metrics**: online/offline state, loss rate, round-trip latency, node-side buffer backlog.
+- **Honest time axis**: the gateway reconstructs when each sample was actually measured, so telemetry that was buffered
+  during an outage lands at its true time on the charts and the gap visibly fills in after the link returns.
 - **Channel impairment simulator**: built-in profiles (`good`, `lossy20`, `delay`, `flaky`), timed blackouts,
   per-node targeting and reproducible runs via a seed, all controllable from the dashboard.
 - **Web dashboard**: live node cards, KPIs, time-series charts backed by SQLite, alarm log, remote commands.
@@ -200,7 +202,7 @@ datagram/message.
 | `telemetry/uplink` | MQTT nodes → gateway | binary frame |
 | `telemetry/downlink/<node_id>` | gateway / web → node | binary frame |
 | `telemetry/gateway/state` | gateway → web, every 2 s | JSON: per-node counters, latency, backlog, impairment state |
-| `telemetry/gateway/telemetry` | gateway → web, per accepted packet | JSON: header fields and decoded payload |
+| `telemetry/gateway/telemetry` | gateway → web, per accepted packet | JSON: header fields, decoded payload and `age_ms` (how long ago the sample was measured) |
 | `telemetry/gateway/control` | web → gateway | JSON: `{"cmd":"impair", "profile", "loss", "dup", "corrupt", "delay_ms", "jitter_ms", "node", "seed", "blackout_s"}` |
 
 ## Web API
@@ -215,7 +217,7 @@ datagram/message.
 | POST | `/api/node-alarm/<node_id>` | Ask a node to raise an ALARM |
 | POST | `/api/alarm/<node_id>`, `/api/alarm/all` | Toggle the remote alarm on nodes |
 | POST | `/api/simulate-loss/<node_id>` | Enable outbound packet loss on the node itself |
-| POST | `/api/nodes/add`, `/api/config/broker` | Register a node manually, switch MQTT broker |
+| POST | `/api/config/broker` | Switch the MQTT broker the dashboard listens to |
 
 ## Channel impairment
 
@@ -243,4 +245,6 @@ only: a node on a healthy wire does not notice the loss and does not buffer.
 - Each node has at most one critical message in flight; others wait in the queue.
 - Loss rate on the dashboard is cumulative since the gateway started.
 - Latency is measured as round-trip time; one-way delay and jitter are not reported.
+- Sample times are reconstructed from node uptime with a minimum-delay filter (accurate to tens of milliseconds while the
+  node has been seen online since boot); samples that arrive only after a gateway restart cannot be placed precisely.
 - The gateway tracks up to 10 nodes, 4 TCP clients and 4 serial ports.

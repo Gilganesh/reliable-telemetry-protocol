@@ -22,6 +22,7 @@ DB_PATH = Path(os.environ.get("TELEMETRY_DB", BASE_DIR / "telemetry.db"))
 RETENTION_HOURS = float(os.environ.get("RETENTION_HOURS", "24"))
 MAX_HISTORY_POINTS = 600
 MAX_EVENTS = 50
+MAX_SAMPLE_AGE_S = 24 * 3600
 
 app = Flask(__name__, static_folder=str(BASE_DIR / "static"), static_url_path="/static")
 
@@ -131,11 +132,11 @@ def numeric_fields(payload: dict) -> dict:
         out[str(key)[:32]] = float(val)
     return out
 
-def store_sample(node_id: int, pkt: Packet, payload: dict):
+def store_sample(node_id: int, pkt: Packet, payload: dict, measured_at: float):
     metrics = numeric_fields(payload)
     if not metrics:
         return
-    now = time.time()
+    now = measured_at
     with _db_lock:
         _db.executemany(
             "INSERT INTO samples "
@@ -144,12 +145,12 @@ def store_sample(node_id: int, pkt: Packet, payload: dict):
         )
         _db.commit()
 
-def store_event(node_id: int, pkt: Packet, text: str):
+def store_event(node_id: int, pkt: Packet, text: str, measured_at: float):
     with _db_lock:
         _db.execute(
             "INSERT OR IGNORE INTO events (node_id, sequence, ts_ms, received_at, text) "
             "VALUES (?,?,?,?,?)",
-            (node_id, pkt.sequence, pkt.timestamp_ms, time.time(), text[:200]),
+            (node_id, pkt.sequence, pkt.timestamp_ms, measured_at, text[:200]),
         )
         _db.commit()
 
@@ -170,16 +171,18 @@ def pruner_loop():
 
 def fetch_history(node_id: int, metric: str, since_s: float):
     since = time.time() - since_s
+    bucket = max(since_s / MAX_HISTORY_POINTS, 1e-3)
     with _db_lock:
         rows = _db.execute(
             """
-            SELECT received_at, value FROM samples
+            SELECT AVG(received_at) AS t, AVG(value) AS v FROM samples
             WHERE node_id = ? AND metric = ? AND received_at >= ?
-            ORDER BY received_at DESC LIMIT ?
+            GROUP BY CAST(received_at / ? AS INTEGER)
+            ORDER BY t
             """,
-            (node_id, metric, since, MAX_HISTORY_POINTS),
+            (node_id, metric, since, bucket),
         ).fetchall()
-    return [{"t": int(r["received_at"] * 1000), "v": r["value"]} for r in reversed(rows)]
+    return [{"t": int(r["t"] * 1000), "v": r["v"]} for r in rows]
 
 def fetch_metrics():
     with _db_lock:
@@ -199,12 +202,11 @@ def fetch_events():
         ).fetchall()
     return [{"node_id": r["node_id"], "t": int(r["received_at"] * 1000), "text": r["text"]} for r in rows]
 
-def get_or_create_node(node_id: int, ip_address: str = "—", name: str = ""):
+def get_or_create_node(node_id: int):
     if node_id not in nodes:
         nodes[node_id] = {
             "node_id": node_id,
-            "name": name or f"Node #{node_id}",
-            "ip_address": ip_address,
+            "name": f"Node #{node_id}",
             "max_seq_seen": -1,
             "received_count": 0,
             "lost_count": 0,
@@ -259,18 +261,21 @@ def on_telemetry(msg):
         payload = {}
     pkt = Packet(1, msg_type, node_id, sequence, ts_ms, b"")
 
+    age_ms = d.get("age_ms")
+    if isinstance(age_ms, bool) or not isinstance(age_ms, (int, float)) or not 0 <= age_ms <= MAX_SAMPLE_AGE_S * 1000:
+        age_ms = 0
+    measured_at = time.time() - age_ms / 1000.0
+
     with nodes_lock:
         node = get_or_create_node(node_id)
-        if "ip" in payload:
-            node["ip_address"] = str(payload["ip"])[:45]
         if msg_type == MsgType.ALARM:
             node["alarm_active"] = True
 
     try:
         if msg_type == MsgType.ALARM:
-            store_event(node_id, pkt, json.dumps(payload or d.get("payload_raw", ""), ensure_ascii=False))
+            store_event(node_id, pkt, json.dumps(payload or d.get("payload_raw", ""), ensure_ascii=False), measured_at)
         else:
-            store_sample(node_id, pkt, payload)
+            store_sample(node_id, pkt, payload, measured_at)
     except sqlite3.Error as e:
         print(f"[DB] write failed: {e}")
 
@@ -405,25 +410,6 @@ def api_history():
 @app.route("/api/events")
 def api_events():
     return jsonify(fetch_events())
-
-@app.route("/api/nodes/add", methods=["POST"])
-def api_add_node():
-    data = body()
-    try:
-        node_id = int(data.get("node_id"))
-    except (TypeError, ValueError):
-        return bad("node_id must be a number")
-    if not 0 < node_id < 65536:
-        return bad("node_id must be in 1..65535")
-    name = str(data.get("name", "")).strip()[:40]
-    ip = str(data.get("ip_address", "")).strip()[:45] or "—"
-    with nodes_lock:
-        node = get_or_create_node(node_id, ip_address=ip, name=name)
-        if name:
-            node["name"] = name
-        if ip != "—":
-            node["ip_address"] = ip
-    return jsonify({"success": True, "node_id": node_id})
 
 @app.route("/api/config/broker", methods=["POST"])
 def api_config_broker():
