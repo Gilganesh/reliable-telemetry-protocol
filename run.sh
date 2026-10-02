@@ -46,12 +46,17 @@ for pid in "${PIDS[@]}"; do
   fi
 done
 
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-[ -z "$IP" ] && IP="$(ipconfig getifaddr en0 2>/dev/null)"
+IPS="$(hostname -I 2>/dev/null)"
+[ -z "$IPS" ] && IPS="$(ipconfig getifaddr en0 2>/dev/null)"
 echo
 echo "Dashboard:"
 echo "  http://localhost:$PORT"
-[ -n "$IP" ] && echo "  http://$IP:$PORT"
+for ip in $IPS; do
+  case "$ip" in
+    *:*) ;;
+    *) echo "  http://$ip:$PORT" ;;
+  esac
+done
 echo "  http://$(hostname -s).local:$PORT"
 echo
 echo "Gateway output follows (events are also saved to gateway/gateway_log.txt). Press Ctrl+C to stop everything."
@@ -64,4 +69,13 @@ fi
 (cd "$ROOT/gateway" && exec ./gateway) &
 PIDS+=("$!")
 
-wait
+while true; do
+  for pid in "${PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo
+      echo "A service stopped unexpectedly (pid $pid). See logs/ and gateway/gateway_log.txt."
+      exit 1
+    fi
+  done
+  sleep 1
+done

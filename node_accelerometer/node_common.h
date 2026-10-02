@@ -35,7 +35,7 @@ char device_mac[18] = "";
 bool id_confirmed = false;
 
 #define SERVO_ENABLED false
-#define SERVO_PIN     18
+#define SERVO_PIN     13
 #if SERVO_ENABLED
   #include <ESP32Servo.h>
   Servo servo;
