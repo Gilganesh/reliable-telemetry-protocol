@@ -66,7 +66,7 @@ alone. The serial command `forget` erases the stored settings.
 |---|---|---|
 | `LINK_VIA_USB_CABLE` | `1` | Wired link over the board's USB serial (UART0). Logs and console commands are disabled because the port carries protocol frames |
 | | `0` | Wired link over UART2: GPIO17 (TX) → adapter RX, GPIO16 (RX) → adapter TX, common GND. USB serial stays free for logs and the `alarm`, `status`, `forget` commands |
-| `SERVO_ENABLED` | `false` | Drive a servo on GPIO18 (ESP32Servo library) |
+| `SERVO_ENABLED` | `false` | Handle the `servo` command with a servo on GPIO13 (ESP32Servo library) |
 | `WIRE_TIMEOUT_MS` | `3000` | Wired link timeout |
 | `WIFI_PROBE_MS` / `WIFI_LINK_TIMEOUT_MS` | `2000` / `7000` | Wi-Fi probe interval and timeout |
 | `BUFFER_CAPACITY` / `ALARM_QUEUE_CAP` | `50` / `8` | Offline buffer sizes |

@@ -156,7 +156,11 @@ so the same wiring works on either board. Connect the sensor to the same two pin
 is meant for an ESP32-WROOM and uses the classic hardware pair SDA GPIO21 / SCL GPIO22 (the pins the SHT41 was tuned on). To use other pins, define `NODE_I2C_SDA` /
 `NODE_I2C_SCL` before including `node_common.h`. On an S3 board use the USB port wired to the UART bridge (labelled UART/COM)
 and keep *USB CDC On Boot* disabled in the Arduino IDE, because the gateway talks to the board over that serial port. The driver is built in (no extra library), finds the backpack at `0x27` or `0x3F` and keeps running without a
-display. If the screen lights up but shows only blocks or nothing, turn the contrast trimmer on the backpack. The existing
+display. If the screen lights up but shows only blocks or nothing, turn the contrast trimmer on the backpack.
+
+Before sharing the bus with a 3.3 V sensor such as the SHT41, check the backpack: many boards pull SDA/SCL up to their own
+supply, which is 5 V. Measure SDA with the node powered; if it reads about 5 V, remove the two pull-up resistors on the
+backpack or power it from 3.3 V (the display is dimmer, adjust the contrast trimmer). The existing
 `node_accelerometer` and `node_sht41` sketches are unchanged and work without a display.
 
 If you edit `node_common/` or `protocol/`, run `node_common/sync.sh` to refresh the copies inside the sketch folders
@@ -194,11 +198,14 @@ Compile-time options at the top of `node_common/node_common.h`:
 | Option | Default | Meaning |
 |---|---|---|
 | `LINK_VIA_USB_CABLE` | `1` | Use the board's USB serial as the wired link. Set to `0` to use UART2 on GPIO16 (RX) / GPIO17 (TX) and keep USB serial for logs and console commands (`alarm`, `status`, `forget`) |
-| `SERVO_ENABLED` | `false` | Drive a servo on `SERVO_PIN` (GPIO18, requires the ESP32Servo library) |
+| `SERVO_ENABLED` | `false` | Handle the `servo` command by driving a servo on `SERVO_PIN` (GPIO13, requires the ESP32Servo library); there is no dashboard control for it |
 | `BUFFER_CAPACITY` | `50` | Telemetry packets buffered while offline (oldest dropped on overflow) |
 | `ALARM_QUEUE_CAP` | `8` | Critical messages waiting for a link |
 
 ## Protocol
+
+The full specification with state diagrams (critical message delivery, node link and buffering, node state on the gateway,
+sequence tracking) is in [`docs/protocol.md`](docs/protocol.md). Summary:
 
 All multi-byte fields are little-endian. A frame is the header, the payload, then a CRC-32 (IEEE 802.3, same as
 `zlib.crc32`) computed over header and payload.
@@ -229,7 +236,7 @@ datagram/message.
 ### Gateway to node commands
 
 `CONFIG` frames with a JSON payload: `{"cmd":"id"}` (node id assignment), `wifi`, `gw` (provisioning), `ping`
-(latency probe), `servo`, `fire_alarm` (ask the node to raise its own ALARM), `simulate_loss`. An `ALARM` frame with
+(latency probe), `servo` (firmware only, not exposed in the dashboard), `fire_alarm` (ask the node to raise its own ALARM), `simulate_loss`. An `ALARM` frame with
 `{"cmd":"alarm","active":true|false}` toggles the remote alarm indicator on the node.
 
 ### MQTT topics

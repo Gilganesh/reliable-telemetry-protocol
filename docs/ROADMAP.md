@@ -10,7 +10,7 @@ all work together. What remains is evidence (recorded test runs on hardware), tw
 
 | Area | State |
 |---|---|
-| Protocol (frame, CRC-32, ACK/retry, sequence tracking) | Done, unit-tested |
+| Protocol (frame, CRC-32, ACK/retry, sequence tracking) | Done, unit-tested; specified with state diagrams in [`protocol.md`](protocol.md) |
 | Node firmware: UART > TCP > UDP failover, store-and-forward, alarm queue, zero-touch provisioning | Done, verified on 4 boards |
 | Sensors: MPU9250, SHT41, sensorless node | Done |
 | LCD 1602 variants of all three sketches | Done, reported working on boards |
@@ -50,7 +50,8 @@ all work together. What remains is evidence (recorded test runs on hardware), tw
 3. **Sensor-driven alarms** in the firmware: raise ALARM on a threshold (temperature above a limit, tilt or shock) with
    hysteresis and a cool-down, so the critical event comes from the node instead of a button.
 4. **Documents**: test report (profile, delivered, lost, retries, recovery time) and a high-level threat model (spoofed node,
-   replay, plain-text Wi-Fi password on the serial link, open broker).
+   replay, plain-text Wi-Fi password on the serial link, open broker). The protocol specification is already in
+   [`protocol.md`](protocol.md).
 5. **Open questions for the mentor**: CRC-32 versus HMAC, what counts as a critical message, node buffer size.
 
 ## Known limitations and technical debt
