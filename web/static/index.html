@@ -168,12 +168,6 @@
     </div>
     <div class="ctrl">
       <div class="panel">
-        <h2>Servo</h2>
-        <div class="row"><label>Node</label><select id="servoNode"></select></div>
-        <div class="row"><label>Angle <b id="servoVal">90</b>°</label><input type="range" id="servoRange" min="0" max="180" value="90"></div>
-        <button class="btn primary" id="btnServo" style="width:100%">Set angle</button>
-      </div>
-      <div class="panel">
         <h2>Link impairment</h2>
         <div class="sub" id="impStatus" style="color:var(--muted);font-size:12px;margin-bottom:8px">No impairment</div>
         <div class="row"><label>Profile</label>
@@ -328,9 +322,6 @@ function renderState() {
     const isel = $("impNode"), iprev = isel.value;
     isel.innerHTML = `<option value="0">All nodes</option>` + nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
     if (iprev) isel.value = iprev;
-    const ssel = $("servoNode"), sprev = ssel.value;
-    ssel.innerHTML = nodes.map(n => `<option value="${n.node_id}">#${n.node_id} ${esc(n.name)}</option>`).join("");
-    if (sprev) ssel.value = sprev;
     renderCharts();
   }
 }
@@ -432,11 +423,6 @@ $("nodes").addEventListener("click", async e => {
   try { await api(`/api/alarm/${id}`, "POST", { state: e.target.dataset.state === "1" }); tick(); }
   catch (err) { toast(err.message); }
 });
-$("servoRange").oninput = e => $("servoVal").textContent = e.target.value;
-$("btnServo").onclick = async () => {
-  try { const r = await api(`/api/servo/${$("servoNode").value}`, "POST", { angle: +$("servoRange").value }); if (!r.sent) toast("Not sent: no MQTT connection"); }
-  catch (e) { toast(e.message); }
-};
 
 async function sendImpair(body) {
   try { const r = await api("/api/impairment", "POST", body); if (!r.sent) toast("Not sent: no MQTT connection"); tick(); }
