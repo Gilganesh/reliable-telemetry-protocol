@@ -60,7 +60,7 @@ echo
 echo "Dashboard:"
 echo "  http://localhost:$PORT"
 [ -n "$IP" ] && echo "  http://$IP:$PORT"
-echo "  http://$(hostname).local:$PORT"
+echo "  http://$(hostname -s).local:$PORT"
 echo
 echo "Press Ctrl+C to stop everything. Gateway output: tail -f logs/gateway.log"
 

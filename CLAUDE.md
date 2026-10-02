@@ -34,6 +34,8 @@
 ```bash
 make            # збірка gateway/gateway і sim_node/sim_node
 make test       # unit-тести (UBSan), крос-перевірка Python-кодека, sync.sh --check
+./run.sh        # брокер + шлюз + веб одним запуском, логи в logs/, Ctrl+C зупиняє все
+# або вручну:
 mosquitto -c mosquitto_open.conf
 cd gateway && ./gateway
 cd web && WEB_HOST=0.0.0.0 ../.venv/bin/python app.py 127.0.0.1    # веб на :8080
