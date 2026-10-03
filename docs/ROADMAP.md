@@ -30,7 +30,7 @@ all work together. What remains is evidence (recorded test runs on hardware), tw
 
 ## Verification so far
 
-- Unit tests (`make test`): protocol 21, reliability 30, packet queue 17, stream frame reader 9, LCD driver 21 (against an
+- Unit tests (`make test`): protocol 21, reliability 30, packet queue 17, stream frame reader 9, alarm threshold 13, LCD driver 21 (against an
   HD44780 emulator), plus a Python/C codec cross-check and a firmware copy check.
 - Stream resynchronisation, measured on a real TCP stream: a frame with a damaged length field used to cost three frames, a
   truncated frame two; now each costs exactly one. A frame with another protocol version is rejected on every link.
@@ -49,8 +49,8 @@ all work together. What remains is evidence (recorded test runs on hardware), tw
 2. **Baseline comparison for the report**: add a naive mode to `sim_node` (send once, no ACK, no buffer) and a script that
    runs both modes through the same impairment profiles with a fixed seed, producing a table of delivered, lost and duplicate
    alarms. MQTT or a naive sender is explicitly allowed as a baseline in the brief.
-3. **Sensor-driven alarms** in the firmware: raise ALARM on a threshold (temperature above a limit, tilt or shock) with
-   hysteresis and a cool-down, so the critical event comes from the node instead of a button.
+3. **More sensor-driven alarms**: `node_sht41_lcd` now raises an ALARM at 35 °C (once per crossing, 2 °C hysteresis,
+   `send_alarm_json()` in the core). The same for the IMU (tilt or shock) is not done yet.
 4. **Documents**: test report (profile, delivered, lost, retries, recovery time) and a high-level threat model (spoofed node,
    replay, plain-text Wi-Fi password on the serial link, open broker). The protocol specification is already in
    [`protocol.md`](protocol.md).

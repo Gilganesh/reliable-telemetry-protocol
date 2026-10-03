@@ -144,7 +144,12 @@ Three sketches add a 16x2 character display that shows the active link and live 
 |---|---|---|---|
 | `node_default_lcd` | none | `uptime_s`, `free_heap_kb`, `rssi` | `Buf:0 Drop:0` |
 | `node_accelerometer_lcd` | MPU9250 | `roll`, `pitch`, `yaw` | `R-1 P-24 Y-11` |
-| `node_sht41_lcd` | SHT41 | `temperature`, `humidity` | `T21.3C H49.8%` |
+| `node_sht41_lcd` | SHT41 | `temperature`, `humidity`; raises an ALARM at 35 °C | `T21.3C H49.8%`, or `T36.2C ALARM!` while the alarm is active |
+
+`node_sht41_lcd` raises a real, sensor-driven critical event: when the temperature reaches 35 °C it sends
+`{"alarm":"overheat","temperature":36.2,"threshold":35}` as an acknowledged `ALARM` (retried, and queued while there is no
+link), once per crossing. It re-arms after the temperature falls below 33 °C. The limit and the 2 °C hysteresis are
+`TEMP_ALARM_C` and `TEMP_ALARM_HYSTERESIS_C` at the top of the sketch.
 
 The first line is always `<link> Node <id>`, where the link is `UART`, `TCP`, `UDP` or `NO LINK`. While telemetry or alarms
 are waiting in the node's buffer the second line alternates with `BUF 6 ALM 1`, and for three seconds after an alarm event it

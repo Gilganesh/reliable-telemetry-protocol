@@ -2,6 +2,7 @@ import struct
 import zlib
 from dataclasses import dataclass
 
+PROTOCOL_VERSION = 1
 MAX_PAYLOAD_SIZE = 128
 HEADER_FORMAT = "<BBHIQH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -43,6 +44,8 @@ class Packet:
 
         header = body[:HEADER_SIZE]
         version, msg_type, node_id, sequence, ts, pay_len = struct.unpack(HEADER_FORMAT, header)
+        if version != PROTOCOL_VERSION:
+            raise CorruptPacketError(f"unsupported protocol version {version}")
         payload = body[HEADER_SIZE:]
         if len(payload) != pay_len:
             raise CorruptPacketError("payload_len does not match the actual payload size")
@@ -72,4 +75,11 @@ if __name__ == "__main__":
     assert pkt.timestamp_ms == 1234567890123
     assert pkt.payload == b'{"t":21.4,"h":45.2}'
     assert pkt.pack() == raw, "round-trip mismatch"
+    foreign = Packet(PROTOCOL_VERSION + 6, MsgType.TELEMETRY, 7, 1, 0, b"{}").pack()
+    try:
+        Packet.unpack(foreign)
+    except CorruptPacketError:
+        pass
+    else:
+        raise AssertionError("a frame with another protocol version was accepted")
     print("OK: Python codec is byte-compatible with the C implementation.")

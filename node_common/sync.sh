@@ -5,6 +5,8 @@ sketches="node_accelerometer node_sht41 node_default_lcd node_accelerometer_lcd 
 lcd_sketches="node_default_lcd node_accelerometer_lcd node_sht41_lcd"
 files="node_common/node_common.h node_common/packet_queue.h protocol/protocol.h protocol/protocol.c protocol/reliability.h protocol/reliability.c"
 lcd_files="node_common/node_lcd.h"
+threshold_sketches="node_sht41_lcd"
+threshold_files="node_common/threshold.h"
 
 bad=0
 sync_file() {
@@ -23,6 +25,9 @@ for sk in $sketches; do
 done
 for sk in $lcd_sketches; do
   for f in $lcd_files; do sync_file "$sk" "$f"; done
+done
+for sk in $threshold_sketches; do
+  for f in $threshold_files; do sync_file "$sk" "$f"; done
 done
 [ "$MODE" = "--check" ] && [ "$bad" = 0 ] && echo "All sketch copies are in sync."
 exit $bad
