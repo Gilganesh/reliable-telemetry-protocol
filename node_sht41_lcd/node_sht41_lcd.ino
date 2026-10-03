@@ -2,6 +2,10 @@
 #define NODE_I2C_SDA 21
 #define NODE_I2C_SCL 22
 #include "node_common.h"
+#include "threshold.h"
+
+#define TEMP_ALARM_C 35.0f
+#define TEMP_ALARM_HYSTERESIS_C 2.0f
 
 #define SHT_ADDR  0x44
 #define CMD_MEAS  0xFD
@@ -55,6 +59,9 @@ float last_temperature = 0;
 float last_humidity = 0;
 bool have_reading = false;
 bool last_read_failed = false;
+ThresholdAlarm overheat;
+bool alarm_to_send = false;
+char alarm_json[MAX_PAYLOAD_SIZE + 1];
 
 void sensor_setup() {
   Wire.begin(NODE_I2C_SDA, NODE_I2C_SCL);
@@ -62,12 +69,17 @@ void sensor_setup() {
   Wire.setTimeOut(1000);
   lcd.setBusClocks(100000, 100000);
   lcd_init();
+  threshold_init(&overheat);
 
   DBG.println("\nInitializing SHT41...");
   shtReset();
 }
 
-void sensor_update() {}
+void sensor_update() {
+  if (!alarm_to_send) return;
+  alarm_to_send = false;
+  send_alarm_json(alarm_json);
+}
 
 bool sensor_payload(char *buf, size_t n) {
   float t, h;
@@ -80,6 +92,12 @@ bool sensor_payload(char *buf, size_t n) {
   have_reading = true;
   last_temperature = t;
   last_humidity = h;
+  if (threshold_update(&overheat, t, TEMP_ALARM_C, TEMP_ALARM_HYSTERESIS_C)) {
+    snprintf(alarm_json, sizeof(alarm_json), "{\"alarm\":\"overheat\",\"temperature\":%.1f,\"threshold\":%.0f}",
+             t, (double)TEMP_ALARM_C);
+    alarm_to_send = true;
+    DBG.println("[ALARM] Temperature threshold exceeded.");
+  }
   snprintf(buf, n, "{\"temperature\":%.2f,\"humidity\":%.2f}", t, h);
   return true;
 }
@@ -87,6 +105,7 @@ bool sensor_payload(char *buf, size_t n) {
 bool sensor_display(char *line, size_t n) {
   if (last_read_failed) snprintf(line, n, "SHT41 error");
   else if (!have_reading) snprintf(line, n, "Measuring...");
+  else if (overheat.active) snprintf(line, n, "T%.1fC ALARM!", last_temperature);
   else snprintf(line, n, "T%.1fC H%.1f%%", last_temperature, last_humidity);
   return true;
 }

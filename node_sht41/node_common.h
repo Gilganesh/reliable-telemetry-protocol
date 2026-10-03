@@ -29,6 +29,7 @@ void sensor_update();
 bool sensor_payload(char *buf, size_t n);
 
 void send_alarm();
+void send_alarm_json(const char *json);
 
 uint16_t MY_NODE_ID = 0;
 char device_mac[18] = "";
@@ -645,8 +646,17 @@ void send_telemetry() {
 }
 
 void send_alarm() {
+  send_alarm_json("{\"alarm\":\"critical_event\"}");
+}
+
+void send_alarm_json(const char *json) {
   if (MY_NODE_ID == 0) {
     DBG.println("[ALARM] node_id not assigned by gateway yet.");
+    return;
+  }
+  size_t json_len = strlen(json);
+  if (json_len > MAX_PAYLOAD_SIZE) {
+    DBG.println("[ALARM] Payload too long, alarm not sent.");
     return;
   }
   SensorPacket pkt = {};
@@ -656,9 +666,8 @@ void send_alarm() {
   pkt.sequence = seq_counter++;
   pkt.timestamp_ms = millis();
 
-  const char* json = "{\"alarm\":\"critical_event\"}";
-  pkt.payload_len = strlen(json);
-  memcpy(pkt.payload, json, pkt.payload_len);
+  pkt.payload_len = (uint16_t)json_len;
+  memcpy(pkt.payload, json, json_len);
 
   DBG.print("[ALARM] ALARM sequence=");
   DBG.print(pkt.sequence);

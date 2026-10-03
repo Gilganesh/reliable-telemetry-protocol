@@ -8,6 +8,7 @@ ESP32 firmware is split into a sensor-independent core and one sketch per sensor
 | `packet_queue.h` | Fixed-capacity ring buffer of packets (unit-tested on the host) |
 | `../node_accelerometer/` | MPU9250 on I2C (SDA 21, SCL 22, address 0x68): `roll`, `pitch`, `yaw` |
 | `../node_sht41/` | SHT41 on I2C (default pins, address 0x44): `temperature`, `humidity` |
+| `threshold.h` | Threshold with hysteresis for sensor-driven alarms (`node_sht41_lcd` uses it; unit-tested on the host) |
 | `node_lcd.h` | Dependency-free driver for a 1602 LCD behind a PCF8574 I2C backpack (unit-tested against an HD44780 emulator) |
 | `../node_default_lcd/` | Sensorless node with an LCD: telemetry is `uptime_s`, `free_heap_kb`, `rssi` |
 | `../node_accelerometer_lcd/`, `../node_sht41_lcd/` | The two sensor sketches with an LCD |
