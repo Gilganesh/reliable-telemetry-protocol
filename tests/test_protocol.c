@@ -154,6 +154,7 @@ static void test_payload_too_large_rejected(void) {
 static void test_unknown_msg_type_rejected(void) {
     printf("test_unknown_msg_type_rejected:\n");
     SensorPacket pkt = {0};
+    pkt.version = PROTOCOL_VERSION;
     pkt.msg_type = 99;
     pkt.payload_len = 0;
 
@@ -163,6 +164,24 @@ static void test_unknown_msg_type_rejected(void) {
     SensorPacket out = {0};
     int rc = protocol_unpack(buf, (size_t)packed_len, &out);
     CHECK(rc == PROTO_ERR_UNKNOWN_TYPE, "msg_type=99 -> PROTO_ERR_UNKNOWN_TYPE");
+}
+
+static void test_wrong_version_rejected(void) {
+    printf("test_wrong_version_rejected:\n");
+    SensorPacket pkt = {0};
+    pkt.version = PROTOCOL_VERSION + 6;
+    pkt.msg_type = MSG_TELEMETRY;
+    pkt.node_id = 1;
+    uint8_t buf[256];
+    int packed_len = protocol_pack(&pkt, buf, sizeof(buf));
+
+    SensorPacket out = {0};
+    int rc = protocol_unpack(buf, (size_t)packed_len, &out);
+    CHECK(rc == PROTO_ERR_BAD_VERSION, "frame with a valid CRC but another version -> PROTO_ERR_BAD_VERSION");
+
+    pkt.version = PROTOCOL_VERSION;
+    packed_len = protocol_pack(&pkt, buf, sizeof(buf));
+    CHECK(protocol_unpack(buf, (size_t)packed_len, &out) == PROTO_OK, "the supported version is accepted");
 }
 
 int main(void) {
@@ -175,6 +194,7 @@ int main(void) {
     test_random_garbage_rejected();
     test_payload_too_large_rejected();
     test_unknown_msg_type_rejected();
+    test_wrong_version_rejected();
 
     printf("\n----------------------------------------\n");
     printf("Tests: %d, failed: %d\n", tests_run, tests_failed);

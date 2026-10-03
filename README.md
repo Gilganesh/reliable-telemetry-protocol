@@ -230,7 +230,7 @@ All multi-byte fields are little-endian. A frame is the header, the payload, the
 | `ACK` | 4 | echoes the sequence number of the acknowledged frame |
 
 Stream transports (UART, TCP) are framed by the header itself: the receiver resynchronises byte by byte on a
-plausible header (`version`, `msg_type`, `payload_len`) and validates the CRC. UDP and MQTT carry one frame per
+plausible header (`version`, `msg_type`, `payload_len`) and validates the CRC. After a failed check it drops one byte and rescans, so a damaged or truncated frame costs only itself. UDP and MQTT carry one frame per
 datagram/message.
 
 ### Gateway to node commands

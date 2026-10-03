@@ -35,6 +35,7 @@ typedef struct {
 #define PROTO_ERR_LEN_MISMATCH    -4
 #define PROTO_ERR_PAYLOAD_TOO_BIG -5
 #define PROTO_ERR_BUF_TOO_SMALL   -6
+#define PROTO_ERR_BAD_VERSION     -7
 
 uint32_t crc32(const uint8_t *data, size_t len);
 

@@ -68,6 +68,10 @@ int protocol_unpack(const uint8_t *raw, size_t raw_len, SensorPacket *out_pkt) {
     memcpy(&out_pkt->timestamp_ms, p, 8); p += 8;
     memcpy(&out_pkt->payload_len,  p, 2); p += 2;
 
+    if (out_pkt->version != PROTOCOL_VERSION) {
+        return PROTO_ERR_BAD_VERSION;
+    }
+
     if (out_pkt->msg_type > MSG_ACK) {
         return PROTO_ERR_UNKNOWN_TYPE;
     }
