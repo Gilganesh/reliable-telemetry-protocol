@@ -69,6 +69,7 @@ bool id_confirmed = false;
 #define ALARM_RETRY_COOLDOWN_MS 5000
 #define TCP_KEEPALIVE_MS  5000
 #define WIFI_PROBE_MS        2000
+#define WIFI_RETRY_MS        20000
 #define WIFI_LINK_TIMEOUT_MS 7000
 
 Preferences prefs;
@@ -265,6 +266,25 @@ bool json_get_int(const char *js, const char *key, long *out) {
   if (!json_find_value(js, key, &v)) return false;
   *out = strtol(v, NULL, 10);
   return true;
+}
+
+const char* wifi_status_name(wl_status_t st) {
+  switch (st) {
+    case WL_CONNECTED:       return "connected";
+    case WL_NO_SSID_AVAIL:   return "SSID not found";
+    case WL_CONNECT_FAILED:  return "connect failed (wrong password?)";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED:    return "disconnected";
+    case WL_IDLE_STATUS:     return "idle";
+    default:                 return "unknown";
+  }
+}
+
+volatile uint8_t wifi_last_reason = 0;
+
+void on_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) wifi_last_reason = info.wifi_sta_disconnected.reason;
+  else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) wifi_last_reason = 0;
 }
 
 void wifi_start() {
@@ -687,7 +707,12 @@ void print_status() {
   DBG.print(" | wire=");
   DBG.print(wire_alive() ? "up" : "down");
   DBG.print(" | Wi-Fi=");
-  DBG.print(wifi_configured ? (WiFi.status() == WL_CONNECTED ? "connected" : "connecting") : "not configured");
+  DBG.print(wifi_configured ? wifi_status_name(WiFi.status()) : "not configured");
+  if (wifi_configured && WiFi.status() != WL_CONNECTED && wifi_last_reason != 0) {
+    DBG.print(" (reason ");
+    DBG.print(wifi_last_reason);
+    DBG.print(")");
+  }
   DBG.print(" | gateway=");
   DBG.print(gw_configured ? gw_ip_str : "not configured");
   DBG.print(" | TCP=");
@@ -864,6 +889,7 @@ void node_setup() {
 
   load_saved_config();
   WiFi.mode(WIFI_STA);
+  WiFi.onEvent(on_wifi_event);
   if (wifi_configured) {
     DBG.println("[CONFIG] Saved settings found, starting Wi-Fi in background.");
     wifi_start();
@@ -885,7 +911,7 @@ void node_loop() {
   bool now_wifi = wifi_up();
   if (wifi_configured && !now_wifi) {
     static unsigned long last_attempt = 0;
-    if (millis() - last_attempt > 8000) {
+    if (millis() - last_attempt > WIFI_RETRY_MS) {
       last_attempt = millis();
       WiFi.disconnect();
       WiFi.begin(wifi_ssid, wifi_pass);
