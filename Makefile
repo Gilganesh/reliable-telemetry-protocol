@@ -3,7 +3,7 @@ SANITIZE ?= undefined
 CFLAGS   ?= -Wall -Wextra -Werror -g -fsanitize=$(SANITIZE)
 BUILD    := build
 
-TESTS := test_protocol test_reliability test_packet_queue
+TESTS := test_protocol test_reliability test_packet_queue test_frame_reader
 CXX   ?= c++
 
 all: gateway sim_node
@@ -14,8 +14,8 @@ gateway:
 sim_node:
 	$(MAKE) -C sim_node
 
-$(BUILD)/test_%: tests/test_%.c protocol/protocol.c protocol/reliability.c protocol/*.h node_common/packet_queue.h | $(BUILD)
-	$(CC) $(CFLAGS) -Iprotocol -Inode_common $< protocol/protocol.c protocol/reliability.c -o $@
+$(BUILD)/test_%: tests/test_%.c protocol/protocol.c protocol/reliability.c protocol/*.h node_common/packet_queue.h gateway/frame_reader.h | $(BUILD)
+	$(CC) $(CFLAGS) -Iprotocol -Inode_common -Igateway $< protocol/protocol.c protocol/reliability.c -o $@
 
 $(BUILD)/test_lcd: tests/test_lcd.cpp node_common/node_lcd.h tests/stubs/*.h | $(BUILD)
 	$(CXX) -std=gnu++17 -Wall -Wextra -Werror -g -fsanitize=$(SANITIZE) -Itests/stubs -Inode_common $< -o $@

@@ -30,8 +30,10 @@ all work together. What remains is evidence (recorded test runs on hardware), tw
 
 ## Verification so far
 
-- Unit tests (`make test`): protocol 19, reliability 30, packet queue 17, LCD driver 21 (against an HD44780 emulator), plus a
-  Python/C codec cross-check and a firmware copy check.
+- Unit tests (`make test`): protocol 21, reliability 30, packet queue 17, stream frame reader 9, LCD driver 21 (against an
+  HD44780 emulator), plus a Python/C codec cross-check and a firmware copy check.
+- Stream resynchronisation, measured on a real TCP stream: a frame with a damaged length field used to cost three frames, a
+  truncated frame two; now each costs exactly one. A frame with another protocol version is rejected on every link.
 - Emulated node against the real gateway: `lossy20` (150 alarms), `flaky` (corrupted frames rejected, counters match),
   `delay` (RTT 400 to 600 ms), a 3 s blackout, a late retry arriving 89 packets behind (still deduplicated).
 - Buffered samples are placed at their true measurement time: with a simulated outage the stored times matched the real

@@ -23,6 +23,7 @@
 #include <mosquitto.h>
 #include <cjson/cJSON.h>
 #include "protocol.h"
+#include "frame_reader.h"
 
 #define MAX_NODES 10
 #define MAX_SEEN_ALARMS 16
@@ -36,8 +37,6 @@
 #define UART_FRAME_GAP_MS 100
 #define UART_BAUD     B115200
 
-#define FRAME_MAX_SIZE (HEADER_SIZE + MAX_PAYLOAD_SIZE + CRC_SIZE)
-
 typedef enum {
     ROUTE_MQTT,
     ROUTE_UDP,
@@ -50,52 +49,6 @@ typedef struct {
     struct sockaddr_in udp_addr;
     int fd;
 } ReplyRoute;
-
-typedef struct {
-    uint8_t buf[FRAME_MAX_SIZE];
-    size_t  have;
-    size_t  need;
-    bool    header_done;
-} FrameReader;
-
-static void frame_reader_init(FrameReader *fr) {
-    fr->have = 0;
-    fr->need = HEADER_SIZE;
-    fr->header_done = false;
-}
-
-static bool frame_prefix_plausible(const FrameReader *fr) {
-    if (fr->have >= 1 && fr->buf[0] != PROTOCOL_VERSION) return false;
-    if (fr->have >= 2 && fr->buf[1] > MSG_ACK) return false;
-    if (fr->have >= HEADER_SIZE) {
-        uint16_t payload_len;
-        memcpy(&payload_len, fr->buf + 16, 2);
-        if (payload_len > MAX_PAYLOAD_SIZE) return false;
-    }
-    return true;
-}
-
-static bool frame_reader_feed_byte(FrameReader *fr, uint8_t byte) {
-    if (fr->have >= sizeof(fr->buf)) {
-        frame_reader_init(fr);
-    }
-    fr->buf[fr->have++] = byte;
-
-    while (fr->have > 0 && !frame_prefix_plausible(fr)) {
-        memmove(fr->buf, fr->buf + 1, fr->have - 1);
-        fr->have--;
-    }
-    if (fr->have >= HEADER_SIZE) {
-        uint16_t payload_len;
-        memcpy(&payload_len, fr->buf + 16, 2);
-        fr->need = HEADER_SIZE + payload_len + CRC_SIZE;
-        fr->header_done = true;
-    } else {
-        fr->header_done = false;
-        fr->need = HEADER_SIZE;
-    }
-    return fr->header_done && fr->have == fr->need;
-}
 
 #define STATE_TOPIC "telemetry/gateway/state"
 
@@ -189,6 +142,8 @@ const char *route_kind_name(RouteKind k) {
 FILE *g_log_file = NULL;
 uint32_t corrupted_count = 0;
 
+static void report_bad_frames(FrameReader *fr, RouteKind kind);
+
 uint64_t get_monotonic_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -216,6 +171,15 @@ void log_event(const char *fmt, ...) {
         fflush(g_log_file);
     }
     va_end(args_file);
+}
+
+static void report_bad_frames(FrameReader *fr, RouteKind kind) {
+    uint32_t fresh = fr->bad_frames - fr->bad_reported;
+    if (fresh == 0) return;
+    fr->bad_reported = fr->bad_frames;
+    corrupted_count += fresh;
+    log_event("[ERROR] %u corrupted frame(s) dropped on link=%s, stream resynchronised. "
+              "Corrupted total: %u\n", fresh, route_kind_name(kind), corrupted_count);
 }
 
 NodeState* find_or_create_node(uint16_t node_id) {
@@ -1377,10 +1341,12 @@ void poll_tcp(void) {
             ReplyRoute route = { .kind = ROUTE_TCP, .fd = cl->fd };
             for (ssize_t i = 0; i < n; i++) {
                 if (frame_reader_feed_byte(&cl->reader, rx[i])) {
-                    handle_packet(cl->reader.buf, cl->reader.have, &route);
-                    frame_reader_init(&cl->reader);
+                    do {
+                        handle_packet(cl->reader.buf, cl->reader.need, &route);
+                    } while (frame_reader_next(&cl->reader));
                 }
             }
+            report_bad_frames(&cl->reader, ROUTE_TCP);
         } else if (n == 0) {
             tcp_client_close(cl, "closed by peer");
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -1527,15 +1493,16 @@ void poll_uart(void) {
             ReplyRoute route = { .kind = ROUTE_UART, .fd = p->fd };
             for (ssize_t i = 0; i < n; i++) {
                 if (frame_reader_feed_byte(&p->reader, rx[i])) {
-                    SensorPacket probe;
-                    if (!p->responded && protocol_unpack(p->reader.buf, p->reader.have, &probe) == PROTO_OK) {
-                        p->responded = true;
-                        log_event("[UART] %s: received a valid frame, node detected\n", p->path);
-                    }
-                    handle_packet(p->reader.buf, p->reader.have, &route);
-                    frame_reader_init(&p->reader);
+                    do {
+                        if (!p->responded) {
+                            p->responded = true;
+                            log_event("[UART] %s: received a valid frame, node detected\n", p->path);
+                        }
+                        handle_packet(p->reader.buf, p->reader.need, &route);
+                    } while (frame_reader_next(&p->reader));
                 }
             }
+            report_bad_frames(&p->reader, ROUTE_UART);
         }
         if (!p->responded && !p->warned_silent && now_ms > p->opened_ms &&
             now_ms - p->opened_ms > UART_PROBE_WARN_MS) {

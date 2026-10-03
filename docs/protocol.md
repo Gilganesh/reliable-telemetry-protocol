@@ -10,7 +10,7 @@ All multi-byte fields are little-endian (ESP32, ARM and x86 hosts all are, so no
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
-| 0 | 1 | `version` | `1`; stream receivers treat a byte sequence as a frame start only if this byte is `1` (`unpack` itself does not check it) |
+| 0 | 1 | `version` | `1`; `unpack` rejects any other value, and stream receivers use it as part of the frame start marker |
 | 1 | 1 | `msg_type` | `0`..`4`, see below |
 | 2 | 2 | `node_id` | `0` is reserved for HELLO and for broadcast from the gateway |
 | 4 | 4 | `sequence` | one counter per node, shared by all message types, starts at 0 after a reboot |
@@ -29,17 +29,24 @@ Maximum frame size: 18 + 128 + 4 = 150 bytes.
 | `CONFIG` | 3 | gateway to node | acknowledged and retried |
 | `ACK` | 4 | both | echoes the `sequence` of the frame it acknowledges; carries no payload |
 
-`unpack` rejects a frame, in this order, when it is shorter than 22 bytes, when the CRC does not match, when `msg_type`
-is above 4, when `payload_len` differs from the bytes actually present, or when `payload_len` exceeds 128. It never reads
-outside the buffer.
+`unpack` rejects a frame, in this order, when it is shorter than 22 bytes (`PROTO_ERR_TOO_SHORT`), when the CRC does not
+match (`PROTO_ERR_BAD_CRC`), when `version` is not 1 (`PROTO_ERR_BAD_VERSION`), when `msg_type` is above 4
+(`PROTO_ERR_UNKNOWN_TYPE`), when `payload_len` differs from the bytes actually present (`PROTO_ERR_LEN_MISMATCH`), or when
+`payload_len` exceeds 128 (`PROTO_ERR_PAYLOAD_TOO_BIG`). It never reads outside the buffer.
 
 ### Framing on byte streams
 
 UART and TCP carry a byte stream, so the receiver finds frame boundaries itself. It accumulates bytes and keeps a
 candidate frame only while it is plausible (byte 0 equals the version, byte 1 is at most 4, `payload_len` is at most 128).
 An implausible prefix is discarded one byte at a time, so garbage such as a bootloader banner or a connection that starts in
-the middle of a frame costs at most one frame and does not desynchronise the stream. On UART a pause of more than 100 ms
-inside an unfinished frame also resets the assembler. UDP and MQTT carry exactly one frame per datagram or message.
+the middle of a frame costs at most one frame and does not desynchronise the stream.
+
+The gateway's reader (`gateway/frame_reader.h`) also checks the CRC itself. When a candidate frame fails the check it drops
+a single byte and rescans the bytes it already holds instead of discarding the whole buffer, so a frame with a damaged length
+field, a truncated frame or a bit error costs only that frame and never the intact frames behind it. Each rejected candidate
+is counted as a corrupted frame. On UART a pause of more than 100 ms inside an unfinished frame also resets the reader.
+The node firmware's assembler for gateway-to-node frames still discards its buffer after a failed CRC; that traffic is sparse
+and every critical frame is retried. UDP and MQTT carry exactly one frame per datagram or message.
 
 ## Commands carried in `CONFIG`
 
