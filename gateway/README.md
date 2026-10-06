@@ -3,12 +3,18 @@
 Single-process C daemon that receives frames from every node, validates and tracks them, acknowledges critical
 messages and publishes its state over MQTT.
 
-## Build and run
+## Quick start
+
+From the repository root, `./run.sh` builds the gateway and starts it together with the MQTT broker (`mosquitto.conf` in
+this folder) and the web dashboard. To run the gateway alone, a broker must already be listening on `127.0.0.1:1883`:
 
 ```bash
 make            # needs libmosquitto and libcjson
 ./gateway
 ```
+
+To let boards join your Wi-Fi automatically, copy `gateway.conf.example` to `gateway.conf` and list your networks (required
+on macOS, where `nmcli` is not available). `gateway.conf` is ignored by git.
 
 Run it from this directory: it reads `gateway.conf`, appends events to `gateway_log.txt` and keeps the MAC → node id
 registry in `node_registry.txt` in the working directory. A terminal dashboard is printed every 2 seconds.

@@ -2,7 +2,7 @@
 
 Version 1. This document describes the wire format, the node and gateway state machines and the reliability rules. The
 source of truth is [`protocol/protocol.c`](../protocol/protocol.c), [`protocol/reliability.c`](../protocol/reliability.c),
-[`node_common/node_common.h`](../node_common/node_common.h) and [`gateway/gateway.c`](../gateway/gateway.c).
+[`node/_shared/node_common.h`](../node/_shared/node_common.h) and [`gateway/gateway.c`](../gateway/gateway.c).
 
 ## Frame format
 

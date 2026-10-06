@@ -30,7 +30,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mosquitto
 fi
 
 echo "Starting services..."
-mosquitto -c "$ROOT/mosquitto_open.conf" >"$LOGS/mosquitto.log" 2>&1 &
+mosquitto -c "$ROOT/gateway/mosquitto.conf" >"$LOGS/mosquitto.log" 2>&1 &
 PIDS+=("$!")
 echo "  started mosquitto (pid $!, log: logs/mosquitto.log)"
 sleep 1

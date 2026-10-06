@@ -34,7 +34,7 @@ Current state and planned work. The protocol is specified in [`protocol.md`](pro
    check buffer overflow (`dropped` on the node must equal the loss the gateway reports).
 2. **Baseline comparison**: a naive mode in `sim_node` (send once, no ACK, no buffer) and a script that runs both modes
    through the same impairment profiles with a fixed seed, producing a table of delivered, lost and duplicate alarms.
-3. **More sensor-driven alarms**: `node_sht41_lcd` raises an ALARM at 35 °C (once per crossing, 2 °C hysteresis,
+3. **More sensor-driven alarms**: `sht41_lcd` raises an ALARM at 35 °C (once per crossing, 2 °C hysteresis,
    `send_alarm_json()` in the core). The same for the IMU (tilt or shock) is not done yet.
 4. **Threat model**: spoofed node, replay, plain-text Wi-Fi password on the serial link, open broker.
 
@@ -70,8 +70,8 @@ Current state and planned work. The protocol is specified in [`protocol.md`](pro
 
 ## Operating notes
 
-- Start everything: `./run.sh` (add `--open` for the browser, or use the desktop shortcut from `./install-shortcut.sh`).
+- Start everything: `./run.sh` (add `--open` for the browser, or use the desktop shortcut from `scripts/install-shortcut.sh`).
 - After pulling changes on the Raspberry Pi: `make -B -C gateway` when `gateway.c` or `protocol/` changed, then restart the
-  gateway and the dashboard. Boards only need reflashing when `node_common/` or the sketches changed.
-- Run `node_common/sync.sh` after editing `node_common/` or `protocol/`; `make test` checks that the sketch copies match.
+  gateway and the dashboard. Boards only need reflashing when `node/_shared/` or the sketches changed.
+- Run `node/_shared/sync.sh` after editing `node/_shared/` or `protocol/`; `make test` checks that the sketch copies match.
 - macOS: Firefox needs the Local Network permission; AddressSanitizer hangs on this system, so `make test` uses UBSan.

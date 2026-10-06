@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "protocol.h"
-#include "../node_common/packet_queue.h"
+#include "../node/_shared/packet_queue.h"
 
 static int tests_run = 0;
 static int tests_failed = 0;

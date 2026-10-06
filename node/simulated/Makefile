@@ -5,11 +5,11 @@ ifneq ($(BREW),)
   CFLAGS  += -I$(BREW)/include
   LDFLAGS += -L$(BREW)/lib
 endif
-CFLAGS += -I../protocol
+CFLAGS += -I../../protocol
 
-SRC = sim_node.c ../protocol/protocol.c ../protocol/reliability.c
+SRC = sim_node.c ../../protocol/protocol.c ../../protocol/reliability.c
 
-sim_node: $(SRC) ../protocol/protocol.h ../protocol/reliability.h
+sim_node: $(SRC) ../../protocol/protocol.h ../../protocol/reliability.h
 	$(CC) $(CFLAGS) $(SRC) $(LDFLAGS) -lmosquitto -o sim_node
 
 clean:
