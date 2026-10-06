@@ -234,6 +234,11 @@ folder. After editing either, run `node/_shared/sync.sh`; `make test` fails if t
 
 The full list is in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
+## Authors
+
+- [Gilganesh](https://github.com/Gilganesh)
+- [artempluysch-beep](https://github.com/artempluysch-beep)
+
 ## License
 
 [MIT](LICENSE)
