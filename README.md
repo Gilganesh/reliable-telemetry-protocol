@@ -7,7 +7,9 @@ impairment simulator lets you break the network on purpose and watch the guarant
 [![CI](https://github.com/Gilganesh/reliable-telemetry-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/Gilganesh/reliable-telemetry-protocol/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![ESP32](https://img.shields.io/badge/ESP32-Arduino-red)
-![C](https://img.shields.io/badge/gateway-C-lightgrey)
+![C](https://img.shields.io/badge/language-C-lightgrey)
+![Gateway platforms](https://img.shields.io/badge/gateway-Linux%20%7C%20macOS%20%7C%20Raspberry%20Pi-informational)
+![Flash from](https://img.shields.io/badge/flash%20from-Windows%20%7C%20macOS%20%7C%20Linux-informational)
 
 ![Automatic channel failover](docs/media/gif/02-channel-failover.gif)
 
@@ -104,9 +106,17 @@ flowchart LR
 |---|---|---|---|
 | **Gateway** | [`gateway/`](gateway/) | C daemon that receives frames from every node, acknowledges, tracks and publishes state | `./run.sh` builds and starts it |
 | **Node** | [`node/`](node/) | ESP32 firmware: pick one variant. A simulated node is included | upload a sketch, or run `node/simulated/sim_node` |
-| **Web** | [`web/`](web/) | Flask dashboard with charts, alarms and impairment controls | started by `./run.sh`, open <http://localhost:8080> |
+| **Web** | [`web/`](web/) | Flask dashboard with charts, alarms and impairment controls | started by `./run.sh`, open <http://localhost:8080> or `http://<gateway-ip>:8080` from any computer on the same network |
 
 Everything else supports these three: `protocol/` (the shared codec), `docs/`, `tests/` and `scripts/`.
+
+**Where each block runs**
+
+| Block | Runs on |
+|---|---|
+| Gateway and web server | Raspberry Pi, any Linux, or macOS. Not natively on Windows (see [the Windows setup](#typical-setup-raspberry-pi-gateway-and-a-windows-laptop)) |
+| Node firmware | Flashed from Windows, macOS or Linux with the Arduino IDE |
+| Dashboard | Any browser on the same network, including a Windows laptop |
 
 ## Quick start (no hardware)
 
@@ -161,6 +171,32 @@ To run the tests: `make test`.
 On macOS, list your Wi-Fi networks in `gateway/gateway.conf` (copy `gateway.conf.example`), because there is no `nmcli` to
 detect them. Wiring, LCD variants and firmware options are in [`docs/hardware.md`](docs/hardware.md).
 
+## Typical setup: Raspberry Pi gateway and a Windows laptop
+
+The gateway and the dashboard server need Linux or macOS; a Raspberry Pi is the intended host. On Windows you flash the
+boards and look at the dashboard.
+
+1. **Start the gateway on the Raspberry Pi.** Connect to it over SSH (Windows 10 and 11 include an SSH client:
+   `ssh <user>@<pi-ip>` in PowerShell), then install the dependencies, clone the repository and start everything as in
+   [Quick start](#quick-start-no-hardware): `make` and `./run.sh`. `run.sh` prints the dashboard addresses when it starts.
+2. **Flash the board from the Windows laptop.**
+   - Install the [Arduino IDE](https://www.arduino.cc/en/software) and, in Boards Manager, the **esp32** package by
+     Espressif Systems. The `accelerometer` variants also need the **MPU9250** library by *hideakitai*.
+   - Download the repository (green **Code** button, **Download ZIP**) and unzip it.
+   - Open `node/<variant>/<variant>.ino` (for example `node/sht41/sht41.ino`), select your ESP32 board and its COM port,
+     and press **Upload**. If no COM port appears, install the driver for the board's USB-UART chip (CP210x or CH340).
+   - Do not rely on the Serial Monitor: by default the board's USB serial carries protocol frames, so it shows binary data.
+3. **Plug the board into the Raspberry Pi** with the USB cable. The gateway assigns a node id and sends the Wi-Fi settings,
+   after which the board can run on Wi-Fi without the cable. The Pi, the board and your laptop should be on the same network.
+4. **Open the dashboard on the laptop.** In any browser on that network go to `http://<pi-ip>:8080` (find the address with
+   `hostname -I` on the Pi, or read it from the `run.sh` output) or `http://<pi-hostname>.local:8080`, which usually works
+   on Windows 10 and 11 with Raspberry Pi OS.
+
+If the page does not load: check that both devices are on the same network (guest Wi-Fi often isolates clients from each
+other), and that a firewall on the Pi allows TCP 8080 for the dashboard and TCP 5006 / UDP 5005 for boards that connect
+over Wi-Fi. The dashboard has no login, so anyone on the network can open it and send commands to nodes; do not expose it
+to the internet.
+
 ## Repository layout
 
 | Path | Contents |
@@ -189,8 +225,8 @@ folder. After editing either, run `node/_shared/sync.sh`; `make test` fails if t
 ## Known limitations
 
 - Integrity is protected by CRC-32 only; frames are not authenticated and there is no replay protection.
-- The bundled Mosquitto configuration allows anonymous access on all interfaces. Wi-Fi credentials are sent to nodes over
-  the serial link and stored in NVS in plain text.
+- The bundled Mosquitto configuration allows anonymous access on all interfaces, and the dashboard has no login. Wi-Fi
+  credentials are sent to nodes over the serial link and stored in NVS in plain text.
 - Buffered telemetry is fire-and-forget once a link accepts it; only critical messages are acknowledged.
 - The node buffer lives in RAM and does not survive a reboot.
 - Each node has at most one critical message in flight; others wait in the queue.
